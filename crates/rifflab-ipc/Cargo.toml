@@ -1,0 +1,13 @@
+[package]
+name = "rifflab-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "IPC client for Python workers: Unix socket + MessagePack"
+
+[dependencies]
+rifflab-core = { workspace = true }
+rmp-serde = { workspace = true }
+tokio = { version = "1", features = ["net", "io-util", "process", "sync", "rt-multi-thread", "macros"] }
+log = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

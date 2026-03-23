@@ -1,0 +1,12 @@
+[package]
+name = "rifflab-stems"
+version = "0.1.0"
+edition = "2021"
+description = "Stem separator: Rust client for Demucs Python worker"
+
+[dependencies]
+rifflab-core = { workspace = true }
+rifflab-ipc = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "rifflab-ui"
+version = "0.1.0"
+edition = "2021"
+description = "UI shell: egui-based arrangement view, piano roll, meters"
+
+[dependencies]
+rifflab-core = { workspace = true }
+rifflab-audio = { workspace = true }
+rifflab-fx = { workspace = true }
+rifflab-stems = { workspace = true }
+rifflab-analysis = { workspace = true }
+rifflab-practice = { workspace = true }
+eframe = "0.31"
+egui = "0.31"
+log = { workspace = true }
+anyhow = { workspace = true }

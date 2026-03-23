@@ -1,0 +1,28 @@
+[package]
+name = "rifflab-app"
+version = "0.1.0"
+edition = "2021"
+description = "RiffLab application binary"
+
+[[bin]]
+name = "rifflab"
+path = "src/main.rs"
+
+[dependencies]
+rifflab-core = { workspace = true }
+rifflab-audio = { workspace = true }
+rifflab-fx = { workspace = true }
+rifflab-ipc = { workspace = true }
+rifflab-stems = { workspace = true }
+rifflab-analysis = { workspace = true }
+rifflab-practice = { workspace = true }
+rifflab-ui = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+rusqlite = { version = "0.31", features = ["bundled"] }
+symphonia = { version = "0.5", features = ["all"] }
+serde = { workspace = true }
+toml = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }

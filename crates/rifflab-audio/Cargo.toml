@@ -1,0 +1,21 @@
+[package]
+name = "rifflab-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Audio engine: JACK/ALSA backends, audio graph, transport, metering"
+
+[features]
+default = ["jack-backend", "alsa-backend"]
+jack-backend = ["dep:jack"]
+alsa-backend = ["dep:cpal"]
+
+[dependencies]
+rifflab-core = { workspace = true }
+jack = { version = "0.13", optional = true }
+cpal = { version = "0.15", optional = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+assert_no_alloc = "1"

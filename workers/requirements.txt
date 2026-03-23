@@ -1,0 +1,11 @@
+# RiffLab Python workers
+# Stem separation
+demucs>=4.0
+torch>=2.0
+torchaudio>=2.0
+
+# Beat tracking
+madmom>=0.16
+
+# IPC
+msgpack>=1.0

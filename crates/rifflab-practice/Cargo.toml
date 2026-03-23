@@ -1,0 +1,12 @@
+[package]
+name = "rifflab-practice"
+version = "0.1.0"
+edition = "2021"
+description = "Practice engine: live comparison, scoring, session history"
+
+[dependencies]
+rifflab-core = { workspace = true }
+midly = "0.5"
+serde_json = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "rifflab-analysis"
+version = "0.1.0"
+edition = "2021"
+description = "Analysis engine: YIN pitch detection, onset detection, beat tracking"
+
+[dependencies]
+rifflab-core = { workspace = true }
+rifflab-ipc = { workspace = true }
+rustfft = "6"
+log = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
