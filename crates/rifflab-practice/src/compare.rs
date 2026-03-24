@@ -39,6 +39,11 @@ impl Comparator {
         }
     }
 
+    /// Return a reference to the loaded reference note sequence.
+    pub fn reference_notes(&self) -> &[NoteEvent] {
+        &self.reference
+    }
+
     /// Reset tracker state (e.g. when transport seeks or stops).
     pub fn reset(&mut self) {
         self.prev_midi_note = 0;

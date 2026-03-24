@@ -4,9 +4,10 @@ use anyhow::Result;
 use eframe::egui;
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
-use rifflab_core::analysis::PitchFrame;
+use rifflab_core::analysis::{NoteEvent, PitchFrame};
 use rifflab_core::audio::AudioConfig;
 use rifflab_core::metering::MeterData;
+use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
 use rifflab_core::transport::{LoopRegion, TransportState};
 use rifflab_practice::compare::Comparator;
@@ -33,6 +34,19 @@ const RULER_HEIGHT: f32 = 24.0;
 
 /// Track lane height in logical pixels.
 const TRACK_LANE_HEIGHT: f32 = 120.0;
+
+/// Default bottom drawer height in logical pixels.
+const DEFAULT_DRAWER_HEIGHT: f32 = 200.0;
+/// Minimum bottom drawer height.
+const MIN_DRAWER_HEIGHT: f32 = 80.0;
+/// Maximum bottom drawer height.
+const MAX_DRAWER_HEIGHT: f32 = 500.0;
+/// Width of the piano keyboard strip on the left of the piano roll.
+const PIANO_KEY_WIDTH: f32 = 48.0;
+/// Height of each semitone row in the piano roll.
+const SEMITONE_ROW_HEIGHT: f32 = 12.0;
+/// Confidence threshold below which pitch frames are treated as silence.
+const PITCH_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
 /// Track colors for stems.
 const TRACK_COLORS: &[egui::Color32] = &[
@@ -241,6 +255,25 @@ struct LoopDragState {
     current_frame: u64,
 }
 
+// ─── Bottom Drawer Types ─────────────────────────────────────────────────────
+
+/// Which tab is active in the bottom drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BottomTab {
+    PianoRoll,
+    Accuracy,
+    Effects,
+}
+
+/// A played note recorded during practice, for piano roll display.
+#[derive(Debug, Clone)]
+struct PlayedNote {
+    midi_note: u8,
+    start_seconds: f64,
+    end_seconds: f64,
+    accuracy: AccuracyBucket,
+}
+
 // ─── App ─────────────────────────────────────────────────────────────────────
 
 struct RiffLabApp {
@@ -279,6 +312,24 @@ struct RiffLabApp {
 
     /// Loop drag state for the timeline ruler.
     loop_drag: LoopDragState,
+
+    // ── Piano roll / bottom drawer state ──
+    /// Whether the bottom drawer is open.
+    drawer_open: bool,
+    /// Bottom drawer height in logical pixels.
+    drawer_height: f32,
+    /// Active tab in the bottom drawer.
+    active_tab: BottomTab,
+    /// Reference notes for piano roll display.
+    reference_notes: Vec<NoteEvent>,
+    /// Recorded played notes during practice (for piano roll display).
+    played_notes: Vec<PlayedNote>,
+    /// Piano roll vertical scroll offset (in MIDI note units from bottom).
+    piano_roll_scroll_note: f32,
+    /// Tracks the MIDI note currently being played (for note onset/offset detection).
+    tracking_midi_note: u8,
+    /// Whether the tracker was silent on the previous frame.
+    tracking_was_silent: bool,
 }
 
 impl RiffLabApp {
@@ -317,14 +368,24 @@ impl RiffLabApp {
             sample_rate,
             buffer_size,
             loop_drag: LoopDragState::default(),
+            drawer_open: true,
+            drawer_height: DEFAULT_DRAWER_HEIGHT,
+            active_tab: BottomTab::PianoRoll,
+            reference_notes: Vec::new(),
+            played_notes: Vec::new(),
+            piano_roll_scroll_note: 48.0, // C3 at bottom
+            tracking_midi_note: 0,
+            tracking_was_silent: true,
         }
     }
 
     /// Load a reference note sequence for practice comparison.
     #[allow(dead_code)]
-    pub fn load_reference(&mut self, reference: Vec<rifflab_core::analysis::NoteEvent>) {
+    pub fn load_reference(&mut self, reference: Vec<NoteEvent>) {
+        self.reference_notes = reference.clone();
         self.comparator = Some(Comparator::new(reference));
         self.scorer = SessionScorer::new();
+        self.played_notes.clear();
     }
 
     /// Convert a frame position to an x coordinate relative to the arrangement rect.
@@ -367,11 +428,59 @@ impl eframe::App for RiffLabApp {
         let position_secs = position.seconds();
         let position_frame = position.frame;
 
-        // Drain pitch frames, run comparison, update score
+        // Drain pitch frames, run comparison, update score, track played notes
         while let Ok(pitch) = self.pitch_rx.pop() {
             self.current_pitch = pitch.clone();
+
+            // Track played notes for piano roll display
+            let is_silent = pitch.frequency_hz <= 0.0
+                || pitch.confidence < PITCH_CONFIDENCE_THRESHOLD;
+            let current_time = position_secs;
+
+            if is_silent {
+                // Close any active note
+                self.tracking_was_silent = true;
+                self.tracking_midi_note = 0;
+            } else {
+                let is_new_note =
+                    self.tracking_was_silent || pitch.midi_note != self.tracking_midi_note;
+                if is_new_note {
+                    // Determine accuracy from comparison or raw cents
+                    let accuracy = if pitch.cents_deviation.abs() <= 5.0 {
+                        AccuracyBucket::Perfect
+                    } else if pitch.cents_deviation.abs() <= 15.0 {
+                        AccuracyBucket::Good
+                    } else if pitch.cents_deviation.abs() <= 25.0 {
+                        AccuracyBucket::Acceptable
+                    } else {
+                        AccuracyBucket::Off
+                    };
+                    self.played_notes.push(PlayedNote {
+                        midi_note: pitch.midi_note,
+                        start_seconds: current_time,
+                        end_seconds: current_time,
+                        accuracy,
+                    });
+                    self.tracking_midi_note = pitch.midi_note;
+                    self.tracking_was_silent = false;
+                } else if let Some(last) = self.played_notes.last_mut() {
+                    // Extend the current note
+                    last.end_seconds = current_time;
+                }
+            }
+
             if let Some(ref mut comparator) = self.comparator {
                 let comparison = comparator.compare(&pitch, &position);
+                // Update the accuracy of the current played note from comparison data
+                if comparison.reference_note.is_some() {
+                    if let Some(last) = self.played_notes.last_mut() {
+                        if !comparison.note_correct {
+                            last.accuracy = AccuracyBucket::Off;
+                        } else {
+                            last.accuracy = comparison.accuracy_bucket;
+                        }
+                    }
+                }
                 self.scorer.feed(comparison);
             }
         }
@@ -429,29 +538,79 @@ impl eframe::App for RiffLabApp {
 
                     ui.separator();
 
-                    // Pitch display
-                    let note = self.current_pitch.note_name();
-                    let cents = self.current_pitch.cents_deviation;
-                    let cents_str = if cents >= 0.0 {
-                        format!("+{:.0}", cents)
-                    } else {
-                        format!("{:.0}", cents)
-                    };
-                    let pitch_color = if self.current_pitch.frequency_hz > 0.0 {
-                        if cents.abs() < 10.0 {
-                            egui::Color32::from_rgb(100, 220, 100)
-                        } else if cents.abs() < 25.0 {
-                            egui::Color32::from_rgb(220, 200, 80)
+                    // Visual tuner indicator
+                    {
+                        let note = self.current_pitch.note_name();
+                        let cents = self.current_pitch.cents_deviation;
+                        let has_pitch = self.current_pitch.frequency_hz > 0.0;
+                        let tuner_color = if has_pitch {
+                            if cents.abs() <= 5.0 {
+                                egui::Color32::from_rgb(80, 220, 80)
+                            } else if cents.abs() <= 15.0 {
+                                egui::Color32::from_rgb(220, 200, 60)
+                            } else {
+                                egui::Color32::from_rgb(220, 70, 70)
+                            }
                         } else {
-                            egui::Color32::from_rgb(220, 100, 80)
+                            egui::Color32::from_rgb(80, 80, 80)
+                        };
+
+                        // Note name (large)
+                        ui.monospace(
+                            egui::RichText::new(&note)
+                                .size(16.0)
+                                .color(tuner_color),
+                        );
+
+                        // Cents deviation bar
+                        let bar_width = 80.0f32;
+                        let bar_height = 8.0f32;
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(bar_width, bar_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(bar_rect);
+                        // Bar background
+                        painter.rect_filled(
+                            bar_rect,
+                            2.0,
+                            egui::Color32::from_rgb(30, 32, 36),
+                        );
+                        // Center tick
+                        let center_x = bar_rect.center().x;
+                        painter.line_segment(
+                            [
+                                egui::pos2(center_x, bar_rect.top()),
+                                egui::pos2(center_x, bar_rect.bottom()),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 85, 90)),
+                        );
+                        if has_pitch {
+                            // Deviation indicator: map -50..+50 cents to bar
+                            let norm = (cents / 50.0).clamp(-1.0, 1.0);
+                            let ind_x = center_x + norm * (bar_width / 2.0);
+                            let ind_w = 4.0f32;
+                            let ind_rect = egui::Rect::from_center_size(
+                                egui::pos2(ind_x, bar_rect.center().y),
+                                egui::vec2(ind_w, bar_height),
+                            );
+                            painter.rect_filled(ind_rect, 1.0, tuner_color);
                         }
-                    } else {
-                        egui::Color32::from_rgb(100, 100, 100)
-                    };
-                    ui.monospace(
-                        egui::RichText::new(format!("Pitch: {} {}c", note, cents_str))
-                            .color(pitch_color),
-                    );
+
+                        // Cents text
+                        if has_pitch {
+                            let cents_str = if cents >= 0.0 {
+                                format!("+{:.0}c", cents)
+                            } else {
+                                format!("{:.0}c", cents)
+                            };
+                            ui.monospace(
+                                egui::RichText::new(cents_str)
+                                    .size(10.0)
+                                    .color(tuner_color),
+                            );
+                        }
+                    }
 
                     ui.separator();
 
@@ -463,9 +622,14 @@ impl eframe::App for RiffLabApp {
                         self.scorer.notes_total(),
                     ));
 
-                    // Auto-follow toggle (right-aligned)
+                    // Right-aligned controls
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.checkbox(&mut self.auto_follow, "Follow");
+                        ui.separator();
+                        let drawer_label = if self.drawer_open { "Hide Panel" } else { "Show Panel" };
+                        if ui.small_button(drawer_label).clicked() {
+                            self.drawer_open = !self.drawer_open;
+                        }
                     });
                 });
             });
@@ -578,6 +742,99 @@ impl eframe::App for RiffLabApp {
                     });
                 });
             });
+
+        // ─── Bottom Drawer (Piano Roll / Accuracy / Effects) ─────
+        if self.drawer_open {
+            egui::TopBottomPanel::bottom("bottom_drawer")
+                .resizable(true)
+                .min_height(MIN_DRAWER_HEIGHT)
+                .max_height(MAX_DRAWER_HEIGHT)
+                .default_height(self.drawer_height)
+                .show(ctx, |ui| {
+                    // Tab bar
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let tabs = [
+                            (BottomTab::PianoRoll, "Piano Roll"),
+                            (BottomTab::Accuracy, "Accuracy"),
+                            (BottomTab::Effects, "Effects"),
+                        ];
+                        for (tab, label) in &tabs {
+                            let active = self.active_tab == *tab;
+                            let btn = egui::Button::new(
+                                egui::RichText::new(*label)
+                                    .size(11.0)
+                                    .color(if active {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        egui::Color32::from_rgb(140, 145, 150)
+                                    }),
+                            )
+                            .fill(if active {
+                                egui::Color32::from_rgb(50, 55, 65)
+                            } else {
+                                egui::Color32::from_rgb(30, 32, 38)
+                            })
+                            .corner_radius(2)
+                            .min_size(egui::vec2(80.0, 20.0));
+                            if ui.add(btn).clicked() {
+                                self.active_tab = *tab;
+                            }
+                        }
+
+                        // Close button (right-aligned)
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button(
+                                        egui::RichText::new("X")
+                                            .size(10.0)
+                                            .color(egui::Color32::from_rgb(160, 160, 160)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.drawer_open = false;
+                                }
+                            },
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Tab content
+                    match self.active_tab {
+                        BottomTab::PianoRoll => {
+                            draw_piano_roll(
+                                ui,
+                                &self.reference_notes,
+                                &self.played_notes,
+                                self.scroll_offset_frames,
+                                self.frames_per_pixel,
+                                self.sample_rate,
+                                position_frame,
+                                self.piano_roll_scroll_note,
+                            );
+                        }
+                        BottomTab::Accuracy => {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Accuracy view coming soon")
+                                        .color(egui::Color32::from_rgb(100, 110, 120)),
+                                );
+                            });
+                        }
+                        BottomTab::Effects => {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Effects rack coming soon")
+                                        .color(egui::Color32::from_rgb(100, 110, 120)),
+                                );
+                            });
+                        }
+                    }
+                });
+        }
 
         // ─── Sidebar ─────────────────────────────────────────────
         egui::SidePanel::left("sidebar")
@@ -1191,6 +1448,285 @@ impl eframe::App for RiffLabApp {
 
         // Request continuous repaint for smooth animation
         ctx.request_repaint();
+    }
+}
+
+// ─── Piano Roll ──────────────────────────────────────────────────────────────
+
+/// Returns the note name for a MIDI note number (e.g. 60 -> "C4").
+fn midi_note_name(midi: u8) -> String {
+    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let octave = (midi as i32 / 12) - 1;
+    let idx = (midi % 12) as usize;
+    format!("{}{}", names[idx], octave)
+}
+
+/// Returns true if the MIDI note is a black key.
+fn is_black_key(midi: u8) -> bool {
+    matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
+}
+
+/// Get the color for an accuracy bucket (played notes).
+fn accuracy_color(bucket: AccuracyBucket) -> egui::Color32 {
+    match bucket {
+        AccuracyBucket::Perfect => egui::Color32::from_rgb(60, 200, 80),
+        AccuracyBucket::Good => egui::Color32::from_rgb(220, 200, 50),
+        AccuracyBucket::Acceptable => egui::Color32::from_rgb(220, 140, 40),
+        AccuracyBucket::Off => egui::Color32::from_rgb(220, 60, 60),
+    }
+}
+
+/// Draw the piano roll view.
+#[allow(clippy::too_many_arguments)]
+fn draw_piano_roll(
+    ui: &mut egui::Ui,
+    reference_notes: &[NoteEvent],
+    played_notes: &[PlayedNote],
+    scroll_offset_frames: f64,
+    frames_per_pixel: f64,
+    sample_rate: u32,
+    position_frame: u64,
+    scroll_note: f32,
+) {
+    let available = ui.available_size();
+    if available.x < 10.0 || available.y < 10.0 {
+        return;
+    }
+
+    let sr = sample_rate as f64;
+
+    // Allocate painter for the full area
+    let (response, painter) =
+        ui.allocate_painter(available, egui::Sense::click_and_drag());
+    let full_rect = response.rect;
+
+    // Piano keyboard area (left strip)
+    let key_rect = egui::Rect::from_min_size(
+        full_rect.min,
+        egui::vec2(PIANO_KEY_WIDTH, full_rect.height()),
+    );
+
+    // Note grid area (right of keyboard)
+    let grid_rect = egui::Rect::from_min_max(
+        egui::pos2(full_rect.left() + PIANO_KEY_WIDTH, full_rect.top()),
+        full_rect.max,
+    );
+
+    // Background
+    painter.rect_filled(full_rect, 0.0, egui::Color32::from_rgb(18, 20, 24));
+
+    // Compute visible note range
+    let visible_rows = (grid_rect.height() / SEMITONE_ROW_HEIGHT).ceil() as i32;
+    let bottom_note = scroll_note.floor() as i32;
+    let top_note = (bottom_note + visible_rows).min(127);
+
+    // Helper: convert MIDI note to Y position (higher notes = higher on screen = lower Y)
+    let note_to_y = |midi: i32| -> f32 {
+        let rows_from_bottom = midi as f32 - scroll_note;
+        grid_rect.bottom() - rows_from_bottom * SEMITONE_ROW_HEIGHT
+    };
+
+    // Helper: convert time (seconds) to x position in the grid
+    let time_to_x = |seconds: f64| -> f32 {
+        let frame = seconds * sr;
+        let x = (frame - scroll_offset_frames) / frames_per_pixel;
+        grid_rect.left() + x as f32
+    };
+
+    // Draw grid rows (semitone lanes)
+    for midi in bottom_note.max(0)..=top_note.min(127) {
+        let y_top = note_to_y(midi + 1);
+        let y_bot = note_to_y(midi);
+        if y_top > grid_rect.bottom() || y_bot < grid_rect.top() {
+            continue;
+        }
+        let y_top = y_top.max(grid_rect.top());
+        let y_bot = y_bot.min(grid_rect.bottom());
+
+        let row_rect = egui::Rect::from_min_max(
+            egui::pos2(grid_rect.left(), y_top),
+            egui::pos2(grid_rect.right(), y_bot),
+        );
+
+        // Alternating row colors (darker for black keys)
+        let bg = if is_black_key(midi as u8) {
+            egui::Color32::from_rgb(14, 16, 20)
+        } else {
+            egui::Color32::from_rgb(22, 24, 28)
+        };
+        painter.rect_filled(row_rect, 0.0, bg);
+
+        // Grid line at each semitone boundary
+        painter.line_segment(
+            [
+                egui::pos2(grid_rect.left(), y_bot),
+                egui::pos2(grid_rect.right(), y_bot),
+            ],
+            egui::Stroke::new(
+                if midi % 12 == 0 { 0.8 } else { 0.3 },
+                egui::Color32::from_rgb(40, 44, 50),
+            ),
+        );
+    }
+
+    // Draw reference notes (semi-transparent colored rectangles)
+    let ref_color = egui::Color32::from_rgba_premultiplied(60, 120, 200, 60);
+    let ref_border = egui::Color32::from_rgba_premultiplied(80, 150, 230, 120);
+    for note in reference_notes {
+        let x0 = time_to_x(note.onset_seconds);
+        let x1 = time_to_x(note.end_seconds());
+        let y_top = note_to_y(note.midi_note as i32 + 1);
+        let y_bot = note_to_y(note.midi_note as i32);
+
+        // Clip to visible grid
+        if x1 < grid_rect.left() || x0 > grid_rect.right() {
+            continue;
+        }
+        if y_top > grid_rect.bottom() || y_bot < grid_rect.top() {
+            continue;
+        }
+
+        let note_rect = egui::Rect::from_min_max(
+            egui::pos2(x0.max(grid_rect.left()), y_top.max(grid_rect.top())),
+            egui::pos2(x1.min(grid_rect.right()), y_bot.min(grid_rect.bottom())),
+        );
+        painter.rect_filled(note_rect, 2.0, ref_color);
+        painter.rect_stroke(note_rect, 2.0, egui::Stroke::new(1.0, ref_border), egui::StrokeKind::Inside);
+    }
+
+    // Check which reference notes were missed (no overlapping played note)
+    let missed_color = egui::Color32::from_rgba_premultiplied(120, 120, 120, 100);
+    for note in reference_notes {
+        let has_match = played_notes.iter().any(|p| {
+            p.midi_note == note.midi_note
+                && p.start_seconds < note.end_seconds()
+                && p.end_seconds > note.onset_seconds
+        });
+        if !has_match {
+            let x0 = time_to_x(note.onset_seconds);
+            let x1 = time_to_x(note.end_seconds());
+            let y_top = note_to_y(note.midi_note as i32 + 1);
+            let y_bot = note_to_y(note.midi_note as i32);
+
+            if x1 < grid_rect.left() || x0 > grid_rect.right() {
+                continue;
+            }
+            if y_top > grid_rect.bottom() || y_bot < grid_rect.top() {
+                continue;
+            }
+
+            let note_rect = egui::Rect::from_min_max(
+                egui::pos2(x0.max(grid_rect.left()), y_top.max(grid_rect.top())),
+                egui::pos2(x1.min(grid_rect.right()), y_bot.min(grid_rect.bottom())),
+            );
+            painter.rect_stroke(
+                note_rect,
+                2.0,
+                egui::Stroke::new(1.5, missed_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    // Draw played notes (solid rectangles, color-coded by accuracy)
+    for pn in played_notes {
+        let x0 = time_to_x(pn.start_seconds);
+        let x1 = time_to_x(pn.end_seconds);
+        let y_top = note_to_y(pn.midi_note as i32 + 1);
+        let y_bot = note_to_y(pn.midi_note as i32);
+
+        // Clip
+        if x1 < grid_rect.left() || x0 > grid_rect.right() {
+            continue;
+        }
+        if y_top > grid_rect.bottom() || y_bot < grid_rect.top() {
+            continue;
+        }
+
+        // Ensure minimum width of 2px so short notes are visible
+        let draw_x1 = x1.max(x0 + 2.0);
+
+        let note_rect = egui::Rect::from_min_max(
+            egui::pos2(x0.max(grid_rect.left()), y_top.max(grid_rect.top()) + 1.0),
+            egui::pos2(
+                draw_x1.min(grid_rect.right()),
+                y_bot.min(grid_rect.bottom()) - 1.0,
+            ),
+        );
+        let color = accuracy_color(pn.accuracy);
+        painter.rect_filled(note_rect, 1.0, color);
+    }
+
+    // Draw piano keyboard strip
+    painter.rect_filled(key_rect, 0.0, egui::Color32::from_rgb(25, 28, 32));
+    for midi in bottom_note.max(0)..=top_note.min(127) {
+        let y_top = note_to_y(midi + 1);
+        let y_bot = note_to_y(midi);
+        if y_top > key_rect.bottom() || y_bot < key_rect.top() {
+            continue;
+        }
+        let y_top = y_top.max(key_rect.top());
+        let y_bot = y_bot.min(key_rect.bottom());
+
+        let is_black = is_black_key(midi as u8);
+        let key_bg = if is_black {
+            egui::Color32::from_rgb(30, 32, 38)
+        } else {
+            egui::Color32::from_rgb(55, 58, 65)
+        };
+        let kr = egui::Rect::from_min_max(
+            egui::pos2(key_rect.left(), y_top),
+            egui::pos2(key_rect.right() - 1.0, y_bot),
+        );
+        painter.rect_filled(kr, 0.0, key_bg);
+
+        // Note label for C notes and every octave
+        if midi % 12 == 0 || (y_bot - y_top) > 10.0 {
+            let name = midi_note_name(midi as u8);
+            let text_color = if midi % 12 == 0 {
+                egui::Color32::from_rgb(180, 185, 190)
+            } else {
+                egui::Color32::from_rgb(110, 115, 120)
+            };
+            let font = egui::FontId::monospace(9.0);
+            painter.text(
+                egui::pos2(key_rect.left() + 3.0, (y_top + y_bot) / 2.0),
+                egui::Align2::LEFT_CENTER,
+                name,
+                font,
+                text_color,
+            );
+        }
+
+        // Separator line
+        painter.line_segment(
+            [
+                egui::pos2(key_rect.left(), y_bot),
+                egui::pos2(key_rect.right(), y_bot),
+            ],
+            egui::Stroke::new(0.3, egui::Color32::from_rgb(40, 44, 50)),
+        );
+    }
+
+    // Right border of keyboard
+    painter.line_segment(
+        [
+            egui::pos2(key_rect.right(), key_rect.top()),
+            egui::pos2(key_rect.right(), key_rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 55, 62)),
+    );
+
+    // Playhead line
+    let playhead_x = time_to_x(position_frame as f64 / sr);
+    if playhead_x >= grid_rect.left() && playhead_x <= grid_rect.right() {
+        painter.line_segment(
+            [
+                egui::pos2(playhead_x, grid_rect.top()),
+                egui::pos2(playhead_x, grid_rect.bottom()),
+            ],
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 50, 50)),
+        );
     }
 }
 
