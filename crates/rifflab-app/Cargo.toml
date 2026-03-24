@@ -17,6 +17,10 @@ rifflab-stems = { workspace = true }
 rifflab-analysis = { workspace = true }
 rifflab-practice = { workspace = true }
 rifflab-ui = { workspace = true }
+cpal = { version = "0.15", features = ["jack"] }
+eframe = "0.31"
+egui = "0.31"
+rtrb = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
