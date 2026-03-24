@@ -2629,7 +2629,39 @@ impl RiffLabApp {
     fn draw_effects_rack(&mut self, ui: &mut egui::Ui) {
         let graph_arc = self.engine.lock().unwrap().graph().clone();
 
-        // Add Effect button
+        // Snapshot effect state (brief lock, no rendering while locked)
+        struct FxSnap {
+            name: String,
+            type_id: String,
+            bypassed: bool,
+            params: Vec<(ParamDescriptor, f32)>,
+        }
+        let fx_snap: Vec<FxSnap> = if let Ok(graph) = graph_arc.try_lock() {
+            graph.fx_chain.effects().iter().map(|e| {
+                let descs = e.param_descriptors();
+                let params = descs.into_iter()
+                    .filter(|d| d.name != "Bypass")
+                    .map(|d| { let v = e.get_param(d.id); (d, v) })
+                    .collect();
+                FxSnap {
+                    name: e.name().to_string(),
+                    type_id: e.effect_type_id().to_string(),
+                    bypassed: e.is_bypassed(),
+                    params,
+                }
+            }).collect()
+        } else {
+            // Lock failed — use empty (no flicker, just show what we had)
+            Vec::new()
+        };
+
+        // Collect mutations to apply after rendering
+        let mut add_effect: Option<String> = None;
+        let mut remove_idx: Option<usize> = None;
+        let mut param_changes: Vec<(usize, ParamId, f32)> = Vec::new();
+        let mut bypass_toggles: Vec<usize> = Vec::new();
+
+        // Header
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Signal Chain")
@@ -2646,15 +2678,10 @@ impl RiffLabApp {
                 }
                 egui::popup_below_widget(ui, popup_id, &add_resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                     ui.set_min_width(180.0);
-                    let effects = self.fx_registry.list_effects();
-                    for (type_id, name, _category) in &effects {
-                        if type_id == "builtin:tuner" { continue; } // skip tuner in rack
+                    for (type_id, name, _) in &self.fx_registry.list_effects() {
+                        if type_id == "builtin:tuner" { continue; }
                         if ui.button(name).clicked() {
-                            if let Some(effect) = self.fx_registry.create_effect(type_id) {
-                                if let Ok(mut graph) = graph_arc.try_lock() {
-                                    graph.fx_chain.add(effect);
-                                }
-                            }
+                            add_effect = Some(type_id.clone());
                             ui.memory_mut(|m| m.toggle_popup(popup_id));
                         }
                     }
@@ -2664,159 +2691,152 @@ impl RiffLabApp {
 
         ui.separator();
 
-        // Scrollable effects list
+        // Render effects from snapshot (no lock held)
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let mut remove_idx: Option<usize> = None;
+            if fx_snap.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(100, 110, 120),
+                    "No effects loaded. Click '+ Add Effect' to start.",
+                );
+                return;
+            }
 
-            if let Ok(mut graph) = graph_arc.try_lock() {
-                let chain = &mut graph.fx_chain;
-                if chain.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(100, 110, 120),
-                        "No effects loaded. Click '+ Add Effect' to start.",
-                    );
-                } else {
-                    for idx in 0..chain.len() {
-                        let effect = &mut chain.effects_mut()[idx];
-                        let effect_name = effect.name().to_string();
-                        let type_id = effect.effect_type_id().to_string();
-                        let is_bypassed = effect.is_bypassed();
+            for (idx, fx) in fx_snap.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    // Bypass toggle
+                    let (label, color) = if fx.bypassed {
+                        ("OFF", egui::Color32::from_rgb(120, 120, 120))
+                    } else {
+                        ("ON", egui::Color32::from_rgb(80, 200, 120))
+                    };
+                    if ui.add(
+                        egui::Button::new(egui::RichText::new(label).size(10.0).color(color))
+                            .min_size(egui::vec2(32.0, 18.0))
+                    ).clicked() {
+                        bypass_toggles.push(idx);
+                    }
 
-                        // Effect header
+                    // Effect name
+                    let name_color = if fx.bypassed {
+                        egui::Color32::from_rgb(120, 120, 120)
+                    } else {
+                        egui::Color32::from_rgb(220, 225, 230)
+                    };
+                    ui.label(egui::RichText::new(&fx.name).strong().size(12.0).color(name_color));
+
+                    // Remove button
+                    if ui.small_button(
+                        egui::RichText::new("\u{2716}").size(11.0).color(egui::Color32::from_rgb(180, 80, 80))
+                    ).clicked() {
+                        remove_idx = Some(idx);
+                    }
+                });
+
+                // Parameters
+                if !fx.bypassed {
+                    for (desc, val) in &fx.params {
+                        let mut v = *val;
                         ui.horizontal(|ui| {
-                            // Bypass toggle
-                            let bypass_label = if is_bypassed { "OFF" } else { "ON" };
-                            let bypass_color = if is_bypassed {
-                                egui::Color32::from_rgb(120, 120, 120)
-                            } else {
-                                egui::Color32::from_rgb(80, 200, 120)
-                            };
-                            if ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(bypass_label).size(10.0).color(bypass_color)
-                                ).min_size(egui::vec2(32.0, 18.0))
-                            ).clicked() {
-                                // Find the bypass param and toggle it
-                                for desc in effect.param_descriptors() {
-                                    if desc.name == "Bypass" {
-                                        let new_val = if is_bypassed { 0.0 } else { 1.0 };
-                                        effect.set_param(desc.id, new_val);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            ui.label(
-                                egui::RichText::new(&effect_name)
-                                    .strong()
-                                    .size(12.0)
-                                    .color(if is_bypassed {
-                                        egui::Color32::from_rgb(120, 120, 120)
-                                    } else {
-                                        egui::Color32::from_rgb(220, 225, 230)
-                                    }),
+                            ui.add_sized(
+                                egui::vec2(60.0, 16.0),
+                                egui::Label::new(
+                                    egui::RichText::new(&desc.name)
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(160, 165, 170)),
+                                ),
                             );
 
-                            // Remove button (right-aligned)
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button(
-                                    egui::RichText::new("X").size(10.0).color(egui::Color32::from_rgb(180, 80, 80))
-                                ).clicked() {
-                                    remove_idx = Some(idx);
+                            let changed = match &desc.kind {
+                                ParamKind::Bool => {
+                                    let mut b = v > 0.5;
+                                    let c = ui.checkbox(&mut b, "").changed();
+                                    if c { v = if b { 1.0 } else { 0.0 }; }
+                                    c
                                 }
-                            });
-                        });
+                                ParamKind::Enum(labels) => {
+                                    let cur = v.round() as usize;
+                                    let cur_label = labels.get(cur).cloned().unwrap_or_default();
+                                    let mut changed = false;
+                                    egui::ComboBox::from_id_salt(format!("fx{}_{}", idx, desc.id.0))
+                                        .selected_text(&cur_label)
+                                        .width(120.0)
+                                        .show_ui(ui, |ui| {
+                                            for (i, l) in labels.iter().enumerate() {
+                                                if ui.selectable_value(&mut v, i as f32, l).changed() {
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                    changed
+                                }
+                                ParamKind::Int => {
+                                    let mut iv = v.round() as i32;
+                                    let c = ui.add(egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32)).changed();
+                                    if c { v = iv as f32; }
+                                    c
+                                }
+                                ParamKind::Float => {
+                                    let unit = desc.unit.clone();
+                                    ui.add(egui::Slider::new(&mut v, desc.min..=desc.max)
+                                        .custom_formatter(move |val, _| {
+                                            if unit.is_empty() { format!("{:.2}", val) }
+                                            else { format!("{:.1} {}", val, unit) }
+                                        })
+                                    ).changed()
+                                }
+                            };
 
-                        // Parameters (skip Bypass since we have the toggle)
-                        if !is_bypassed {
-                            let descs: Vec<ParamDescriptor> = effect.param_descriptors()
-                                .into_iter()
-                                .filter(|d| d.name != "Bypass")
-                                .collect();
-
-                            for desc in &descs {
-                                let mut val = effect.get_param(desc.id);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&desc.name)
-                                            .size(10.0)
-                                            .color(egui::Color32::from_rgb(160, 165, 170)),
-                                    );
-
-                                    let changed = match &desc.kind {
-                                        ParamKind::Bool => {
-                                            let mut b = val > 0.5;
-                                            let c = ui.checkbox(&mut b, "").changed();
-                                            if c { val = if b { 1.0 } else { 0.0 }; }
-                                            c
-                                        }
-                                        ParamKind::Enum(labels) => {
-                                            let current_idx = val.round() as usize;
-                                            let current_label = labels.get(current_idx)
-                                                .cloned()
-                                                .unwrap_or_else(|| format!("{}", current_idx));
-                                            let mut changed = false;
-                                            egui::ComboBox::from_id_salt(format!("{}_{}", type_id, desc.id.0))
-                                                .selected_text(&current_label)
-                                                .width(120.0)
-                                                .show_ui(ui, |ui| {
-                                                    for (i, label) in labels.iter().enumerate() {
-                                                        if ui.selectable_value(&mut val, i as f32, label).changed() {
-                                                            changed = true;
-                                                        }
-                                                    }
-                                                });
-                                            changed
-                                        }
-                                        ParamKind::Int => {
-                                            let mut ival = val.round() as i32;
-                                            let c = ui.add(
-                                                egui::Slider::new(&mut ival, desc.min as i32..=desc.max as i32)
-                                            ).changed();
-                                            if c { val = ival as f32; }
-                                            c
-                                        }
-                                        ParamKind::Float => {
-                                            let unit = &desc.unit;
-                                            let c = ui.add(
-                                                egui::Slider::new(&mut val, desc.min..=desc.max)
-                                                    .custom_formatter(move |v, _| {
-                                                        if unit.is_empty() {
-                                                            format!("{:.2}", v)
-                                                        } else {
-                                                            format!("{:.1} {}", v, unit)
-                                                        }
-                                                    })
-                                            ).changed();
-                                            c
-                                        }
-                                    };
-
-                                    if changed {
-                                        effect.set_param(desc.id, val);
-                                    }
-                                });
+                            if changed {
+                                param_changes.push((idx, desc.id, v));
                             }
-                        }
-
-                        ui.add_space(4.0);
-                        if idx + 1 < chain.len() {
-                            ui.separator();
-                        }
+                        });
                     }
                 }
 
-                // Remove effect if requested
-                if let Some(idx) = remove_idx {
-                    chain.remove(idx);
+                ui.add_space(4.0);
+                if idx + 1 < fx_snap.len() {
+                    ui.separator();
                 }
-            } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 120, 120),
-                    "Audio engine busy...",
-                );
             }
         });
+
+        // Apply mutations (brief lock)
+        let needs_lock = add_effect.is_some() || remove_idx.is_some()
+            || !param_changes.is_empty() || !bypass_toggles.is_empty();
+        if needs_lock {
+            if let Ok(mut graph) = graph_arc.try_lock() {
+                // Add
+                if let Some(type_id) = &add_effect {
+                    if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                        graph.fx_chain.add(effect);
+                    }
+                }
+                // Remove (do before param changes to avoid index shift issues)
+                if let Some(idx) = remove_idx {
+                    if idx < graph.fx_chain.len() {
+                        graph.fx_chain.remove(idx);
+                    }
+                }
+                // Bypass toggles
+                for idx in &bypass_toggles {
+                    if let Some(effect) = graph.fx_chain.effects_mut().get_mut(*idx) {
+                        for desc in effect.param_descriptors() {
+                            if desc.name == "Bypass" {
+                                let cur = effect.get_param(desc.id);
+                                effect.set_param(desc.id, if cur > 0.5 { 0.0 } else { 1.0 });
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Param changes
+                for (idx, param_id, val) in &param_changes {
+                    if let Some(effect) = graph.fx_chain.effects_mut().get_mut(*idx) {
+                        effect.set_param(*param_id, *val);
+                    }
+                }
+            }
+        }
     }
 
     fn draw_tuner_settings(&mut self, ctx: &egui::Context) {
