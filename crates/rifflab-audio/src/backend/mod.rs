@@ -58,9 +58,21 @@ pub type AudioCallback = Box<
     dyn FnMut(&[f32], &mut [f32], usize) + Send + 'static
 >;
 
-/// Try to create a JACK backend, falling back to ALSA.
+/// Create an audio backend. Tries cpal (ALSA/PipeWire) first, JACK as fallback.
 pub fn create_backend() -> Result<Box<dyn AudioBackend>, BackendError> {
-    // Try JACK first
+    // Try cpal first — works with PipeWire, PulseAudio, and ALSA
+    #[cfg(feature = "alsa-backend")]
+    match alsa_backend::AlsaBackend::new() {
+        Ok(backend) => {
+            log::info!("Using cpal audio backend (PipeWire/ALSA)");
+            return Ok(Box::new(backend));
+        }
+        Err(e) => {
+            log::warn!("cpal not available ({e}), trying JACK");
+        }
+    }
+
+    // Fallback to JACK
     #[cfg(feature = "jack-backend")]
     match jack_backend::JackBackend::new() {
         Ok(backend) => {
@@ -68,18 +80,7 @@ pub fn create_backend() -> Result<Box<dyn AudioBackend>, BackendError> {
             return Ok(Box::new(backend));
         }
         Err(e) => {
-            log::warn!("JACK not available ({e}), falling back to ALSA");
-        }
-    }
-
-    #[cfg(feature = "alsa-backend")]
-    match alsa_backend::AlsaBackend::new() {
-        Ok(backend) => {
-            log::info!("Using ALSA audio backend via cpal");
-            return Ok(Box::new(backend));
-        }
-        Err(e) => {
-            log::error!("ALSA also failed: {e}");
+            log::error!("JACK also failed: {e}");
         }
     }
 
