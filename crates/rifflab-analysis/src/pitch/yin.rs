@@ -139,6 +139,54 @@ impl YinDetector {
     }
 }
 
+impl YinDetector {
+    /// Process a full audio buffer offline and return pitch data for each frame.
+    ///
+    /// Returns a `Vec` of `(time_seconds, frequency_hz, confidence)` tuples.
+    /// Uses a hop size of 256 samples (same as real-time).
+    /// Frames with very low energy (silence) return 0.0 Hz.
+    pub fn detect_batch(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Vec<(f64, f32, f32)> {
+        let hop_size = 256;
+        let silence_threshold = 1e-6; // RMS threshold below which we consider silence
+        let mut results = Vec::new();
+
+        // Reset internal state for a clean run
+        self.buffer.fill(0.0);
+        self.write_pos = 0;
+        self.sample_rate = sample_rate;
+
+        let num_chunks = samples.len() / hop_size;
+        for i in 0..num_chunks {
+            let start = i * hop_size;
+            let end = start + hop_size;
+            let chunk = &samples[start..end];
+
+            // Check energy: if the chunk is essentially silent, skip pitch detection
+            let rms = (chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+            if rms < silence_threshold {
+                // Still feed the buffer so state stays consistent
+                for &s in chunk {
+                    self.buffer[self.write_pos] = s;
+                    self.write_pos = (self.write_pos + 1) % self.buffer.len();
+                }
+                let time = start as f64 / sample_rate as f64;
+                results.push((time, 0.0, 0.0));
+                continue;
+            }
+
+            let frame = self.detect(chunk);
+            let time = start as f64 / sample_rate as f64;
+            results.push((time, frame.frequency_hz, frame.confidence));
+        }
+
+        results
+    }
+}
+
 /// Convert frequency to MIDI note number and cents deviation.
 fn freq_to_midi_cents(freq: f32) -> (u8, f32) {
     let midi_float = 69.0 + 12.0 * (freq / 440.0).log2();
@@ -192,5 +240,59 @@ mod tests {
         assert!(result.confidence > 0.5);
         // MIDI note 69 = A4, should still round correctly within 5 Hz
         assert_eq!(result.midi_note, 69);
+    }
+
+    #[test]
+    fn test_detect_batch_sine_440() {
+        let sample_rate = 48000u32;
+        let freq = 440.0f32;
+        let duration_secs = 0.5;
+        let num_samples = (sample_rate as f64 * duration_secs) as usize;
+
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (2.0 * std::f32::consts::PI * freq * t).sin()
+            })
+            .collect();
+
+        let mut detector = YinDetector::new(sample_rate);
+        let results = detector.detect_batch(&samples, sample_rate);
+
+        assert!(!results.is_empty(), "Should have at least one frame");
+
+        // Skip the first few frames while the buffer fills up
+        let stable_results: Vec<_> = results.iter().skip(15).collect();
+        assert!(!stable_results.is_empty());
+
+        for &&(_, freq_hz, confidence) in &stable_results {
+            if confidence > 0.5 {
+                assert!(
+                    (freq_hz - freq).abs() < 10.0,
+                    "Expected ~{freq} Hz, got {freq_hz} Hz"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_batch_silence() {
+        let sample_rate = 48000u32;
+        let duration_secs = 0.2;
+        let num_samples = (sample_rate as f64 * duration_secs) as usize;
+
+        let samples = vec![0.0f32; num_samples];
+
+        let mut detector = YinDetector::new(sample_rate);
+        let results = detector.detect_batch(&samples, sample_rate);
+
+        assert!(!results.is_empty());
+
+        for &(_, freq_hz, _confidence) in &results {
+            assert!(
+                freq_hz.abs() < 1.0,
+                "Silence should give ~0 Hz, got {freq_hz} Hz"
+            );
+        }
     }
 }
