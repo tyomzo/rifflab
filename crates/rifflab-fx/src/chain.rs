@@ -41,6 +41,15 @@ impl EffectChain {
     pub fn effects_mut(&mut self) -> &mut [Box<dyn EffectDescriptor>] {
         &mut self.effects
     }
+
+    /// Move an effect from one position to another.
+    pub fn move_effect(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.effects.len() || to >= self.effects.len() {
+            return;
+        }
+        let effect = self.effects.remove(from);
+        self.effects.insert(to, effect);
+    }
 }
 
 impl Default for EffectChain {
