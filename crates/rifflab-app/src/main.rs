@@ -15,6 +15,7 @@ use rifflab_core::metering::MeterData;
 use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
 use rifflab_core::transport::{LoopRegion, TransportState};
+use rifflab_cue::{Cue, CueAction, CueEngine, CueList, CuePosition, DispatchedAction};
 use rifflab_fx::registry::EffectRegistry;
 use rifflab_practice::compare::Comparator;
 use rifflab_practice::scoring::SessionScorer;
@@ -594,6 +595,8 @@ struct RiffLabApp {
     fx_registry: EffectRegistry,
     /// Whether the "Add Effect" dropdown is open.
     fx_add_open: bool,
+    /// Cue engine for timeline automation.
+    cue_engine: CueEngine,
 }
 
 impl RiffLabApp {
@@ -675,6 +678,7 @@ impl RiffLabApp {
             sidebar_snapshot: None,
             fx_registry: EffectRegistry::new(),
             fx_add_open: false,
+            cue_engine: CueEngine::new(sample_rate),
         }
     }
 
@@ -922,6 +926,27 @@ impl eframe::App for RiffLabApp {
         };
         let position_secs = position.seconds();
         let position_frame = position.frame;
+
+        // ─── Tick cue engine ─────────────────────────────────────
+        if state == TransportState::Playing {
+            let actions = self.cue_engine.tick(position_frame);
+            for action in actions {
+                match action {
+                    DispatchedAction::SetLoop(region) => {
+                        let mut eng = self.engine.lock().unwrap();
+                        eng.transport_mut().set_loop(Some(region));
+                    }
+                    DispatchedAction::ClearLoop => {
+                        let mut eng = self.engine.lock().unwrap();
+                        eng.transport_mut().set_loop(None);
+                    }
+                    DispatchedAction::SwitchPreset(name) => {
+                        log::info!("Cue: switch preset to '{}'", name);
+                        // TODO: load preset by name and apply to fx_chain
+                    }
+                }
+            }
+        }
 
         // Drain pitch frames, run comparison, update score, track played notes
         while let Ok(pitch) = self.pitch_rx.pop() {
@@ -1766,6 +1791,35 @@ impl eframe::App for RiffLabApp {
                     );
                 }
 
+                // Cue markers on ruler (snapshot to avoid borrow conflicts with context menu)
+                {
+                    let cues_snap: Vec<_> = self.cue_engine.cue_list().cues.iter()
+                        .filter_map(|cue| {
+                            let frame = cue.position.to_frame(None, self.sample_rate)?;
+                            Some((frame, cue.label.clone(), cue.color))
+                        })
+                        .collect();
+                    for (cue_frame, label, color_rgb) in &cues_snap {
+                        let cx = rect.left() + self.frame_to_x(*cue_frame) as f32;
+                        if cx >= rect.left() && cx <= rect.right() {
+                            let color = egui::Color32::from_rgb(color_rgb[0], color_rgb[1], color_rgb[2]);
+                            painter.line_segment(
+                                [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+                                egui::Stroke::new(1.5, color),
+                            );
+                            if !label.is_empty() {
+                                painter.text(
+                                    egui::pos2(cx + 3.0, rect.top() + 2.0),
+                                    egui::Align2::LEFT_TOP,
+                                    label,
+                                    egui::FontId::proportional(9.0),
+                                    color,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Playhead on ruler
                 let playhead_x = rect.left() + self.frame_to_x(position_frame) as f32;
                 if playhead_x >= rect.left() && playhead_x <= rect.right() {
@@ -1830,11 +1884,61 @@ impl eframe::App for RiffLabApp {
                     }
                 }
 
-                // Right-click to clear loop
-                if response.secondary_clicked() {
-                    let mut eng = self.engine.lock().unwrap();
-                    eng.transport_mut().set_loop(None);
-                }
+                // Right-click context menu on ruler
+                response.context_menu(|ui| {
+                    let click_frame = response.interact_pointer_pos()
+                        .map(|pos| self.x_to_frame((pos.x - rect.left()) as f64))
+                        .unwrap_or(0);
+                    let time_secs = click_frame as f64 / self.sample_rate as f64;
+
+                    ui.label(egui::RichText::new(format!("@ {:.1}s", time_secs)).size(10.0));
+                    ui.separator();
+
+                    let next_idx = self.cue_engine.cue_list().len() + 1;
+                    if ui.button("Add Marker").clicked() {
+                        self.cue_engine.cue_list_mut().add(Cue {
+                            position: CuePosition::Frame(click_frame),
+                            action: CueAction::Marker,
+                            label: format!("Cue {}", next_idx),
+                            color: [220, 200, 50],
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Add Loop Cue").clicked() {
+                        let end = click_frame + self.sample_rate as u64 * 4;
+                        self.cue_engine.cue_list_mut().add(Cue {
+                            position: CuePosition::Frame(click_frame),
+                            action: CueAction::SetLoop(LoopRegion {
+                                start_frame: click_frame,
+                                end_frame: end,
+                            }),
+                            label: format!("Loop {}", next_idx),
+                            color: [140, 80, 220],
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Add Preset Cue").clicked() {
+                        self.cue_engine.cue_list_mut().add(Cue {
+                            position: CuePosition::Frame(click_frame),
+                            action: CueAction::SwitchPreset("Default".into()),
+                            label: "Preset".to_string(),
+                            color: [80, 200, 140],
+                        });
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Clear Loop").clicked() {
+                        let mut eng = self.engine.lock().unwrap();
+                        eng.transport_mut().set_loop(None);
+                        ui.close_menu();
+                    }
+                    if !self.cue_engine.cue_list().is_empty() {
+                        if ui.button("Clear All Cues").clicked() {
+                            *self.cue_engine.cue_list_mut() = CueList::new();
+                            ui.close_menu();
+                        }
+                    }
+                });
 
                 // Drag preview overlay
                 if self.loop_drag.dragging {
