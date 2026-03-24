@@ -586,7 +586,8 @@ struct RiffLabApp {
     /// Status message for file loading (shown in status bar).
     load_status: LoadStatus,
     /// Cached sidebar state to avoid locking every frame.
-    sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32)>,
+    /// (num_stems, solos, mutes, volumes, master_vol, input_vol)
+    sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32)>,
 }
 
 impl RiffLabApp {
@@ -1424,7 +1425,7 @@ impl eframe::App for RiffLabApp {
         // Snapshot graph state with try_lock — never block the audio thread.
         // If we can't get the lock this frame, use stale data from last frame.
         let graph_arc = self.engine.lock().unwrap().graph().clone();
-        let (num_stems, mut solos, mut mutes, mut volumes, mut master_vol) = {
+        let (num_stems, mut solos, mut mutes, mut volumes, mut master_vol, mut input_vol) = {
             if let Ok(graph) = graph_arc.try_lock() {
                 let snap = (
                     graph.stem_players.len(),
@@ -1432,13 +1433,14 @@ impl eframe::App for RiffLabApp {
                     graph.stem_mutes.clone(),
                     graph.stem_volumes.clone(),
                     graph.master_volume,
+                    graph.input_volume,
                 );
-                self.sidebar_snapshot = Some((snap.0, snap.1.clone(), snap.2.clone(), snap.3.clone(), snap.4));
+                self.sidebar_snapshot = Some((snap.0, snap.1.clone(), snap.2.clone(), snap.3.clone(), snap.4, snap.5));
                 snap
             } else if let Some(ref snap) = self.sidebar_snapshot {
                 snap.clone()
             } else {
-                (0, Vec::new(), Vec::new(), Vec::new(), 1.0)
+                (0, Vec::new(), Vec::new(), Vec::new(), 1.0, 1.0)
             }
         };
 
@@ -1563,7 +1565,68 @@ impl eframe::App for RiffLabApp {
                         );
                     }
 
-                    ui.add_space(20.0);
+                    // ── Live Input track ──
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        // Color dot (orange for input)
+                        let input_color = egui::Color32::from_rgb(240, 140, 40);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.0, input_color);
+
+                        ui.label(
+                            egui::RichText::new("Live Input")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(220, 225, 230)),
+                        );
+                    });
+
+                    // Mute button for input
+                    ui.horizontal(|ui| {
+                        let is_muted = input_vol <= 0.0;
+                        let mute_color = if is_muted {
+                            egui::Color32::from_rgb(220, 60, 60)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 80)
+                        };
+                        let mute_btn = egui::Button::new(
+                            egui::RichText::new("M")
+                                .size(11.0)
+                                .color(if is_muted {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(160, 160, 160)
+                                }),
+                        )
+                        .fill(mute_color)
+                        .min_size(egui::vec2(24.0, 18.0));
+                        if ui.add(mute_btn).clicked() {
+                            if is_muted {
+                                input_vol = 1.0; // unmute
+                            } else {
+                                input_vol = 0.0; // mute
+                            }
+                        }
+                    });
+
+                    // Input volume slider
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Vol")
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                        );
+                        let slider = egui::Slider::new(&mut input_vol, 0.0..=2.0)
+                            .show_value(false)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
+                        ui.add(slider);
+                    });
+
+                    // ── Master ──
+                    ui.add_space(12.0);
                     ui.separator();
 
                     ui.label(
@@ -1590,10 +1653,10 @@ impl eframe::App for RiffLabApp {
                 });
             });
 
-        // Write back only if the user changed something (compare to snapshot)
         // Write back only if the user changed something
         let changed = self.sidebar_snapshot.as_ref().map_or(false, |snap| {
-            snap.1 != solos || snap.2 != mutes || snap.3 != volumes || snap.4 != master_vol
+            snap.1 != solos || snap.2 != mutes || snap.3 != volumes
+                || snap.4 != master_vol || snap.5 != input_vol
         });
         if changed {
             if let Ok(mut graph) = graph_arc.try_lock() {
@@ -1601,6 +1664,7 @@ impl eframe::App for RiffLabApp {
                 graph.stem_mutes = mutes;
                 graph.stem_volumes = volumes;
                 graph.master_volume = master_vol;
+                graph.input_volume = input_vol;
             }
         }
 
