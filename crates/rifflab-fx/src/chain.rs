@@ -1,9 +1,10 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId};
 
 /// An ordered chain of audio effects.
-/// Implements AudioProcessor itself so it can be plugged into the audio graph.
+/// Implements both AudioProcessor and EffectDescriptor so it can be plugged
+/// into the audio graph while still exposing rich metadata.
 pub struct EffectChain {
-    effects: Vec<Box<dyn AudioProcessor>>,
+    effects: Vec<Box<dyn EffectDescriptor>>,
 }
 
 impl EffectChain {
@@ -13,15 +14,15 @@ impl EffectChain {
         }
     }
 
-    pub fn add(&mut self, effect: Box<dyn AudioProcessor>) {
+    pub fn add(&mut self, effect: Box<dyn EffectDescriptor>) {
         self.effects.push(effect);
     }
 
-    pub fn insert(&mut self, index: usize, effect: Box<dyn AudioProcessor>) {
+    pub fn insert(&mut self, index: usize, effect: Box<dyn EffectDescriptor>) {
         self.effects.insert(index, effect);
     }
 
-    pub fn remove(&mut self, index: usize) -> Box<dyn AudioProcessor> {
+    pub fn remove(&mut self, index: usize) -> Box<dyn EffectDescriptor> {
         self.effects.remove(index)
     }
 
@@ -33,11 +34,11 @@ impl EffectChain {
         self.effects.is_empty()
     }
 
-    pub fn effects(&self) -> &[Box<dyn AudioProcessor>] {
+    pub fn effects(&self) -> &[Box<dyn EffectDescriptor>] {
         &self.effects
     }
 
-    pub fn effects_mut(&mut self) -> &mut [Box<dyn AudioProcessor>] {
+    pub fn effects_mut(&mut self) -> &mut [Box<dyn EffectDescriptor>] {
         &mut self.effects
     }
 }
@@ -69,5 +70,34 @@ impl AudioProcessor for EffectChain {
 
     fn name(&self) -> &str {
         "Effect Chain"
+    }
+}
+
+impl EffectDescriptor for EffectChain {
+    fn effect_type_id(&self) -> &str {
+        "builtin:chain"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        // Aggregate descriptors from all child effects.
+        // Each child's params are returned as-is; callers should use the
+        // per-effect accessors for disambiguation.
+        let mut all = Vec::new();
+        for effect in &self.effects {
+            all.extend(effect.param_descriptors());
+        }
+        all
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        // Delegate to the first child that recognises this param id.
+        for effect in &self.effects {
+            for desc in effect.param_descriptors() {
+                if desc.id == param {
+                    return effect.get_param(param);
+                }
+            }
+        }
+        0.0
     }
 }

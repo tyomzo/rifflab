@@ -1,4 +1,4 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// Dynamic range compressor.
 pub struct Compressor {
@@ -83,5 +83,77 @@ impl AudioProcessor for Compressor {
 
     fn is_bypassed(&self) -> bool {
         self.bypassed
+    }
+}
+
+impl EffectDescriptor for Compressor {
+    fn effect_type_id(&self) -> &str {
+        "builtin:compressor"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor {
+                id: ParamId(0),
+                name: "Threshold".into(),
+                unit: "dB".into(),
+                min: -60.0,
+                max: 0.0,
+                default: -20.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(1),
+                name: "Ratio".into(),
+                unit: "".into(),
+                min: 1.0,
+                max: 20.0,
+                default: 4.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(2),
+                name: "Attack".into(),
+                unit: "ms".into(),
+                min: 0.1,
+                max: 200.0,
+                default: 5.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(3),
+                name: "Release".into(),
+                unit: "ms".into(),
+                min: 1.0,
+                max: 2000.0,
+                default: 50.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(4),
+                name: "Makeup Gain".into(),
+                unit: "dB".into(),
+                min: -12.0,
+                max: 36.0,
+                default: 0.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+        ]
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        match param.0 {
+            0 => self.threshold,
+            1 => self.ratio,
+            2 => self.attack_ms,
+            3 => self.release_ms,
+            4 => self.makeup_gain,
+            _ => 0.0,
+        }
     }
 }

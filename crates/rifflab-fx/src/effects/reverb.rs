@@ -1,4 +1,4 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// Simple Schroeder reverb with 4 comb filters and 2 allpass filters.
 pub struct Reverb {
@@ -149,5 +149,66 @@ impl AudioProcessor for Reverb {
 
     fn is_bypassed(&self) -> bool {
         self.bypassed
+    }
+}
+
+impl EffectDescriptor for Reverb {
+    fn effect_type_id(&self) -> &str {
+        "builtin:reverb"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor {
+                id: ParamId(0),
+                name: "Room Size".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(1),
+                name: "Damping".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.3,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(2),
+                name: "Wet".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.3,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(3),
+                name: "Dry".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.7,
+                step: None,
+                kind: ParamKind::Float,
+            },
+        ]
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        match param.0 {
+            0 => self.room_size,
+            1 => self.damping,
+            2 => self.wet,
+            3 => self.dry,
+            _ => 0.0,
+        }
     }
 }

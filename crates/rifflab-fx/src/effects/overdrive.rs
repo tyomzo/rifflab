@@ -1,4 +1,4 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// Overdrive / distortion effect with selectable waveshaper.
 pub struct Overdrive {
@@ -95,5 +95,74 @@ impl AudioProcessor for Overdrive {
 
     fn is_bypassed(&self) -> bool {
         self.bypassed
+    }
+}
+
+impl EffectDescriptor for Overdrive {
+    fn effect_type_id(&self) -> &str {
+        "builtin:overdrive"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor {
+                id: ParamId(0),
+                name: "Drive".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(1),
+                name: "Tone".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(2),
+                name: "Mix".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 1.0,
+                default: 1.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(3),
+                name: "Shaper Type".into(),
+                unit: "".into(),
+                min: 0.0,
+                max: 2.0,
+                default: 0.0,
+                step: Some(1.0),
+                kind: ParamKind::Enum(vec![
+                    "Tanh".into(),
+                    "HardClip".into(),
+                    "SoftClip".into(),
+                ]),
+            },
+        ]
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        match param.0 {
+            0 => self.drive,
+            1 => self.tone,
+            2 => self.mix,
+            3 => match self.shaper {
+                WaveShaperType::Tanh => 0.0,
+                WaveShaperType::HardClip => 1.0,
+                WaveShaperType::SoftClip => 2.0,
+            },
+            _ => 0.0,
+        }
     }
 }

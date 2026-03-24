@@ -106,6 +106,39 @@ pub trait AudioProcessor: Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ParamId(pub u32);
 
+/// Metadata about a single parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamDescriptor {
+    pub id: ParamId,
+    pub name: String,
+    pub unit: String,        // "dB", "ms", "Hz", "%", ""
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub step: Option<f32>,   // None = continuous
+    pub kind: ParamKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ParamKind {
+    Float,
+    Int,
+    Bool,
+    Enum(Vec<String>),
+}
+
+/// Self-describing audio processor. All effects implement this.
+pub trait EffectDescriptor: AudioProcessor {
+    /// A unique string identifying the effect type (e.g., "builtin:compressor").
+    fn effect_type_id(&self) -> &str;
+
+    /// Return descriptors for every parameter this effect exposes.
+    fn param_descriptors(&self) -> Vec<ParamDescriptor>;
+
+    /// Read the current value of a parameter.
+    fn get_param(&self, param: ParamId) -> f32;
+}
+
 /// Context passed to graph nodes during processing.
 #[derive(Debug, Clone)]
 pub struct ProcessContext {

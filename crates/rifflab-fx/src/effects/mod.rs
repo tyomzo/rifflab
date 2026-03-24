@@ -3,3 +3,4 @@ pub mod compressor;
 pub mod overdrive;
 pub mod eq;
 pub mod reverb;
+pub mod tuner;

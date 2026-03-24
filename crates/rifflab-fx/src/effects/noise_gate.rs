@@ -1,4 +1,4 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// Simple noise gate with threshold, attack, and release.
 pub struct NoiseGate {
@@ -66,5 +66,55 @@ impl AudioProcessor for NoiseGate {
 
     fn is_bypassed(&self) -> bool {
         self.bypassed
+    }
+}
+
+impl EffectDescriptor for NoiseGate {
+    fn effect_type_id(&self) -> &str {
+        "builtin:noise_gate"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        vec![
+            ParamDescriptor {
+                id: ParamId(0),
+                name: "Threshold".into(),
+                unit: "dB".into(),
+                min: -80.0,
+                max: 0.0,
+                default: -40.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(1),
+                name: "Attack".into(),
+                unit: "ms".into(),
+                min: 0.1,
+                max: 100.0,
+                default: 1.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+            ParamDescriptor {
+                id: ParamId(2),
+                name: "Release".into(),
+                unit: "ms".into(),
+                min: 1.0,
+                max: 1000.0,
+                default: 50.0,
+                step: None,
+                kind: ParamKind::Float,
+            },
+        ]
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        match param.0 {
+            0 => self.threshold,
+            1 => self.attack_ms,
+            2 => self.release_ms,
+            _ => 0.0,
+        }
     }
 }

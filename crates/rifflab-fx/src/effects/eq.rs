@@ -1,4 +1,4 @@
-use rifflab_core::audio::{AudioProcessor, ParamId};
+use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// A single biquad filter section.
 #[derive(Clone)]
@@ -173,5 +173,72 @@ impl AudioProcessor for ParametricEq {
 
     fn is_bypassed(&self) -> bool {
         self.bypassed
+    }
+}
+
+impl EffectDescriptor for ParametricEq {
+    fn effect_type_id(&self) -> &str {
+        "builtin:eq"
+    }
+
+    fn param_descriptors(&self) -> Vec<ParamDescriptor> {
+        let band_names = ["Low Shelf", "Mid-Low", "Mid-High", "High Shelf"];
+        let mut descs = Vec::with_capacity(12);
+        for (i, band_name) in band_names.iter().enumerate() {
+            let base = (i * 3) as u32;
+            let (default_freq, default_gain, default_q) = match i {
+                0 => (100.0, 0.0, 0.707),
+                1 => (500.0, 0.0, 1.0),
+                2 => (2000.0, 0.0, 1.0),
+                3 => (8000.0, 0.0, 0.707),
+                _ => unreachable!(),
+            };
+            descs.push(ParamDescriptor {
+                id: ParamId(base),
+                name: format!("{} Freq", band_name),
+                unit: "Hz".into(),
+                min: 20.0,
+                max: 20000.0,
+                default: default_freq,
+                step: None,
+                kind: ParamKind::Float,
+            });
+            descs.push(ParamDescriptor {
+                id: ParamId(base + 1),
+                name: format!("{} Gain", band_name),
+                unit: "dB".into(),
+                min: -24.0,
+                max: 24.0,
+                default: default_gain,
+                step: None,
+                kind: ParamKind::Float,
+            });
+            descs.push(ParamDescriptor {
+                id: ParamId(base + 2),
+                name: format!("{} Q", band_name),
+                unit: "".into(),
+                min: 0.1,
+                max: 18.0,
+                default: default_q,
+                step: None,
+                kind: ParamKind::Float,
+            });
+        }
+        descs
+    }
+
+    fn get_param(&self, param: ParamId) -> f32 {
+        let band_idx = (param.0 / 3) as usize;
+        let param_idx = param.0 % 3;
+        if band_idx < 4 {
+            match param_idx {
+                0 => self.params[band_idx].0 as f32,
+                1 => self.params[band_idx].1 as f32,
+                2 => self.params[band_idx].2 as f32,
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        }
     }
 }
