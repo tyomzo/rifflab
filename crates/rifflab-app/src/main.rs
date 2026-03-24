@@ -517,6 +517,24 @@ struct RiffLabApp {
 
     /// Latest detected pitch frame.
     current_pitch: PitchFrame,
+    /// Smoothed tuner display state: holds the last confident note.
+    tuner_note: u8,
+    tuner_cents: f32,
+    tuner_confidence: f32,
+    /// How many consecutive frames the current tuner note has been held.
+    tuner_hold_count: u32,
+    /// Timestamp of last confident detection (for display timeout).
+    tuner_last_active: std::time::Instant,
+    /// Tuner settings popup.
+    tuner_settings_open: bool,
+    /// Tuner: minimum confidence to display (0.0–1.0).
+    tuner_min_confidence: f32,
+    /// Tuner: noise floor RMS threshold (0.0–0.2).
+    tuner_noise_floor: f32,
+    /// Tuner: how many consistent frames before switching note.
+    tuner_hold_frames: u32,
+    /// Tuner: display timeout in ms after last detection.
+    tuner_timeout_ms: u32,
 
     /// Real-time comparator (active when reference notes are loaded).
     comparator: Option<Comparator>,
@@ -611,6 +629,16 @@ impl RiffLabApp {
             rms_l: 0.0,
             rms_r: 0.0,
             current_pitch: PitchFrame::default(),
+            tuner_note: 0,
+            tuner_cents: 0.0,
+            tuner_confidence: 0.0,
+            tuner_hold_count: 0,
+            tuner_last_active: std::time::Instant::now(),
+            tuner_settings_open: false,
+            tuner_min_confidence: 0.4,
+            tuner_noise_floor: 0.02,
+            tuner_hold_frames: 2,
+            tuner_timeout_ms: 800,
             comparator,
             scorer: SessionScorer::new(),
             waveform_overviews,
@@ -890,6 +918,33 @@ impl eframe::App for RiffLabApp {
         while let Ok(pitch) = self.pitch_rx.pop() {
             self.current_pitch = pitch.clone();
 
+            // Tuner smoothing with configurable parameters
+            if pitch.frequency_hz > 0.0 && pitch.confidence > self.tuner_min_confidence {
+                let new_note = pitch.midi_note;
+                if new_note == self.tuner_note {
+                    self.tuner_cents = self.tuner_cents * 0.5 + pitch.cents_deviation * 0.5;
+                    self.tuner_confidence = self.tuner_confidence * 0.5 + pitch.confidence * 0.5;
+                    self.tuner_hold_count = 0;
+                } else {
+                    self.tuner_hold_count += 1;
+                    if self.tuner_hold_count >= self.tuner_hold_frames || self.tuner_note == 0 {
+                        self.tuner_note = new_note;
+                        self.tuner_cents = pitch.cents_deviation;
+                        self.tuner_confidence = pitch.confidence;
+                        self.tuner_hold_count = 0;
+                    }
+                }
+                self.tuner_last_active = std::time::Instant::now();
+            } else {
+                if self.tuner_last_active.elapsed()
+                    > std::time::Duration::from_millis(self.tuner_timeout_ms as u64)
+                {
+                    self.tuner_note = 0;
+                    self.tuner_cents = 0.0;
+                    self.tuner_confidence = 0.0;
+                }
+            }
+
             // Track played notes for piano roll display
             let is_silent = pitch.frequency_hz <= 0.0
                 || pitch.confidence < PITCH_CONFIDENCE_THRESHOLD;
@@ -1011,11 +1066,18 @@ impl eframe::App for RiffLabApp {
 
                     ui.separator();
 
-                    // Visual tuner indicator
+                    // Visual tuner indicator (uses smoothed values)
                     {
-                        let note = self.current_pitch.note_name();
-                        let cents = self.current_pitch.cents_deviation;
-                        let has_pitch = self.current_pitch.frequency_hz > 0.0;
+                        let has_pitch = self.tuner_note > 0;
+                        let note = if has_pitch {
+                            let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                            let octave = (self.tuner_note as i32 / 12) - 1;
+                            let idx = (self.tuner_note % 12) as usize;
+                            format!("{}{}", names[idx], octave)
+                        } else {
+                            "--".to_string()
+                        };
+                        let cents = self.tuner_cents;
                         let tuner_color = if has_pitch {
                             if cents.abs() <= 5.0 {
                                 egui::Color32::from_rgb(80, 220, 80)
@@ -1028,12 +1090,23 @@ impl eframe::App for RiffLabApp {
                             egui::Color32::from_rgb(80, 80, 80)
                         };
 
-                        // Note name (large)
-                        ui.monospace(
-                            egui::RichText::new(&note)
-                                .size(16.0)
-                                .color(tuner_color),
+                        // Note name (fixed width, clickable to open tuner settings)
+                        // Pad to 4 chars so "A4" and "C#4" take the same space.
+                        let padded_note = format!("{:<4}", note);
+                        let note_resp = ui.add_sized(
+                            egui::vec2(44.0, 20.0),
+                            egui::Label::new(
+                                egui::RichText::new(padded_note)
+                                    .size(16.0)
+                                    .color(tuner_color)
+                                    .family(egui::FontFamily::Monospace),
+                            )
+                            .sense(egui::Sense::click()),
                         );
+                        if note_resp.clicked() {
+                            self.tuner_settings_open = !self.tuner_settings_open;
+                        }
+                        note_resp.on_hover_text("Click to open tuner settings");
 
                         // Cents deviation bar
                         let bar_width = 80.0f32;
@@ -1070,19 +1143,25 @@ impl eframe::App for RiffLabApp {
                             painter.rect_filled(ind_rect, 1.0, tuner_color);
                         }
 
-                        // Cents text
-                        if has_pitch {
-                            let cents_str = if cents >= 0.0 {
+                        // Cents text (fixed width)
+                        let cents_str = if has_pitch {
+                            if cents >= 0.0 {
                                 format!("+{:.0}c", cents)
                             } else {
                                 format!("{:.0}c", cents)
-                            };
-                            ui.monospace(
+                            }
+                        } else {
+                            "   ".to_string()
+                        };
+                        ui.add_sized(
+                            egui::vec2(32.0, 14.0),
+                            egui::Label::new(
                                 egui::RichText::new(cents_str)
                                     .size(10.0)
-                                    .color(tuner_color),
-                            );
-                        }
+                                    .color(tuner_color)
+                                    .family(egui::FontFamily::Monospace),
+                            ),
+                        );
                     }
 
                     ui.separator();
@@ -1975,6 +2054,7 @@ impl eframe::App for RiffLabApp {
 
         // ─── Audio Settings Window ───────────────────────────────
         self.draw_audio_settings(ctx);
+        self.draw_tuner_settings(ctx);
 
         // Request continuous repaint for smooth animation
         ctx.request_repaint();
@@ -2373,6 +2453,70 @@ impl RiffLabApp {
                 log::error!("Engine restart failed: {e}");
             }
         }
+    }
+
+    fn draw_tuner_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.tuner_settings_open;
+        egui::Window::new("Tuner Settings")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let label_color = egui::Color32::from_rgb(180, 200, 220);
+
+                ui.label(egui::RichText::new("Confidence Threshold").color(label_color));
+                ui.add(egui::Slider::new(&mut self.tuner_min_confidence, 0.1..=0.9)
+                    .step_by(0.05)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                ui.label(egui::RichText::new(
+                    "How sure the detector must be. Lower = more responsive, higher = more stable."
+                ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
+
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Noise Floor (RMS)").color(label_color));
+                if ui.add(egui::Slider::new(&mut self.tuner_noise_floor, 0.001..=0.1)
+                    .logarithmic(true)
+                    .custom_formatter(|v, _| {
+                        let db = if v > 0.0 { 20.0 * (v as f64).log10() } else { -100.0 };
+                        format!("{:.1} dB", db)
+                    })).changed()
+                {
+                    let eng = self.engine.lock().unwrap();
+                    eng.set_analysis_noise_floor(self.tuner_noise_floor);
+                }
+                ui.label(egui::RichText::new(
+                    "Signal below this level is ignored. Raise if picking up noise."
+                ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
+
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Note Hold (frames)").color(label_color));
+                ui.add(egui::Slider::new(&mut self.tuner_hold_frames, 1..=10));
+                ui.label(egui::RichText::new(
+                    "How many consistent detections before switching note. Higher = less jumpy."
+                ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
+
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Display Timeout (ms)").color(label_color));
+                ui.add(egui::Slider::new(&mut self.tuner_timeout_ms, 200..=3000).step_by(100.0));
+                ui.label(egui::RichText::new(
+                    "How long the note stays visible after the signal fades."
+                ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
+
+                ui.add_space(8.0);
+
+                // Live debug info
+                ui.separator();
+                let raw = &self.current_pitch;
+                ui.label(egui::RichText::new(format!(
+                    "Raw: {:.1}Hz  conf={:.2}  midi={}  cents={:.1}",
+                    raw.frequency_hz, raw.confidence, raw.midi_note, raw.cents_deviation,
+                )).size(10.0).color(egui::Color32::from_rgb(100, 110, 120)));
+            });
+        self.tuner_settings_open = open;
     }
 }
 

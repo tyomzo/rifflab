@@ -210,6 +210,13 @@ impl AudioEngine {
         &self.config
     }
 
+    /// Update the analysis thread's noise floor threshold.
+    pub fn set_analysis_noise_floor(&self, rms: f32) {
+        if let Some(ref at) = self.analysis_thread {
+            at.set_noise_floor(rms);
+        }
+    }
+
     /// Set backend preferences. Takes effect on next start().
     pub fn set_backend_prefs(
         &mut self,
