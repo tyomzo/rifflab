@@ -1,11 +1,14 @@
+mod config;
 mod decode;
+mod import;
+mod library;
 
 use anyhow::Result;
+use clap::Parser;
 use eframe::egui;
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
 use rifflab_core::analysis::{NoteEvent, PitchFrame};
-use rifflab_core::audio::AudioConfig;
 use rifflab_core::metering::MeterData;
 use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
@@ -13,6 +16,24 @@ use rifflab_core::transport::{LoopRegion, TransportState};
 use rifflab_practice::compare::Comparator;
 use rifflab_practice::scoring::SessionScorer;
 use std::sync::{Arc, Mutex};
+
+use config::AppConfig;
+use library::Library;
+
+// ─── CLI Arguments ──────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "rifflab", about = "Music practice workstation")]
+struct Args {
+    /// Audio file to load (WAV, FLAC, MP3)
+    file: Option<String>,
+    /// Audio backend preference
+    #[arg(long, default_value = "auto")]
+    backend: String,
+    /// Buffer size in samples
+    #[arg(long, default_value_t = 256)]
+    buffer_size: u32,
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -64,70 +85,103 @@ fn main() -> Result<()> {
     env_logger::init();
     log::info!("Starting RiffLab");
 
-    // Parse CLI: optional file path
-    let file_path = std::env::args().nth(1);
+    // 1. Parse CLI arguments with clap
+    let args = Args::parse();
 
-    // Create audio engine
-    let config = AudioConfig::default(); // 48kHz, 256 samples
-    let target_rate = config.sample_rate.as_u32();
-    let buffer_size = config.buffer_size.as_usize();
-    let (engine, meter_rx, pitch_rx) = AudioEngine::new(config);
-    let engine = Arc::new(Mutex::new(engine));
-
-    // Decode file if provided, resample to engine's sample rate
-    let decoded = if let Some(ref path) = file_path {
-        let path = std::path::Path::new(path);
-        match decode::decode_file(path) {
-            Ok(d) => {
-                log::info!(
-                    "Loaded: {} ({} frames, {}ch, {}Hz)",
-                    path.display(),
-                    d.frames,
-                    d.channels,
-                    d.sample_rate
-                );
-                let d = decode::resample(d, target_rate);
-                Some(d)
-            }
-            Err(e) => {
-                log::error!("Failed to decode {}: {e}", path.display());
-                None
-            }
+    // 2. Init library (creates ~/.local/share/rifflab/ tree)
+    let library = match Library::init() {
+        Ok(lib) => {
+            log::info!("Library root: {}", lib.root.display());
+            Some(lib)
         }
-    } else {
-        None
+        Err(e) => {
+            log::warn!("Library init failed (non-fatal): {e}");
+            None
+        }
     };
 
-    // Build waveform overview(s) from decoded audio
+    // 3. Load config (or create defaults), apply CLI overrides
+    let mut app_config = AppConfig::load_or_create_default().unwrap_or_else(|e| {
+        log::warn!("Config load failed, using defaults: {e}");
+        AppConfig::default()
+    });
+    app_config.apply_cli_overrides(&args.backend, args.buffer_size);
+
+    // 4. Create audio engine from config
+    let audio_config = app_config.to_audio_config();
+    let target_rate = audio_config.sample_rate.as_u32();
+    let buffer_size = audio_config.buffer_size.as_usize();
+    let (engine, meter_rx, pitch_rx) = AudioEngine::new(audio_config);
+    let engine = Arc::new(Mutex::new(engine));
+
+    // 5. If file provided: import → load stems → set transport → compute overviews → transcribe
     let mut waveform_overviews: Vec<WaveformOverview> = Vec::new();
-    if let Some(ref audio) = decoded {
-        waveform_overviews.push(WaveformOverview::from_interleaved(
-            &audio.data,
-            audio.channels,
-            OVERVIEW_SAMPLES_PER_PEAK,
-            egui::Color32::from_rgb(0, 180, 120),
-            file_path
-                .as_ref()
-                .and_then(|p| {
-                    std::path::Path::new(p)
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                })
-                .unwrap_or("Track 1")
-                .to_string(),
-        ));
+    let mut reference_notes: Vec<NoteEvent> = Vec::new();
+    let file_path = args.file.clone();
+
+    if let Some(ref path_str) = file_path {
+        let path = std::path::Path::new(path_str);
+
+        // Run import pipeline (decode, transcribe, skip stem sep + beat tracking)
+        if let Some(ref lib) = library {
+            match import::import_song(path, lib, target_rate) {
+                Ok(result) => {
+                    log::info!(
+                        "Import complete: {} ({} frames, {}ch, {} notes transcribed)",
+                        result.original_name,
+                        result.total_frames,
+                        result.channels,
+                        result.reference_notes.len(),
+                    );
+
+                    // Build waveform overview from imported audio
+                    waveform_overviews.push(WaveformOverview::from_interleaved(
+                        &result.audio_data,
+                        result.channels,
+                        OVERVIEW_SAMPLES_PER_PEAK,
+                        egui::Color32::from_rgb(0, 180, 120),
+                        result.original_name.clone(),
+                    ));
+
+                    // Store reference notes for practice comparison
+                    reference_notes = result.reference_notes;
+
+                    // Load into engine
+                    let eng = engine.lock().unwrap();
+                    let player = StemPlayer::new(
+                        StemType::Other,
+                        result.audio_data,
+                        result.channels,
+                    );
+                    let total_frames = player.total_frames();
+                    eng.graph().lock().unwrap().load_stems(vec![player]);
+                    eng.transport().set_length(total_frames);
+                }
+                Err(e) => {
+                    log::error!("Import failed: {e}");
+                    // Fallback: try direct decode without library
+                    load_fallback(
+                        path,
+                        target_rate,
+                        &engine,
+                        &file_path,
+                        &mut waveform_overviews,
+                    );
+                }
+            }
+        } else {
+            // No library available, use direct decode fallback
+            load_fallback(
+                path,
+                target_rate,
+                &engine,
+                &file_path,
+                &mut waveform_overviews,
+            );
+        }
     }
 
-    // Load into engine if decoded
-    if let Some(ref audio) = decoded {
-        let eng = engine.lock().unwrap();
-        let player = StemPlayer::new(StemType::Other, audio.data.clone(), audio.channels);
-        let total_frames = player.total_frames();
-        eng.graph().lock().unwrap().load_stems(vec![player]);
-        eng.transport().set_length(total_frames);
-    }
-
-    // Start engine
+    // 6. Start engine
     {
         let mut eng = engine.lock().unwrap();
         match eng.start() {
@@ -136,7 +190,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Launch UI
+    // 7. Launch UI with all data connected
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
@@ -157,6 +211,7 @@ fn main() -> Result<()> {
                 pitch_rx,
                 file_path,
                 waveform_overviews,
+                reference_notes,
                 target_rate,
                 buffer_size,
             )))
@@ -165,6 +220,52 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("UI error: {e}"))?;
 
     Ok(())
+}
+
+/// Fallback loader: decode file directly without the import pipeline.
+/// Used when the library is unavailable or import fails.
+fn load_fallback(
+    path: &std::path::Path,
+    target_rate: u32,
+    engine: &Arc<Mutex<AudioEngine>>,
+    file_path: &Option<String>,
+    waveform_overviews: &mut Vec<WaveformOverview>,
+) {
+    match decode::decode_file(path) {
+        Ok(d) => {
+            log::info!(
+                "Fallback load: {} ({} frames, {}ch, {}Hz)",
+                path.display(),
+                d.frames,
+                d.channels,
+                d.sample_rate
+            );
+            let d = decode::resample(d, target_rate);
+            waveform_overviews.push(WaveformOverview::from_interleaved(
+                &d.data,
+                d.channels,
+                OVERVIEW_SAMPLES_PER_PEAK,
+                egui::Color32::from_rgb(0, 180, 120),
+                file_path
+                    .as_ref()
+                    .and_then(|p| {
+                        std::path::Path::new(p)
+                            .file_stem()
+                            .and_then(|n| n.to_str())
+                    })
+                    .unwrap_or("Track 1")
+                    .to_string(),
+            ));
+            let eng = engine.lock().unwrap();
+            let player = StemPlayer::new(StemType::Other, d.data, d.channels);
+            let total_frames = player.total_frames();
+            eng.graph().lock().unwrap().load_stems(vec![player]);
+            eng.transport().set_length(total_frames);
+        }
+        Err(e) => {
+            log::error!("Failed to decode {}: {e}", path.display());
+        }
+    }
 }
 
 // ─── Waveform Overview ──────────────────────────────────────────────────────
@@ -339,6 +440,7 @@ impl RiffLabApp {
         pitch_rx: rifflab_core::rtrb::Consumer<PitchFrame>,
         file_path: Option<String>,
         waveform_overviews: Vec<WaveformOverview>,
+        reference_notes: Vec<NoteEvent>,
         sample_rate: u32,
         buffer_size: usize,
     ) -> Self {
@@ -348,6 +450,17 @@ impl RiffLabApp {
             .and_then(|n| n.to_str())
             .unwrap_or("No file loaded")
             .to_string();
+
+        // If reference notes were transcribed, set up the comparator
+        let comparator = if !reference_notes.is_empty() {
+            log::info!(
+                "Loaded {} reference notes into comparator",
+                reference_notes.len()
+            );
+            Some(Comparator::new(reference_notes.clone()))
+        } else {
+            None
+        };
 
         Self {
             engine,
@@ -359,7 +472,7 @@ impl RiffLabApp {
             rms_l: 0.0,
             rms_r: 0.0,
             current_pitch: PitchFrame::default(),
-            comparator: None,
+            comparator,
             scorer: SessionScorer::new(),
             waveform_overviews,
             frames_per_pixel: DEFAULT_FRAMES_PER_PIXEL,
@@ -371,7 +484,7 @@ impl RiffLabApp {
             drawer_open: true,
             drawer_height: DEFAULT_DRAWER_HEIGHT,
             active_tab: BottomTab::PianoRoll,
-            reference_notes: Vec::new(),
+            reference_notes,
             played_notes: Vec::new(),
             piano_roll_scroll_note: 48.0, // C3 at bottom
             tracking_midi_note: 0,
