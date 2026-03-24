@@ -67,12 +67,28 @@ fn analysis_loop(
     let hop_size = 1024;
     let mut buf = vec![0.0f32; hop_size];
 
+    // Noise gate: ~-40 dB RMS threshold. Below this, input is treated as silence.
+    let noise_floor_rms = 0.01f32;
+
     while !stop.load(Ordering::Relaxed) {
         if audio_rx.slots() >= hop_size {
             for s in &mut buf {
                 *s = audio_rx.pop().unwrap();
             }
-            let frame = detector.detect(&buf);
+
+            // Check signal level before running pitch detection
+            let rms = (buf.iter().map(|s| s * s).sum::<f32>() / hop_size as f32).sqrt();
+            let frame = if rms < noise_floor_rms {
+                // Below noise floor — emit silence instead of flickering
+                PitchFrame {
+                    frequency_hz: 0.0,
+                    confidence: 0.0,
+                    midi_note: 0,
+                    cents_deviation: 0.0,
+                }
+            } else {
+                detector.detect(&buf)
+            };
             let _ = pitch_tx.push(frame);
         } else {
             std::thread::sleep(std::time::Duration::from_micros(500));

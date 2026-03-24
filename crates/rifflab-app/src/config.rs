@@ -173,7 +173,7 @@ mod tests {
 
         let loaded = AppConfig::load(&tmp).expect("load should succeed");
         assert_eq!(loaded.audio.backend, "auto");
-        assert_eq!(loaded.audio.buffer_size, 256);
+        assert_eq!(loaded.audio.buffer_size, 128);
         assert_eq!(loaded.audio.sample_rate, 48000);
         assert_eq!(loaded.ui.auto_follow, true);
 
@@ -191,7 +191,7 @@ mod tests {
         assert!(!tmp.exists());
         let config = AppConfig::load_or_create(&tmp).expect("should create default");
         assert!(tmp.exists());
-        assert_eq!(config.audio.buffer_size, 256);
+        assert_eq!(config.audio.buffer_size, 128);
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -208,7 +208,7 @@ mod tests {
     fn test_cli_overrides_auto_no_change() {
         let mut config = AppConfig::default();
         let original_backend = config.audio.backend.clone();
-        config.apply_cli_overrides("auto", 256);
+        config.apply_cli_overrides("auto", 128);
         // "auto" should not override
         assert_eq!(config.audio.backend, original_backend);
     }
@@ -218,7 +218,7 @@ mod tests {
         let config = AppConfig::default();
         let ac = config.to_audio_config();
         assert_eq!(ac.sample_rate.as_u32(), 48000);
-        assert_eq!(ac.buffer_size.as_usize(), 256);
+        assert_eq!(ac.buffer_size.as_usize(), 128);
     }
 
     #[test]
