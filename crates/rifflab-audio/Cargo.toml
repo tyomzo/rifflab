@@ -11,6 +11,7 @@ alsa-backend = ["dep:cpal"]
 
 [dependencies]
 rifflab-core = { workspace = true }
+rifflab-analysis = { workspace = true }
 jack = { version = "0.13", optional = true }
 cpal = { version = "0.15", optional = true }
 log = { workspace = true }

@@ -1,6 +1,7 @@
 use crate::backend::{self, AudioBackend, BackendError};
 use crate::graph::AudioGraph;
 use crate::transport::Transport;
+use rifflab_core::analysis::PitchFrame;
 use rifflab_core::audio::{AudioConfig, ProcessContext};
 use rifflab_core::metering::MeterData;
 use std::sync::{Arc, Mutex};
@@ -21,21 +22,32 @@ pub struct AudioEngine {
     transport: Transport,
     config: AudioConfig,
     meter_tx: rifflab_core::rtrb::Producer<MeterData>,
+    pitch_tx: rifflab_core::rtrb::Producer<PitchFrame>,
     running: bool,
 }
 
 impl AudioEngine {
-    pub fn new(config: AudioConfig) -> (Self, rifflab_core::rtrb::Consumer<MeterData>) {
+    pub fn new(
+        config: AudioConfig,
+    ) -> (
+        Self,
+        rifflab_core::rtrb::Consumer<MeterData>,
+        rifflab_core::rtrb::Consumer<PitchFrame>,
+    ) {
         let (meter_tx, meter_rx) = rifflab_core::rtrb::RingBuffer::new(1024);
+        let (pitch_tx, pitch_rx) = rifflab_core::rtrb::RingBuffer::new(1024);
+        let mut graph = AudioGraph::new(config.buffer_size.as_usize());
+        graph.enable_pitch_detection(config.sample_rate.as_u32());
         let engine = Self {
             backend: None,
-            graph: Arc::new(Mutex::new(AudioGraph::new(config.buffer_size.as_usize()))),
+            graph: Arc::new(Mutex::new(graph)),
             transport: Transport::new(config.sample_rate.as_u32()),
             config,
             meter_tx,
+            pitch_tx,
             running: false,
         };
-        (engine, meter_rx)
+        (engine, meter_rx, pitch_rx)
     }
 
     /// Get a mutable reference to the graph for loading stems, setting FX, etc.
@@ -72,6 +84,10 @@ impl AudioEngine {
             let (new_tx, _) = rifflab_core::rtrb::RingBuffer::new(1);
             std::mem::replace(&mut self.meter_tx, new_tx)
         };
+        let mut pitch_tx = {
+            let (new_tx, _) = rifflab_core::rtrb::RingBuffer::new(1);
+            std::mem::replace(&mut self.pitch_tx, new_tx)
+        };
 
         let callback: backend::AudioCallback = Box::new(move |input, output, frames| {
             let is_playing = rt_handle.advance(frames, &mut command_rx);
@@ -90,8 +106,11 @@ impl AudioEngine {
             }
 
             if let Ok(mut g) = graph.lock() {
-                let meter = g.process(input, output, frames, &context);
+                let (meter, pitch_frame) = g.process(input, output, frames, &context);
                 let _ = meter_tx.push(meter);
+                if let Some(pitch) = pitch_frame {
+                    let _ = pitch_tx.push(pitch);
+                }
             }
         });
 

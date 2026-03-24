@@ -4,10 +4,13 @@ use anyhow::Result;
 use eframe::egui;
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
+use rifflab_core::analysis::PitchFrame;
 use rifflab_core::audio::AudioConfig;
 use rifflab_core::metering::MeterData;
 use rifflab_core::song::StemType;
 use rifflab_core::transport::TransportState;
+use rifflab_practice::compare::Comparator;
+use rifflab_practice::scoring::SessionScorer;
 use std::sync::{Arc, Mutex};
 
 const WAVEFORM_SIZE: usize = 4096;
@@ -22,7 +25,7 @@ fn main() -> Result<()> {
     // Create audio engine
     let config = AudioConfig::default(); // 48kHz, 256 samples
     let target_rate = config.sample_rate.as_u32();
-    let (engine, meter_rx) = AudioEngine::new(config);
+    let (engine, meter_rx, pitch_rx) = AudioEngine::new(config);
     let engine = Arc::new(Mutex::new(engine));
 
     // Decode file if provided, resample to engine's sample rate
@@ -75,7 +78,7 @@ fn main() -> Result<()> {
         "RiffLab",
         options,
         Box::new(move |_cc| {
-            Ok(Box::new(RiffLabApp::new(app_engine, meter_rx, file_path)))
+            Ok(Box::new(RiffLabApp::new(app_engine, meter_rx, pitch_rx, file_path)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("UI error: {e}"))?;
@@ -88,6 +91,7 @@ fn main() -> Result<()> {
 struct RiffLabApp {
     engine: Arc<Mutex<AudioEngine>>,
     meter_rx: rifflab_core::rtrb::Consumer<MeterData>,
+    pitch_rx: rifflab_core::rtrb::Consumer<PitchFrame>,
     file_name: String,
     /// Waveform display buffer.
     waveform: Vec<f32>,
@@ -98,12 +102,19 @@ struct RiffLabApp {
     /// Seek position (0.0–1.0) for the slider.
     #[allow(dead_code)]
     seek_frac: f32,
+    /// Latest detected pitch frame.
+    current_pitch: PitchFrame,
+    /// Real-time comparator (active when reference notes are loaded).
+    comparator: Option<Comparator>,
+    /// Session scoring accumulator.
+    scorer: SessionScorer,
 }
 
 impl RiffLabApp {
     fn new(
         engine: Arc<Mutex<AudioEngine>>,
         meter_rx: rifflab_core::rtrb::Consumer<MeterData>,
+        pitch_rx: rifflab_core::rtrb::Consumer<PitchFrame>,
         file_path: Option<String>,
     ) -> Self {
         let file_name = file_path
@@ -116,13 +127,24 @@ impl RiffLabApp {
         Self {
             engine,
             meter_rx,
+            pitch_rx,
             file_name,
             waveform: vec![0.0; WAVEFORM_SIZE],
             waveform_pos: 0,
             peak: 0.0,
             rms: 0.0,
             seek_frac: 0.0,
+            current_pitch: PitchFrame::default(),
+            comparator: None,
+            scorer: SessionScorer::new(),
         }
+    }
+
+    /// Load a reference note sequence for practice comparison.
+    #[allow(dead_code)]
+    pub fn load_reference(&mut self, reference: Vec<rifflab_core::analysis::NoteEvent>) {
+        self.comparator = Some(Comparator::new(reference));
+        self.scorer = SessionScorer::new();
     }
 }
 
@@ -138,13 +160,23 @@ impl eframe::App for RiffLabApp {
         }
 
         // Read transport state
-        let (state, position_secs, is_running) = {
+        let (state, position, is_running) = {
             let eng = self.engine.lock().unwrap();
             let state = eng.transport().state();
-            let pos_secs = eng.transport().position().seconds();
+            let position = eng.transport().position();
             let running = eng.is_running();
-            (state, pos_secs, running)
+            (state, position, running)
         };
+        let position_secs = position.seconds();
+
+        // Drain pitch frames, run comparison, update score
+        while let Ok(pitch) = self.pitch_rx.pop() {
+            self.current_pitch = pitch.clone();
+            if let Some(ref mut comparator) = self.comparator {
+                let comparison = comparator.compare(&pitch, &position);
+                self.scorer.feed(comparison);
+            }
+        }
 
         // ─── Toolbar ──────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -193,6 +225,24 @@ impl eframe::App for RiffLabApp {
                         TransportState::Paused => ui.label("Paused"),
                         TransportState::Stopped => ui.label("Stopped"),
                     };
+                    ui.separator();
+                    // Pitch display
+                    let note = self.current_pitch.note_name();
+                    let cents = self.current_pitch.cents_deviation;
+                    let cents_str = if cents >= 0.0 {
+                        format!("+{:.0}", cents)
+                    } else {
+                        format!("{:.0}", cents)
+                    };
+                    ui.monospace(format!("Pitch: {} ({}c)", note, cents_str));
+                    ui.separator();
+                    // Score display
+                    ui.label(format!(
+                        "Score: {:.0} | Notes: {}/{}",
+                        self.scorer.score(),
+                        self.scorer.notes_correct(),
+                        self.scorer.notes_total(),
+                    ));
                 } else {
                     ui.label("Engine not running");
                 }
