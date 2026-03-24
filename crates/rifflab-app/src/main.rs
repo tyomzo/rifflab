@@ -597,8 +597,6 @@ struct RiffLabApp {
     fx_add_open: bool,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
-    /// Effects rack drag-reorder state: index of effect being dragged.
-    fx_drag_source: Option<usize>,
 }
 
 impl RiffLabApp {
@@ -681,7 +679,6 @@ impl RiffLabApp {
             fx_registry: EffectRegistry::new(),
             fx_add_open: false,
             cue_engine: CueEngine::new(sample_rate),
-            fx_drag_source: None,
         }
     }
 
@@ -2720,45 +2717,41 @@ impl RiffLabApp {
                 ui.spacing_mut().item_spacing.x = 6.0;
 
                 for (idx, fx) in fx_snap.iter().enumerate() {
-                    let is_drag_source = self.fx_drag_source == Some(idx);
-                    let bg = if is_drag_source {
-                        egui::Color32::from_rgb(50, 55, 65)
-                    } else if fx.bypassed {
-                        card_bg_bypassed
-                    } else {
-                        card_bg
-                    };
+                    let bg = if fx.bypassed { card_bg_bypassed } else { card_bg };
+                    let num_fx = fx_snap.len();
 
-                    let card_resp = egui::Frame::new()
+                    egui::Frame::new()
                         .fill(bg)
                         .corner_radius(4.0)
                         .inner_margin(6.0)
-                        .stroke(if is_drag_source {
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 140, 220))
-                        } else {
-                            egui::Stroke::NONE
-                        })
                         .show(ui, |ui| {
                             // Force vertical layout inside the card
                             ui.set_width(card_width);
                             ui.vertical(|ui| {
-                                // Drag handle + header
+                                // Header: move arrows + bypass + name + remove
                                 ui.horizontal(|ui| {
-                                    // Drag grip
-                                    let grip = ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new("\u{2630}")
-                                                .size(12.0)
-                                                .color(egui::Color32::from_rgb(90, 95, 105)),
-                                        ).sense(egui::Sense::drag()),
-                                    );
-                                    if grip.drag_started() {
-                                        self.fx_drag_source = Some(idx);
+                                    // Move left/right buttons
+                                    let arrow_color = egui::Color32::from_rgb(100, 110, 130);
+                                    if idx > 0 {
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("\u{25C0}").size(9.0).color(arrow_color)
+                                        ).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Move left").clicked() {
+                                            reorder = Some((idx, idx - 1));
+                                        }
+                                    } else {
+                                        ui.add_space(22.0);
                                     }
-                                });
+                                    if idx + 1 < num_fx {
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("\u{25B6}").size(9.0).color(arrow_color)
+                                        ).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Move right").clicked() {
+                                            reorder = Some((idx, idx + 1));
+                                        }
+                                    } else {
+                                        ui.add_space(22.0);
+                                    }
 
-                                // Header: bypass + name + remove
-                                ui.horizontal(|ui| {
+                                    // Bypass toggle
                                     let (label, color) = if fx.bypassed {
                                         ("OFF", egui::Color32::from_rgb(120, 120, 120))
                                     } else {
@@ -2771,19 +2764,21 @@ impl RiffLabApp {
                                         bypass_toggles.push(idx);
                                     }
 
-                                    let name_color = if fx.bypassed {
-                                        egui::Color32::from_rgb(100, 100, 100)
-                                    } else {
-                                        egui::Color32::from_rgb(220, 225, 230)
-                                    };
-                                    ui.label(egui::RichText::new(&fx.name).strong().size(11.0).color(name_color));
-
+                                    // Remove button
                                     if ui.small_button(
                                         egui::RichText::new("\u{2716}").size(9.0).color(egui::Color32::from_rgb(160, 70, 70))
                                     ).clicked() {
                                         remove_idx = Some(idx);
                                     }
                                 });
+
+                                // Effect name
+                                let name_color = if fx.bypassed {
+                                    egui::Color32::from_rgb(100, 100, 100)
+                                } else {
+                                    egui::Color32::from_rgb(220, 225, 230)
+                                };
+                                ui.label(egui::RichText::new(&fx.name).strong().size(11.0).color(name_color));
 
                                 // Parameters stacked vertically
                                 if !fx.bypassed {
@@ -2846,32 +2841,12 @@ impl RiffLabApp {
                             });
                         });
 
-                    // Detect drop on this card
-                    let card_rect = card_resp.response.rect;
-                    if self.fx_drag_source.is_some() && self.fx_drag_source != Some(idx) {
-                        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-                            if card_rect.contains(pointer) && ui.input(|i| i.pointer.any_released()) {
-                                reorder = Some((self.fx_drag_source.unwrap(), idx));
-                            }
-                        }
-                    }
-
-                    // Arrow between cards (highlight if dragging over gap)
+                    // Arrow between cards showing signal flow
                     if idx + 1 < fx_snap.len() {
-                        let arrow_color = if self.fx_drag_source.is_some() {
-                            egui::Color32::from_rgb(100, 140, 220)
-                        } else {
-                            egui::Color32::from_rgb(80, 85, 95)
-                        };
-                        ui.label(egui::RichText::new("\u{25B6}").size(14.0).color(arrow_color));
+                        ui.label(egui::RichText::new("\u{25B6}").size(14.0).color(egui::Color32::from_rgb(80, 85, 95)));
                     }
                 }
             });
-
-            // Clear drag state when mouse released
-            if ui.input(|i| i.pointer.any_released()) {
-                self.fx_drag_source = None;
-            }
         });
 
         // Apply mutations (brief lock)
