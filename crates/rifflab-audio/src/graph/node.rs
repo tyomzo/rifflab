@@ -92,4 +92,14 @@ impl StemPlayer {
     pub fn set_position(&mut self, frame: u64) {
         self.position = frame;
     }
+
+    /// Get a reference to the raw audio data (for waveform display).
+    pub fn data(&self) -> &Arc<Vec<f32>> {
+        &self.data
+    }
+
+    /// Get the number of channels.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
 }

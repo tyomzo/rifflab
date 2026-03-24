@@ -79,6 +79,36 @@ impl Transport {
         self.length.store(frames, Ordering::Relaxed);
     }
 
+    /// Get the total length in frames.
+    pub fn length(&self) -> u64 {
+        self.length.load(Ordering::Relaxed)
+    }
+
+    /// Get the sample rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Set a loop region (or clear it with None).
+    pub fn set_loop(&mut self, region: Option<rifflab_core::transport::LoopRegion>) {
+        self.send_command(TransportCommand::SetLoop(region));
+    }
+
+    /// Check if looping is enabled (readable from any thread).
+    pub fn loop_enabled(&self) -> bool {
+        self.loop_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Get the loop start frame (readable from any thread).
+    pub fn loop_start(&self) -> u64 {
+        self.loop_start.load(Ordering::Relaxed)
+    }
+
+    /// Get the loop end frame (readable from any thread).
+    pub fn loop_end(&self) -> u64 {
+        self.loop_end.load(Ordering::Relaxed)
+    }
+
     /// Get a handle for the audio thread to update position/state.
     pub fn rt_handle(&self) -> TransportRtHandle {
         TransportRtHandle {
