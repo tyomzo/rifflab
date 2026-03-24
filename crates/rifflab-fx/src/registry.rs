@@ -1,9 +1,14 @@
 use rifflab_core::audio::EffectDescriptor;
 
+use crate::effects::cabinet::Cabinet;
+use crate::effects::chorus::Chorus;
 use crate::effects::compressor::Compressor;
+use crate::effects::delay::Delay;
 use crate::effects::eq::ParametricEq;
+use crate::effects::flanger::Flanger;
 use crate::effects::noise_gate::NoiseGate;
 use crate::effects::overdrive::Overdrive;
+use crate::effects::phaser::Phaser;
 use crate::effects::reverb::Reverb;
 use crate::effects::tuner::Tuner;
 
@@ -70,6 +75,41 @@ impl EffectRegistry {
             "Tuner",
             "Built-in",
             || Box::new(Tuner::new()),
+        );
+
+        reg.register(
+            "builtin:delay",
+            "Delay",
+            "Built-in",
+            || Box::new(Delay::new(48000)),
+        );
+
+        reg.register(
+            "builtin:chorus",
+            "Chorus",
+            "Built-in",
+            || Box::new(Chorus::new(48000)),
+        );
+
+        reg.register(
+            "builtin:flanger",
+            "Flanger",
+            "Built-in",
+            || Box::new(Flanger::new(48000)),
+        );
+
+        reg.register(
+            "builtin:phaser",
+            "Phaser",
+            "Built-in",
+            || Box::new(Phaser::new(48000)),
+        );
+
+        reg.register(
+            "builtin:cabinet",
+            "Cabinet Sim",
+            "Built-in",
+            || Box::new(Cabinet::new(48000)),
         );
 
         reg

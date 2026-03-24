@@ -4,3 +4,8 @@ pub mod overdrive;
 pub mod eq;
 pub mod reverb;
 pub mod tuner;
+pub mod delay;
+pub mod chorus;
+pub mod flanger;
+pub mod phaser;
+pub mod cabinet;
