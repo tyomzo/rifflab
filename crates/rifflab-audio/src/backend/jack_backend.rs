@@ -103,6 +103,11 @@ impl AudioBackend for JackBackend {
             .register_port("output_R", jack::AudioOut::default())
             .map_err(|e| BackendError::Jack(e.to_string()))?;
 
+        // Get port names before moving into process handler
+        let out_l_name = output_port_l.name().unwrap_or_default().to_string();
+        let out_r_name = output_port_r.name().unwrap_or_default().to_string();
+        let in_name = input_port.name().unwrap_or_default().to_string();
+
         let process = JackProcess {
             input_port,
             output_port_l,
@@ -113,6 +118,36 @@ impl AudioBackend for JackBackend {
         let active = client
             .activate_async(Notifications, process)
             .map_err(|e| BackendError::Jack(e.to_string()))?;
+
+        // Auto-connect output ports to system playback
+        let client_ref = active.as_client();
+        let playback_ports = client_ref.ports(
+            Some("system:playback_.*"),
+            None,
+            jack::PortFlags::IS_INPUT,
+        );
+        if playback_ports.len() >= 2 {
+            let _ = client_ref.connect_ports_by_name(&out_l_name, &playback_ports[0]);
+            let _ = client_ref.connect_ports_by_name(&out_r_name, &playback_ports[1]);
+            log::info!("Connected output to {} and {}", playback_ports[0], playback_ports[1]);
+        } else if playback_ports.len() == 1 {
+            let _ = client_ref.connect_ports_by_name(&out_l_name, &playback_ports[0]);
+            let _ = client_ref.connect_ports_by_name(&out_r_name, &playback_ports[0]);
+            log::info!("Connected output (mono) to {}", playback_ports[0]);
+        } else {
+            log::warn!("No system playback ports found — output not connected");
+        }
+
+        // Auto-connect system capture to our input
+        let capture_ports = client_ref.ports(
+            Some("system:capture_.*"),
+            None,
+            jack::PortFlags::IS_OUTPUT,
+        );
+        if let Some(capture) = capture_ports.first() {
+            let _ = client_ref.connect_ports_by_name(capture, &in_name);
+            log::info!("Connected input from {}", capture);
+        }
 
         self.active_client = Some(active);
         log::info!(

@@ -8,6 +8,10 @@ description = "RiffLab application binary"
 name = "rifflab"
 path = "src/main.rs"
 
+[[example]]
+name = "passthrough_demo"
+path = "examples/passthrough_demo.rs"
+
 [dependencies]
 rifflab-core = { workspace = true }
 rifflab-audio = { workspace = true }

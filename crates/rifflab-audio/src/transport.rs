@@ -145,17 +145,20 @@ impl TransportRtHandle {
             let mut pos = self.position.load(Ordering::Relaxed);
             pos += frames as u64;
 
-            let length = self.length.load(Ordering::Relaxed);
-            if length > 0 && pos >= length {
-                // Check loop
-                if self.loop_enabled.load(Ordering::Relaxed) {
+            // Check loop boundary first
+            if self.loop_enabled.load(Ordering::Relaxed) {
+                let loop_end = self.loop_end.load(Ordering::Relaxed);
+                if loop_end > 0 && pos >= loop_end {
                     let loop_start = self.loop_start.load(Ordering::Relaxed);
                     pos = loop_start;
-                } else {
-                    // Stop at end
-                    pos = 0;
-                    self.state.store(0, Ordering::Relaxed);
                 }
+            }
+
+            // Check song end
+            let length = self.length.load(Ordering::Relaxed);
+            if length > 0 && pos >= length {
+                pos = 0;
+                self.state.store(0, Ordering::Relaxed);
             }
 
             self.position.store(pos, Ordering::Relaxed);
