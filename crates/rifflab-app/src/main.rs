@@ -6,6 +6,7 @@ mod library;
 use anyhow::Result;
 use clap::Parser;
 use eframe::egui;
+use rifflab_audio::backend::{self, DeviceInfo};
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
 use rifflab_core::analysis::{NoteEvent, PitchFrame};
@@ -30,9 +31,9 @@ struct Args {
     /// Audio backend preference
     #[arg(long, default_value = "auto")]
     backend: String,
-    /// Buffer size in samples
-    #[arg(long, default_value_t = 256)]
-    buffer_size: u32,
+    /// Buffer size in samples (overrides config file)
+    #[arg(long)]
+    buffer_size: Option<u32>,
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -105,23 +106,39 @@ fn main() -> Result<()> {
         log::warn!("Config load failed, using defaults: {e}");
         AppConfig::default()
     });
-    app_config.apply_cli_overrides(&args.backend, args.buffer_size);
+    app_config.apply_cli_overrides(&args.backend, args.buffer_size.unwrap_or(app_config.audio.buffer_size));
 
     // 4. Create audio engine from config
     let audio_config = app_config.to_audio_config();
-    let target_rate = audio_config.sample_rate.as_u32();
+    let mut target_rate = audio_config.sample_rate.as_u32();
     let buffer_size = audio_config.buffer_size.as_usize();
-    let (engine, meter_rx, pitch_rx) = AudioEngine::new(audio_config);
+    let (mut engine, meter_rx, pitch_rx) = AudioEngine::new(audio_config);
+    engine.set_backend_prefs(
+        &app_config.audio.backend,
+        &app_config.audio.output_device,
+        &app_config.audio.input_device,
+    );
     let engine = Arc::new(Mutex::new(engine));
 
     // 5. File path from CLI (will be loaded after UI opens via load_file())
     let file_path = args.file.clone();
 
-    // 6. Start engine
+    // 6. Start engine and update config to match actual hardware rate
     {
         let mut eng = engine.lock().unwrap();
         match eng.start() {
-            Ok(()) => log::info!("Audio engine started"),
+            Ok(()) => {
+                // Check if hardware negotiated a different sample rate
+                if let Some(backend) = eng.backend_ref() {
+                    if let Some(actual_rate) = backend.actual_sample_rate() {
+                        if actual_rate != target_rate {
+                            log::info!("Hardware rate {}Hz differs from config {}Hz, adapting", actual_rate, target_rate);
+                            target_rate = actual_rate;
+                        }
+                    }
+                }
+                log::info!("Audio engine started ({}Hz)", target_rate);
+            }
             Err(e) => log::error!("Failed to start engine: {e}"),
         }
     }
@@ -150,6 +167,7 @@ fn main() -> Result<()> {
                 Vec::new(),
                 target_rate,
                 buffer_size,
+                app_config,
             )))
         }),
     )
@@ -265,6 +283,224 @@ struct PlayedNote {
     accuracy: AccuracyBucket,
 }
 
+// ─── Background File Loading ─────────────────────────────────────────────────
+
+/// Result of background file decoding + resampling.
+struct LoadedFile {
+    file_name: String,
+    decoded: decode::DecodedAudio,
+    overview: WaveformOverview,
+}
+
+/// Messages sent from the loading thread to the UI.
+enum LoadMsg {
+    /// Progress status text.
+    Status(String),
+    /// Loading finished successfully.
+    Done(LoadedFile),
+    /// Loading failed.
+    Error(String),
+}
+
+/// State of background file loading.
+enum FileLoadState {
+    Idle,
+    Loading {
+        file_name: String,
+        receiver: std::sync::mpsc::Receiver<LoadMsg>,
+    },
+}
+
+/// Persistent load status shown in the status bar.
+struct LoadStatus {
+    /// Current status message.
+    text: String,
+    /// Whether the last operation was an error.
+    is_error: bool,
+    /// When the status was last updated (for auto-clear of success messages).
+    timestamp: std::time::Instant,
+}
+
+// ─── Audio Settings Panel ────────────────────────────────────────────────────
+
+/// PipeWire server settings (read via pw-metadata).
+#[derive(Default, Clone)]
+struct PipeWireSettings {
+    available: bool,
+    clock_rate: u32,
+    allowed_rates: Vec<u32>,
+    quantum: u32,
+    min_quantum: u32,
+    max_quantum: u32,
+    force_quantum: u32,
+}
+
+impl PipeWireSettings {
+    fn query() -> Self {
+        let output = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0"])
+            .output();
+        let output = match output {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => return Self::default(),
+        };
+
+        let mut s = Self { available: true, ..Default::default() };
+        for line in output.lines() {
+            if let Some(rest) = line.strip_prefix("update: id:0 key:'") {
+                let parts: Vec<&str> = rest.splitn(2, "' value:'").collect();
+                if parts.len() == 2 {
+                    let key = parts[0];
+                    let val = parts[1].trim_end_matches("' type:''").trim_end_matches('\'');
+                    match key {
+                        "clock.rate" => s.clock_rate = val.parse().unwrap_or(0),
+                        "clock.quantum" => s.quantum = val.parse().unwrap_or(0),
+                        "clock.min-quantum" => s.min_quantum = val.parse().unwrap_or(0),
+                        "clock.max-quantum" => s.max_quantum = val.parse().unwrap_or(0),
+                        "clock.force-quantum" => s.force_quantum = val.parse().unwrap_or(0),
+                        "clock.allowed-rates" => {
+                            // Format: "[ 48000 ]" or "[ 44100 48000 96000 ]"
+                            let inner = val.trim_start_matches("[ ").trim_end_matches(" ]");
+                            s.allowed_rates = inner.split_whitespace()
+                                .filter_map(|r| r.parse().ok())
+                                .collect();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    fn set_rate(&self, rate: u32) -> Result<(), String> {
+        let status = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0", "clock.rate", &rate.to_string()])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("pw-metadata returned non-zero".into());
+        }
+        // Also update allowed-rates to include this rate
+        let rates_val = format!("[ {} ]", rate);
+        let _ = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0", "clock.allowed-rates", &rates_val])
+            .status();
+        Ok(())
+    }
+
+    fn set_quantum(&self, quantum: u32) -> Result<(), String> {
+        let val = quantum.to_string();
+        let status = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0", "clock.force-quantum", &val])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("pw-metadata returned non-zero".into());
+        }
+        Ok(())
+    }
+}
+
+/// Editing state for the audio settings window.
+struct AudioSettings {
+    open: bool,
+    /// Cached device list (refreshed when panel opens).
+    output_devices: Vec<DeviceInfo>,
+    input_devices: Vec<DeviceInfo>,
+    available_backends: Vec<String>,
+    /// Editing copies of config values.
+    backend: String,
+    sample_rate: u32,
+    buffer_size: u32,
+    output_device: String,
+    input_device: String,
+    /// Status message after apply.
+    status_msg: String,
+    /// Whether settings have been modified since last apply.
+    dirty: bool,
+    /// PipeWire server settings (for JACK mode).
+    pipewire: PipeWireSettings,
+    /// Editing copies of PipeWire values.
+    pw_rate: u32,
+    pw_quantum: u32,
+}
+
+impl AudioSettings {
+    fn new(config: &AppConfig) -> Self {
+        let pw = PipeWireSettings::query();
+        let pw_rate = pw.clock_rate;
+        let pw_quantum = if pw.force_quantum > 0 { pw.force_quantum } else { pw.quantum };
+        let mut s = Self {
+            open: false,
+            output_devices: Vec::new(),
+            input_devices: Vec::new(),
+            available_backends: Vec::new(),
+            backend: config.audio.backend.clone(),
+            sample_rate: config.audio.sample_rate,
+            buffer_size: config.audio.buffer_size,
+            output_device: config.audio.output_device.clone(),
+            input_device: config.audio.input_device.clone(),
+            status_msg: String::new(),
+            dirty: false,
+            pipewire: pw,
+            pw_rate,
+            pw_quantum,
+        };
+        s.refresh_devices();
+        s
+    }
+
+    fn refresh_devices(&mut self) {
+        let all_devices = backend::enumerate_devices();
+        self.output_devices = all_devices.iter().filter(|d| d.is_output).cloned().collect();
+        self.input_devices = all_devices.iter().filter(|d| d.is_input).cloned().collect();
+        self.available_backends = backend::available_backends()
+            .iter()
+            .map(|b| match b {
+                backend::BackendType::Alsa => "alsa".to_string(),
+                backend::BackendType::Jack => "jack".to_string(),
+            })
+            .collect();
+        // Always include "auto" as first option
+        self.available_backends.insert(0, "auto".to_string());
+    }
+
+    fn refresh_pipewire(&mut self) {
+        self.pipewire = PipeWireSettings::query();
+        self.pw_rate = self.pipewire.clock_rate;
+        self.pw_quantum = if self.pipewire.force_quantum > 0 {
+            self.pipewire.force_quantum
+        } else {
+            self.pipewire.quantum
+        };
+    }
+
+    fn load_from_config(&mut self, config: &AppConfig) {
+        self.backend = config.audio.backend.clone();
+        self.sample_rate = config.audio.sample_rate;
+        self.buffer_size = config.audio.buffer_size;
+        self.output_device = config.audio.output_device.clone();
+        self.input_device = config.audio.input_device.clone();
+        self.dirty = false;
+        self.status_msg.clear();
+        self.refresh_pipewire();
+    }
+
+    /// Get sample rates supported by the currently selected output device.
+    /// Returns empty vec if "system default" is selected (meaning all common rates shown).
+    fn selected_output_sample_rates(&self) -> Vec<u32> {
+        if self.output_device.is_empty() {
+            return Vec::new(); // default device — show all options
+        }
+        self.output_devices
+            .iter()
+            .find(|d| d.name == self.output_device)
+            .map(|d| d.sample_rates.clone())
+            .unwrap_or_default()
+    }
+}
+
 // ─── App ─────────────────────────────────────────────────────────────────────
 
 struct RiffLabApp {
@@ -323,6 +559,16 @@ struct RiffLabApp {
     tracking_was_silent: bool,
     /// File to load on first frame (from CLI arg).
     pending_file: Option<std::path::PathBuf>,
+    /// Audio settings panel state.
+    audio_settings: AudioSettings,
+    /// Persisted app config (for saving).
+    app_config: AppConfig,
+    /// Background file loading state.
+    file_load_state: FileLoadState,
+    /// Status message for file loading (shown in status bar).
+    load_status: LoadStatus,
+    /// Cached sidebar state to avoid locking every frame.
+    sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32)>,
 }
 
 impl RiffLabApp {
@@ -335,6 +581,7 @@ impl RiffLabApp {
         reference_notes: Vec<NoteEvent>,
         sample_rate: u32,
         buffer_size: usize,
+        app_config: AppConfig,
     ) -> Self {
         let file_name = file_path
             .as_ref()
@@ -382,6 +629,15 @@ impl RiffLabApp {
             tracking_midi_note: 0,
             tracking_was_silent: true,
             pending_file: file_path.map(std::path::PathBuf::from),
+            audio_settings: AudioSettings::new(&app_config),
+            app_config,
+            file_load_state: FileLoadState::Idle,
+            load_status: LoadStatus {
+                text: String::new(),
+                is_error: false,
+                timestamp: std::time::Instant::now(),
+            },
+            sidebar_snapshot: None,
         }
     }
 
@@ -405,64 +661,192 @@ impl RiffLabApp {
         frame.max(0.0) as u64
     }
 
-    /// Load an audio file: decode, load into engine, compute waveform overview.
+    /// Start loading an audio file in the background.
     fn load_file(&mut self, path: &std::path::Path) {
         log::info!("Loading file: {}", path.display());
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
 
         let target_rate = {
             let eng = self.engine.lock().unwrap();
             eng.transport().sample_rate()
         };
 
-        // Decode + resample
-        let decoded = match decode::decode_file(path) {
-            Ok(d) => decode::resample(d, target_rate),
-            Err(e) => {
-                log::error!("Failed to decode {}: {e}", path.display());
-                return;
+        let path_buf = path.to_path_buf();
+        let name_clone = file_name.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let _ = tx.send(LoadMsg::Status(format!("Decoding {}...", name_clone)));
+
+            let decoded = match decode::decode_file(&path_buf) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = tx.send(LoadMsg::Error(format!("Decode failed: {e}")));
+                    return;
+                }
+            };
+
+            let src_rate = decoded.sample_rate;
+            let duration_secs = decoded.frames as f64 / decoded.sample_rate as f64;
+            let _ = tx.send(LoadMsg::Status(format!(
+                "Decoded: {:.1}s, {}ch, {}Hz",
+                duration_secs, decoded.channels, src_rate,
+            )));
+
+            let decoded = if src_rate != target_rate {
+                let _ = tx.send(LoadMsg::Status(format!(
+                    "Resampling {}Hz -> {}Hz (sinc)...",
+                    src_rate, target_rate,
+                )));
+                decode::resample(decoded, target_rate)
+            } else {
+                decoded
+            };
+
+            // Debug: dump first 5s of resampled audio to /tmp for verification
+            {
+                let dump_frames = (decoded.sample_rate as usize * 5).min(decoded.frames as usize);
+                let dump_samples = dump_frames * decoded.channels as usize;
+                let peak: f32 = decoded.data[..dump_samples].iter()
+                    .map(|s| s.abs()).fold(0.0f32, f32::max);
+                log::info!(
+                    "[decode] Resampled: {}ch, {}Hz, {} frames, peak={:.4}, data[0..8]={:?}",
+                    decoded.channels, decoded.sample_rate, decoded.frames, peak,
+                    &decoded.data[..8.min(decoded.data.len())],
+                );
             }
+
+            let _ = tx.send(LoadMsg::Status("Building waveform overview...".into()));
+
+            let overview = WaveformOverview::from_interleaved(
+                &decoded.data,
+                decoded.channels,
+                OVERVIEW_SAMPLES_PER_PEAK,
+                TRACK_COLORS[0],
+                name_clone.clone(),
+            );
+
+            let _ = tx.send(LoadMsg::Done(LoadedFile {
+                file_name: name_clone,
+                decoded,
+                overview,
+            }));
+        });
+
+        self.file_name = format!("Loading {}...", file_name);
+        self.load_status = LoadStatus {
+            text: format!("Opening {}...", file_name),
+            is_error: false,
+            timestamp: std::time::Instant::now(),
         };
+        self.file_load_state = FileLoadState::Loading {
+            file_name,
+            receiver: rx,
+        };
+    }
 
-        log::info!(
-            "Loaded: {} frames, {}ch, {}Hz ({:.1}s)",
-            decoded.frames, decoded.channels, decoded.sample_rate,
-            decoded.frames as f64 / decoded.sample_rate as f64,
-        );
+    /// Check if background loading sent any messages, and apply them.
+    fn poll_file_load(&mut self) {
+        let state = std::mem::replace(&mut self.file_load_state, FileLoadState::Idle);
+        match state {
+            FileLoadState::Idle => {}
+            FileLoadState::Loading { file_name, receiver } => {
+                // Drain all available messages
+                let mut keep_loading = true;
+                loop {
+                    match receiver.try_recv() {
+                        Ok(LoadMsg::Status(msg)) => {
+                            log::info!("[load] {msg}");
+                            self.load_status = LoadStatus {
+                                text: msg,
+                                is_error: false,
+                                timestamp: std::time::Instant::now(),
+                            };
+                        }
+                        Ok(LoadMsg::Done(loaded)) => {
+                            // Apply to engine
+                            let load_msg = {
+                                let mut eng = self.engine.lock().unwrap();
+                                eng.transport_mut().stop();
+                                let channels = loaded.decoded.channels;
+                                let frames = loaded.decoded.frames;
+                                let rate = loaded.decoded.sample_rate;
+                                let player = StemPlayer::new(
+                                    StemType::Other,
+                                    loaded.decoded.data,
+                                    channels,
+                                );
+                                let total_frames = player.total_frames();
+                                eng.graph().lock().unwrap().load_stems(vec![player]);
+                                eng.transport().set_length(total_frames);
+                                format!(
+                                    "Loaded: {} ({:.1}s, {}ch, {}Hz, {} frames)",
+                                    loaded.file_name,
+                                    frames as f64 / rate as f64,
+                                    channels,
+                                    rate,
+                                    frames,
+                                )
+                            };
 
-        // Update file name
-        self.file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-            .to_string();
+                            self.file_name = loaded.file_name;
+                            self.waveform_overviews = vec![loaded.overview];
 
-        // Build waveform overview
-        self.waveform_overviews = vec![WaveformOverview::from_interleaved(
-            &decoded.data,
-            decoded.channels,
-            OVERVIEW_SAMPLES_PER_PEAK,
-            TRACK_COLORS[0],
-            self.file_name.clone(),
-        )];
+                            // Reset practice state
+                            self.comparator = None;
+                            self.reference_notes.clear();
+                            self.scorer = SessionScorer::new();
+                            self.played_notes.clear();
+                            self.scroll_offset_frames = 0.0;
 
-        // Load into engine
-        {
-            let mut eng = self.engine.lock().unwrap();
-            eng.transport_mut().stop();
-            let player = StemPlayer::new(StemType::Other, decoded.data, decoded.channels);
-            let total_frames = player.total_frames();
-            eng.graph().lock().unwrap().load_stems(vec![player]);
-            eng.transport().set_length(total_frames);
+                            log::info!("{load_msg}");
+                            self.load_status = LoadStatus {
+                                text: load_msg,
+                                is_error: false,
+                                timestamp: std::time::Instant::now(),
+                            };
+                            keep_loading = false;
+                            break;
+                        }
+                        Ok(LoadMsg::Error(e)) => {
+                            log::error!("File load error: {e}");
+                            self.file_name = "No file loaded".to_string();
+                            self.load_status = LoadStatus {
+                                text: e,
+                                is_error: true,
+                                timestamp: std::time::Instant::now(),
+                            };
+                            keep_loading = false;
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            break; // no more messages yet
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            if keep_loading {
+                                // Thread died without sending Done/Error
+                                self.file_name = "No file loaded".to_string();
+                                self.load_status = LoadStatus {
+                                    text: "File loader thread crashed".into(),
+                                    is_error: true,
+                                    timestamp: std::time::Instant::now(),
+                                };
+                            }
+                            keep_loading = false;
+                            break;
+                        }
+                    }
+                }
+                if keep_loading {
+                    self.file_load_state = FileLoadState::Loading { file_name, receiver };
+                }
+            }
         }
-
-        // Reset practice state
-        self.comparator = None;
-        self.reference_notes.clear();
-        self.scorer = SessionScorer::new();
-        self.played_notes.clear();
-        self.scroll_offset_frames = 0.0;
-
-        log::info!("File loaded successfully: {}", self.file_name);
     }
 }
 
@@ -472,6 +856,9 @@ impl eframe::App for RiffLabApp {
         if let Some(path) = self.pending_file.take() {
             self.load_file(&path);
         }
+
+        // ─── Poll background file loading ────────────────────────
+        self.poll_file_load();
 
         // ─── Drain channels ──────────────────────────────────────
         while let Ok(meter) = self.meter_rx.pop() {
@@ -566,8 +953,10 @@ impl eframe::App for RiffLabApp {
                     ui.heading("RiffLab");
                     ui.separator();
 
-                    // Open file button
-                    if ui.button("\u{1F4C2} Open").clicked() {
+                    // Open file button (disabled while loading)
+                    let is_loading = matches!(self.file_load_state, FileLoadState::Loading { .. });
+                    let open_label = if is_loading { "\u{231B} Loading..." } else { "\u{1F4C2} Open" };
+                    if ui.add_enabled(!is_loading, egui::Button::new(open_label)).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aac", "m4a"])
                             .add_filter("All files", &["*"])
@@ -708,6 +1097,13 @@ impl eframe::App for RiffLabApp {
 
                     // Right-aligned controls
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Settings gear button
+                        if ui.small_button("\u{2699} Audio").clicked() {
+                            self.audio_settings.refresh_devices();
+                            self.audio_settings.load_from_config(&self.app_config);
+                            self.audio_settings.open = true;
+                        }
+                        ui.separator();
                         ui.checkbox(&mut self.auto_follow, "Follow");
                         ui.separator();
                         let drawer_label = if self.drawer_open { "Hide Panel" } else { "Show Panel" };
@@ -813,7 +1209,7 @@ impl eframe::App for RiffLabApp {
                         );
                     }
 
-                    // Zoom info (right side)
+                    // Right side: load status + zoom
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!(
@@ -823,6 +1219,31 @@ impl eframe::App for RiffLabApp {
                             .small()
                             .color(status_color),
                         );
+
+                        // File load status
+                        if !self.load_status.text.is_empty() {
+                            let is_active = matches!(self.file_load_state, FileLoadState::Loading { .. });
+                            // Auto-clear success messages after 8 seconds
+                            let age = self.load_status.timestamp.elapsed();
+                            let show = self.load_status.is_error
+                                || is_active
+                                || age < std::time::Duration::from_secs(8);
+                            if show {
+                                ui.separator();
+                                let color = if self.load_status.is_error {
+                                    egui::Color32::from_rgb(220, 80, 80)
+                                } else if is_active {
+                                    egui::Color32::from_rgb(100, 180, 240)
+                                } else {
+                                    egui::Color32::from_rgb(80, 200, 120)
+                                };
+                                ui.label(
+                                    egui::RichText::new(&self.load_status.text)
+                                        .small()
+                                        .color(color),
+                                );
+                            }
+                        }
                     });
                 });
             });
@@ -921,6 +1342,27 @@ impl eframe::App for RiffLabApp {
         }
 
         // ─── Sidebar ─────────────────────────────────────────────
+        // Snapshot graph state with try_lock — never block the audio thread.
+        // If we can't get the lock this frame, use stale data from last frame.
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+        let (num_stems, mut solos, mut mutes, mut volumes, mut master_vol) = {
+            if let Ok(graph) = graph_arc.try_lock() {
+                let snap = (
+                    graph.stem_players.len(),
+                    graph.stem_solos.clone(),
+                    graph.stem_mutes.clone(),
+                    graph.stem_volumes.clone(),
+                    graph.master_volume,
+                );
+                self.sidebar_snapshot = Some((snap.0, snap.1.clone(), snap.2.clone(), snap.3.clone(), snap.4));
+                snap
+            } else if let Some(ref snap) = self.sidebar_snapshot {
+                snap.clone()
+            } else {
+                (0, Vec::new(), Vec::new(), Vec::new(), 1.0)
+            }
+        };
+
         egui::SidePanel::left("sidebar")
             .exact_width(SIDEBAR_WIDTH)
             .resizable(false)
@@ -937,11 +1379,6 @@ impl eframe::App for RiffLabApp {
                     );
                     ui.separator();
 
-                    // Get stem info from graph
-                    let eng = self.engine.lock().unwrap();
-                    let mut graph = eng.graph().lock().unwrap();
-                    let num_stems = graph.stem_players.len();
-
                     for i in 0..num_stems {
                         let track_color = TRACK_COLORS[i % TRACK_COLORS.len()];
                         let track_name = if i < self.waveform_overviews.len() {
@@ -954,7 +1391,6 @@ impl eframe::App for RiffLabApp {
 
                         // Track header with color indicator
                         ui.horizontal(|ui| {
-                            // Color dot
                             let (rect, _) =
                                 ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                             ui.painter()
@@ -969,7 +1405,7 @@ impl eframe::App for RiffLabApp {
 
                         // Solo / Mute buttons
                         ui.horizontal(|ui| {
-                            let is_solo = graph.stem_solos.get(i).copied().unwrap_or(false);
+                            let is_solo = solos.get(i).copied().unwrap_or(false);
                             let solo_color = if is_solo {
                                 egui::Color32::from_rgb(220, 200, 40)
                             } else {
@@ -987,12 +1423,12 @@ impl eframe::App for RiffLabApp {
                             .fill(solo_color)
                             .min_size(egui::vec2(24.0, 18.0));
                             if ui.add(solo_btn).clicked() {
-                                if let Some(s) = graph.stem_solos.get_mut(i) {
+                                if let Some(s) = solos.get_mut(i) {
                                     *s = !*s;
                                 }
                             }
 
-                            let is_mute = graph.stem_mutes.get(i).copied().unwrap_or(false);
+                            let is_mute = mutes.get(i).copied().unwrap_or(false);
                             let mute_color = if is_mute {
                                 egui::Color32::from_rgb(220, 60, 60)
                             } else {
@@ -1010,7 +1446,7 @@ impl eframe::App for RiffLabApp {
                             .fill(mute_color)
                             .min_size(egui::vec2(24.0, 18.0));
                             if ui.add(mute_btn).clicked() {
-                                if let Some(m) = graph.stem_mutes.get_mut(i) {
+                                if let Some(m) = mutes.get_mut(i) {
                                     *m = !*m;
                                 }
                             }
@@ -1023,12 +1459,12 @@ impl eframe::App for RiffLabApp {
                                     .size(10.0)
                                     .color(egui::Color32::from_rgb(140, 140, 140)),
                             );
-                            let mut vol = graph.stem_volumes.get(i).copied().unwrap_or(1.0);
+                            let mut vol = volumes.get(i).copied().unwrap_or(1.0);
                             let slider = egui::Slider::new(&mut vol, 0.0..=1.0)
                                 .show_value(false)
                                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
                             if ui.add(slider).changed() {
-                                if let Some(v) = graph.stem_volumes.get_mut(i) {
+                                if let Some(v) = volumes.get_mut(i) {
                                     *v = vol;
                                 }
                             }
@@ -1039,7 +1475,6 @@ impl eframe::App for RiffLabApp {
                         }
                     }
 
-                    // If no stems, show placeholder
                     if num_stems == 0 {
                         ui.add_space(20.0);
                         ui.label(
@@ -1049,11 +1484,9 @@ impl eframe::App for RiffLabApp {
                         );
                     }
 
-                    // Push master section to bottom
                     ui.add_space(20.0);
                     ui.separator();
 
-                    // Master volume
                     ui.label(
                         egui::RichText::new("Master")
                             .strong()
@@ -1067,20 +1500,30 @@ impl eframe::App for RiffLabApp {
                                 .size(10.0)
                                 .color(egui::Color32::from_rgb(140, 140, 140)),
                         );
-                        let mut master_vol = graph.master_volume;
                         let slider = egui::Slider::new(&mut master_vol, 0.0..=1.0)
                             .show_value(false)
                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
-                        if ui.add(slider).changed() {
-                            graph.master_volume = master_vol;
-                        }
+                        ui.add(slider);
                     });
 
-                    // Stereo peak meter
                     ui.add_space(8.0);
                     draw_stereo_meter(ui, self.peak_l, self.peak_r, self.rms_l, self.rms_r);
                 });
             });
+
+        // Write back only if the user changed something (compare to snapshot)
+        // Write back only if the user changed something
+        let changed = self.sidebar_snapshot.as_ref().map_or(false, |snap| {
+            snap.1 != solos || snap.2 != mutes || snap.3 != volumes || snap.4 != master_vol
+        });
+        if changed {
+            if let Ok(mut graph) = graph_arc.try_lock() {
+                graph.stem_solos = solos;
+                graph.stem_mutes = mutes;
+                graph.stem_volumes = volumes;
+                graph.master_volume = master_vol;
+            }
+        }
 
         // ─── Arrangement View (Central Panel) ────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1530,8 +1973,406 @@ impl eframe::App for RiffLabApp {
             let _ = ruler_rect; // used above for playhead triangle
         });
 
+        // ─── Audio Settings Window ───────────────────────────────
+        self.draw_audio_settings(ctx);
+
         // Request continuous repaint for smooth animation
         ctx.request_repaint();
+    }
+}
+
+impl RiffLabApp {
+    fn draw_audio_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.audio_settings.open;
+        egui::Window::new("Audio Settings")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let section_color = egui::Color32::from_rgb(180, 200, 220);
+                let hint_color = egui::Color32::from_rgb(130, 135, 145);
+
+                let is_jack = self.audio_settings.backend == "jack";
+
+                // ── Backend ──
+                ui.label(egui::RichText::new("Backend").strong().color(section_color));
+                egui::ComboBox::from_id_salt("backend_combo")
+                    .selected_text(&self.audio_settings.backend)
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        for b in &self.audio_settings.available_backends {
+                            let label = match b.as_str() {
+                                "auto" => "Auto (try cpal, then JACK)",
+                                "alsa" => "cpal (ALSA / PipeWire)",
+                                "jack" => "JACK",
+                                other => other,
+                            };
+                            if ui.selectable_value(&mut self.audio_settings.backend, b.clone(), label).changed() {
+                                self.audio_settings.dirty = true;
+                            }
+                        }
+                    });
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                if is_jack {
+                    let pw = &self.audio_settings.pipewire;
+                    if !pw.available {
+                        ui.label(
+                            egui::RichText::new(
+                                "JACK mode: pw-metadata not found.\n\
+                                 Install PipeWire tools to configure server settings,\n\
+                                 or use qpwgraph to route ports."
+                            )
+                            .size(11.0)
+                            .color(hint_color),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "JACK mode: these settings change the PipeWire server.\n\
+                                 Device routing is done via qpwgraph or equivalent."
+                            )
+                            .size(11.0)
+                            .color(hint_color),
+                        );
+
+                        ui.add_space(4.0);
+
+                        // ── PipeWire Sample Rate ──
+                        ui.label(egui::RichText::new("Server Sample Rate").strong().color(section_color));
+                        ui.horizontal(|ui| {
+                            let rates = [44100u32, 48000, 96000];
+                            for &rate in &rates {
+                                let label = format!("{} Hz", rate);
+                                if ui.selectable_label(
+                                    self.audio_settings.pw_rate == rate,
+                                    &label,
+                                ).clicked() {
+                                    self.audio_settings.pw_rate = rate;
+                                    self.audio_settings.dirty = true;
+                                }
+                            }
+                        });
+
+                        ui.add_space(4.0);
+
+                        // ── PipeWire Buffer Size (quantum) ──
+                        ui.label(egui::RichText::new("Server Buffer Size (quantum)").strong().color(section_color));
+                        ui.horizontal(|ui| {
+                            let sizes = [64u32, 128, 256, 512, 1024, 2048];
+                            for &size in &sizes {
+                                let in_range = size >= pw.min_quantum && size <= pw.max_quantum;
+                                let latency = size as f64 / self.audio_settings.pw_rate.max(1) as f64 * 1000.0;
+                                let label = format!("{} ({:.1}ms)", size, latency);
+                                let mut btn = ui.add_enabled(
+                                    in_range,
+                                    egui::SelectableLabel::new(
+                                        self.audio_settings.pw_quantum == size,
+                                        &label,
+                                    ),
+                                );
+                                if !in_range {
+                                    btn = btn.on_disabled_hover_text(format!(
+                                        "Server range: {}–{}",
+                                        pw.min_quantum, pw.max_quantum,
+                                    ));
+                                }
+                                if btn.clicked() {
+                                    self.audio_settings.pw_quantum = size;
+                                    self.audio_settings.dirty = true;
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    // cpal: full device and parameter selection
+
+                    // ── Output Device ──
+                    ui.label(egui::RichText::new("Output Device").strong().color(section_color));
+                    {
+                        let current = if self.audio_settings.output_device.is_empty() {
+                            "(system default)".to_string()
+                        } else {
+                            self.audio_settings.output_device.clone()
+                        };
+                        egui::ComboBox::from_id_salt("output_device_combo")
+                            .selected_text(&current)
+                            .width(300.0)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(
+                                    &mut self.audio_settings.output_device,
+                                    String::new(),
+                                    "(system default)",
+                                ).changed() {
+                                    self.audio_settings.dirty = true;
+                                }
+                                for dev in &self.audio_settings.output_devices {
+                                    let rates_str = dev.sample_rates.iter()
+                                        .map(|r| format!("{}k", r / 1000))
+                                        .collect::<Vec<_>>()
+                                        .join("/");
+                                    let label = format!(
+                                        "{} ({}ch, {}{})",
+                                        dev.name,
+                                        dev.channels,
+                                        rates_str,
+                                        if dev.is_default { " *" } else { "" },
+                                    );
+                                    if ui.selectable_value(
+                                        &mut self.audio_settings.output_device,
+                                        dev.name.clone(),
+                                        label,
+                                    ).changed() {
+                                        self.audio_settings.dirty = true;
+                                    }
+                                }
+                            });
+                    }
+
+                    ui.add_space(4.0);
+
+                    // ── Input Device ──
+                    ui.label(egui::RichText::new("Input Device").strong().color(section_color));
+                    {
+                        let current = if self.audio_settings.input_device.is_empty() {
+                            "(system default)".to_string()
+                        } else if self.audio_settings.input_device == "(none)" {
+                            "(none)".to_string()
+                        } else {
+                            self.audio_settings.input_device.clone()
+                        };
+                        egui::ComboBox::from_id_salt("input_device_combo")
+                            .selected_text(&current)
+                            .width(300.0)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(
+                                    &mut self.audio_settings.input_device,
+                                    String::new(),
+                                    "(system default)",
+                                ).changed() {
+                                    self.audio_settings.dirty = true;
+                                }
+                                if ui.selectable_value(
+                                    &mut self.audio_settings.input_device,
+                                    "(none)".to_string(),
+                                    "(none — no input)",
+                                ).changed() {
+                                    self.audio_settings.dirty = true;
+                                }
+                                for dev in &self.audio_settings.input_devices {
+                                    let rates_str = dev.sample_rates.iter()
+                                        .map(|r| format!("{}k", r / 1000))
+                                        .collect::<Vec<_>>()
+                                        .join("/");
+                                    let label = format!(
+                                        "{} ({}ch, {}{})",
+                                        dev.name,
+                                        dev.channels,
+                                        rates_str,
+                                        if dev.is_default { " *" } else { "" },
+                                    );
+                                    if ui.selectable_value(
+                                        &mut self.audio_settings.input_device,
+                                        dev.name.clone(),
+                                        label,
+                                    ).changed() {
+                                        self.audio_settings.dirty = true;
+                                    }
+                                }
+                            });
+                    }
+
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    // ── Sample Rate ──
+                    ui.label(egui::RichText::new("Sample Rate").strong().color(section_color));
+                    // Filter to rates supported by the selected output device
+                    let available_rates = self.audio_settings.selected_output_sample_rates();
+                    ui.horizontal(|ui| {
+                        let rates = [44100u32, 48000, 96000];
+                        for &rate in &rates {
+                            let supported = available_rates.is_empty()
+                                || available_rates.contains(&rate);
+                            let label = format!("{} Hz", rate);
+                            let mut btn = ui.add_enabled(
+                                supported,
+                                egui::SelectableLabel::new(
+                                    self.audio_settings.sample_rate == rate,
+                                    &label,
+                                ),
+                            );
+                            if !supported {
+                                btn = btn.on_disabled_hover_text("Not supported by selected device");
+                            }
+                            if btn.clicked() {
+                                self.audio_settings.sample_rate = rate;
+                                self.audio_settings.dirty = true;
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // ── Buffer Size ──
+                    ui.label(egui::RichText::new("Buffer Size").strong().color(section_color));
+                    ui.horizontal(|ui| {
+                        let sizes = [64u32, 128, 256, 512, 1024];
+                        for &size in &sizes {
+                            let latency = size as f64 / self.audio_settings.sample_rate as f64 * 1000.0;
+                            let label = format!("{} ({:.1}ms)", size, latency);
+                            if ui.selectable_label(
+                                self.audio_settings.buffer_size == size,
+                                &label,
+                            ).clicked() {
+                                self.audio_settings.buffer_size = size;
+                                self.audio_settings.dirty = true;
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ── Status / Apply / Refresh ──
+                if !self.audio_settings.status_msg.is_empty() {
+                    let color = if self.audio_settings.status_msg.starts_with("Error") {
+                        egui::Color32::from_rgb(220, 80, 80)
+                    } else {
+                        egui::Color32::from_rgb(80, 200, 120)
+                    };
+                    ui.label(
+                        egui::RichText::new(&self.audio_settings.status_msg)
+                            .color(color)
+                            .size(12.0),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                ui.horizontal(|ui| {
+                    if is_jack {
+                        if self.audio_settings.pipewire.available {
+                            if ui.button("Refresh Server").clicked() {
+                                self.audio_settings.refresh_pipewire();
+                            }
+                        }
+                    } else {
+                        if ui.button("Refresh Devices").clicked() {
+                            self.audio_settings.refresh_devices();
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let apply_text = if self.audio_settings.dirty {
+                            egui::RichText::new("Apply & Restart Audio").strong()
+                        } else {
+                            egui::RichText::new("Apply & Restart Audio")
+                        };
+                        if ui.button(apply_text).clicked() {
+                            self.apply_audio_settings();
+                        }
+                    });
+                });
+            });
+        self.audio_settings.open = open;
+    }
+
+    fn apply_audio_settings(&mut self) {
+        let is_jack = self.audio_settings.backend == "jack";
+
+        // For JACK: apply PipeWire server settings first
+        if is_jack && self.audio_settings.pipewire.available {
+            let pw = &self.audio_settings.pipewire;
+
+            if self.audio_settings.pw_rate != pw.clock_rate {
+                match pw.set_rate(self.audio_settings.pw_rate) {
+                    Ok(()) => log::info!("PipeWire rate set to {}", self.audio_settings.pw_rate),
+                    Err(e) => {
+                        self.audio_settings.status_msg = format!("Error setting server rate: {e}");
+                        log::error!("{}", self.audio_settings.status_msg);
+                        return;
+                    }
+                }
+            }
+
+            let current_quantum = if pw.force_quantum > 0 { pw.force_quantum } else { pw.quantum };
+            if self.audio_settings.pw_quantum != current_quantum {
+                match pw.set_quantum(self.audio_settings.pw_quantum) {
+                    Ok(()) => log::info!("PipeWire quantum set to {}", self.audio_settings.pw_quantum),
+                    Err(e) => {
+                        self.audio_settings.status_msg = format!("Error setting server quantum: {e}");
+                        log::error!("{}", self.audio_settings.status_msg);
+                        return;
+                    }
+                }
+            }
+
+            // Re-read server state after changes
+            self.audio_settings.refresh_pipewire();
+
+            // Update our config to reflect the server values
+            self.audio_settings.sample_rate = self.audio_settings.pipewire.clock_rate;
+            self.audio_settings.buffer_size = if self.audio_settings.pipewire.force_quantum > 0 {
+                self.audio_settings.pipewire.force_quantum
+            } else {
+                self.audio_settings.pipewire.quantum
+            };
+        }
+
+        // Update config
+        self.app_config.audio.backend = self.audio_settings.backend.clone();
+        self.app_config.audio.sample_rate = self.audio_settings.sample_rate;
+        self.app_config.audio.buffer_size = self.audio_settings.buffer_size;
+        if !is_jack {
+            self.app_config.audio.output_device = self.audio_settings.output_device.clone();
+            self.app_config.audio.input_device = self.audio_settings.input_device.clone();
+        }
+
+        // Save config to disk
+        if let Some(path) = config::default_config_path() {
+            if let Err(e) = self.app_config.save(&path) {
+                log::error!("Failed to save config: {e}");
+                self.audio_settings.status_msg = format!("Error saving config: {e}");
+                return;
+            }
+            log::info!("Config saved to {}", path.display());
+        }
+
+        // Build new AudioConfig
+        let audio_config = self.app_config.to_audio_config();
+        self.sample_rate = audio_config.sample_rate.as_u32();
+        self.buffer_size = audio_config.buffer_size.as_usize();
+
+        // Restart engine
+        let mut eng = self.engine.lock().unwrap();
+        eng.set_backend_prefs(
+            &self.app_config.audio.backend,
+            &self.app_config.audio.output_device,
+            &self.app_config.audio.input_device,
+        );
+        eng.set_config(audio_config);
+
+        match eng.restart() {
+            Ok((meter_rx, pitch_rx)) => {
+                self.meter_rx = meter_rx;
+                self.pitch_rx = pitch_rx;
+                self.audio_settings.status_msg = format!(
+                    "Audio restarted: {}Hz, {} samples",
+                    self.sample_rate, self.buffer_size,
+                );
+                self.audio_settings.dirty = false;
+                log::info!("{}", self.audio_settings.status_msg);
+            }
+            Err(e) => {
+                self.audio_settings.status_msg = format!("Error: {e}");
+                log::error!("Engine restart failed: {e}");
+            }
+        }
     }
 }
 

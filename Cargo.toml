@@ -23,6 +23,7 @@ env_logger = "0.11"
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+rubato = "1"
 
 # Internal crates
 rifflab-core = { path = "crates/rifflab-core" }

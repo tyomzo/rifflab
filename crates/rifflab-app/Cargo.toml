@@ -36,3 +36,5 @@ env_logger = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 rfd = "0.15"
+rubato = { workspace = true }
+audioadapter-buffers = "2"

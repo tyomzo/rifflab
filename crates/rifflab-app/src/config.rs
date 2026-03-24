@@ -23,6 +23,12 @@ pub struct AudioSection {
     pub input_gain: f32,
     /// Master volume (0.0 - 1.0).
     pub master_volume: f32,
+    /// Output device name (empty = system default).
+    #[serde(default)]
+    pub output_device: String,
+    /// Input device name (empty = system default).
+    #[serde(default)]
+    pub input_device: String,
 }
 
 /// Library paths configuration section.
@@ -48,10 +54,12 @@ impl Default for AppConfig {
         Self {
             audio: AudioSection {
                 backend: "auto".to_string(),
-                buffer_size: 256,
+                buffer_size: 128,
                 sample_rate: 48000,
                 input_gain: 1.0,
                 master_volume: 1.0,
+                output_device: String::new(),
+                input_device: String::new(),
             },
             library: LibrarySection {
                 root_override: String::new(),
@@ -130,6 +138,7 @@ impl AppConfig {
             64 => rifflab_core::audio::BufferSize::B64,
             128 => rifflab_core::audio::BufferSize::B128,
             512 => rifflab_core::audio::BufferSize::B512,
+            1024 => rifflab_core::audio::BufferSize::B1024,
             _ => rifflab_core::audio::BufferSize::B256,
         };
         rifflab_core::audio::AudioConfig {
@@ -142,7 +151,7 @@ impl AppConfig {
 }
 
 /// Determine the default config file path using XDG conventions.
-fn default_config_path() -> Option<PathBuf> {
+pub fn default_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "rifflab")
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }

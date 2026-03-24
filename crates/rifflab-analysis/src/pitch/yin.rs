@@ -11,6 +11,10 @@ pub struct YinDetector {
     threshold: f32,
     min_freq: f32,
     max_freq: f32,
+    /// Pre-allocated difference function buffer (avoids alloc in detect).
+    diff: Vec<f32>,
+    /// Pre-allocated cumulative mean normalized difference buffer.
+    cmnd: Vec<f32>,
 }
 
 impl YinDetector {
@@ -25,6 +29,8 @@ impl YinDetector {
             threshold: 0.15,
             min_freq: 30.0,
             max_freq: 2000.0,
+            diff: vec![0.0; max_period],
+            cmnd: vec![0.0; max_period],
         }
     }
 
@@ -54,7 +60,7 @@ impl YinDetector {
         }
     }
 
-    fn yin_detect(&self) -> (f32, f32) {
+    fn yin_detect(&mut self) -> (f32, f32) {
         let buf = &self.buffer;
         let half_len = buf.len() / 2;
         let min_tau = (self.sample_rate as f32 / self.max_freq).floor() as usize;
@@ -65,8 +71,9 @@ impl YinDetector {
             return (0.0, 0.0);
         }
 
-        // Step 1-2: Difference function
-        let mut diff = vec![0.0f32; max_tau];
+        // Step 1-2: Difference function (re-use pre-allocated buffer)
+        let diff = &mut self.diff[..max_tau];
+        diff.fill(0.0);
         for tau in 1..max_tau {
             let mut sum = 0.0;
             for j in 0..half_len {
@@ -79,7 +86,8 @@ impl YinDetector {
         }
 
         // Step 3: Cumulative mean normalized difference function (CMND)
-        let mut cmnd = vec![0.0f32; max_tau];
+        let cmnd = &mut self.cmnd[..max_tau];
+        cmnd.fill(0.0);
         cmnd[0] = 1.0;
         let mut running_sum = 0.0;
         for tau in 1..max_tau {

@@ -135,14 +135,12 @@ pub struct TransportRtHandle {
 }
 
 impl TransportRtHandle {
-    /// Process pending commands and advance position by `frames`.
-    /// Returns true if transport is currently playing.
-    pub fn advance(
+    /// Process pending commands and return whether transport is playing.
+    /// Call this BEFORE reading position for the current buffer.
+    pub fn process_commands(
         &self,
-        frames: usize,
         commands: &mut rifflab_core::rtrb::Consumer<TransportCommand>,
     ) -> bool {
-        // Process commands
         while let Ok(cmd) = commands.pop() {
             match cmd {
                 TransportCommand::Play => {
@@ -169,13 +167,18 @@ impl TransportRtHandle {
                 }
             }
         }
+        self.state.load(Ordering::Relaxed) == 1
+    }
 
+    /// Advance position by `frames` AFTER the current buffer has been processed.
+    /// Call this AFTER graph.process() so the position reflects the next buffer.
+    pub fn advance(&self, frames: usize) {
         let playing = self.state.load(Ordering::Relaxed) == 1;
         if playing {
             let mut pos = self.position.load(Ordering::Relaxed);
             pos += frames as u64;
 
-            // Check loop boundary first
+            // Check loop boundary
             if self.loop_enabled.load(Ordering::Relaxed) {
                 let loop_end = self.loop_end.load(Ordering::Relaxed);
                 if loop_end > 0 && pos >= loop_end {
@@ -193,8 +196,6 @@ impl TransportRtHandle {
 
             self.position.store(pos, Ordering::Relaxed);
         }
-
-        playing
     }
 
     pub fn position_frames(&self) -> u64 {

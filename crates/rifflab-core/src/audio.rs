@@ -40,6 +40,7 @@ pub enum BufferSize {
     B128,
     B256,
     B512,
+    B1024,
 }
 
 impl BufferSize {
@@ -49,6 +50,7 @@ impl BufferSize {
             Self::B128 => 128,
             Self::B256 => 256,
             Self::B512 => 512,
+            Self::B1024 => 1024,
         }
     }
 }
