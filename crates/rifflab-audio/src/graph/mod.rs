@@ -40,6 +40,9 @@ pub struct AudioGraph {
 
 impl AudioGraph {
     pub fn new(max_buffer_size: usize) -> Self {
+        // Use a generous buffer size — JACK may use larger buffers than configured.
+        // 8192 covers up to 8192-frame JACK buffers.
+        let buf_size = max_buffer_size.max(8192);
         Self {
             stem_players: Vec::new(),
             stem_volumes: Vec::new(),
@@ -48,9 +51,9 @@ impl AudioGraph {
             fx_chain: None,
             input_volume: 1.0,
             master_volume: 1.0,
-            mix_buffer: vec![0.0; max_buffer_size * 2], // stereo
-            input_buffer: vec![0.0; max_buffer_size * 2],
-            mono_buffer: vec![0.0; max_buffer_size],
+            mix_buffer: vec![0.0; buf_size * 2], // stereo
+            input_buffer: vec![0.0; buf_size * 2],
+            mono_buffer: vec![0.0; buf_size],
             pitch_detector: None,
         }
     }
