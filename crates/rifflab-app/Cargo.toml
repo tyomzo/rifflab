@@ -35,3 +35,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
+rfd = "0.15"

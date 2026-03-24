@@ -105,12 +105,11 @@ pub fn import_song(
     let beat_grid = None;
     log::info!("Beat tracking skipped (Phase 1) -- no madmom");
 
-    // 7. Offline note transcription (pure Rust)
-    let reference_notes = run_transcription(&decoded.data, decoded.channels, decoded.sample_rate);
-    log::info!(
-        "Transcription complete: {} notes detected",
-        reference_notes.len()
-    );
+    // 7. Offline note transcription — SKIPPED at import time.
+    //    Transcription is slow on large files (minutes in debug builds).
+    //    Run it later via run_transcription() in a background thread if needed.
+    let reference_notes = Vec::new();
+    log::info!("Transcription deferred (will run on demand)");
 
     Ok(ImportResult {
         song_id,
@@ -128,7 +127,8 @@ pub fn import_song(
 /// Run offline note transcription on audio data.
 ///
 /// Downmixes to mono before running YIN pitch detection + onset detection.
-fn run_transcription(data: &[f32], channels: u16, sample_rate: u32) -> Vec<NoteEvent> {
+/// This is CPU-intensive — run in a background thread for large files.
+pub fn run_transcription(data: &[f32], channels: u16, sample_rate: u32) -> Vec<NoteEvent> {
     let mono = downmix_to_mono(data, channels);
     rifflab_analysis::transcribe::transcribe_notes(&mono, sample_rate)
 }
