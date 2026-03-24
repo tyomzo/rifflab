@@ -10,10 +10,12 @@ use rifflab_audio::backend::{self, DeviceInfo};
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
 use rifflab_core::analysis::{NoteEvent, PitchFrame};
+use rifflab_core::audio::{EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 use rifflab_core::metering::MeterData;
 use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
 use rifflab_core::transport::{LoopRegion, TransportState};
+use rifflab_fx::registry::EffectRegistry;
 use rifflab_practice::compare::Comparator;
 use rifflab_practice::scoring::SessionScorer;
 use std::sync::{Arc, Mutex};
@@ -588,6 +590,10 @@ struct RiffLabApp {
     /// Cached sidebar state to avoid locking every frame.
     /// (num_stems, solos, mutes, volumes, master_vol, input_vol)
     sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32)>,
+    /// Effect registry for creating new effects.
+    fx_registry: EffectRegistry,
+    /// Whether the "Add Effect" dropdown is open.
+    fx_add_open: bool,
 }
 
 impl RiffLabApp {
@@ -667,6 +673,8 @@ impl RiffLabApp {
                 timestamp: std::time::Instant::now(),
             },
             sidebar_snapshot: None,
+            fx_registry: EffectRegistry::new(),
+            fx_add_open: false,
         }
     }
 
@@ -1410,12 +1418,7 @@ impl eframe::App for RiffLabApp {
                             });
                         }
                         BottomTab::Effects => {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Effects rack coming soon")
-                                        .color(egui::Color32::from_rgb(100, 110, 120)),
-                                );
-                            });
+                            self.draw_effects_rack(ui);
                         }
                     }
                 });
@@ -2517,6 +2520,199 @@ impl RiffLabApp {
                 log::error!("Engine restart failed: {e}");
             }
         }
+    }
+
+    fn draw_effects_rack(&mut self, ui: &mut egui::Ui) {
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+
+        // Add Effect button
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Signal Chain")
+                    .strong()
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(200, 210, 220)),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let add_resp = ui.button("+ Add Effect");
+                let popup_id = ui.make_persistent_id("fx_add_popup");
+                if add_resp.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(popup_id));
+                }
+                egui::popup_below_widget(ui, popup_id, &add_resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                    ui.set_min_width(180.0);
+                    let effects = self.fx_registry.list_effects();
+                    for (type_id, name, _category) in &effects {
+                        if type_id == "builtin:tuner" { continue; } // skip tuner in rack
+                        if ui.button(name).clicked() {
+                            if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                                if let Ok(mut graph) = graph_arc.try_lock() {
+                                    graph.fx_chain.add(effect);
+                                }
+                            }
+                            ui.memory_mut(|m| m.toggle_popup(popup_id));
+                        }
+                    }
+                });
+            });
+        });
+
+        ui.separator();
+
+        // Scrollable effects list
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut remove_idx: Option<usize> = None;
+
+            if let Ok(mut graph) = graph_arc.try_lock() {
+                let chain = &mut graph.fx_chain;
+                if chain.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 110, 120),
+                        "No effects loaded. Click '+ Add Effect' to start.",
+                    );
+                } else {
+                    for idx in 0..chain.len() {
+                        let effect = &mut chain.effects_mut()[idx];
+                        let effect_name = effect.name().to_string();
+                        let type_id = effect.effect_type_id().to_string();
+                        let is_bypassed = effect.is_bypassed();
+
+                        // Effect header
+                        ui.horizontal(|ui| {
+                            // Bypass toggle
+                            let bypass_label = if is_bypassed { "OFF" } else { "ON" };
+                            let bypass_color = if is_bypassed {
+                                egui::Color32::from_rgb(120, 120, 120)
+                            } else {
+                                egui::Color32::from_rgb(80, 200, 120)
+                            };
+                            if ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(bypass_label).size(10.0).color(bypass_color)
+                                ).min_size(egui::vec2(32.0, 18.0))
+                            ).clicked() {
+                                // Find the bypass param and toggle it
+                                for desc in effect.param_descriptors() {
+                                    if desc.name == "Bypass" {
+                                        let new_val = if is_bypassed { 0.0 } else { 1.0 };
+                                        effect.set_param(desc.id, new_val);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            ui.label(
+                                egui::RichText::new(&effect_name)
+                                    .strong()
+                                    .size(12.0)
+                                    .color(if is_bypassed {
+                                        egui::Color32::from_rgb(120, 120, 120)
+                                    } else {
+                                        egui::Color32::from_rgb(220, 225, 230)
+                                    }),
+                            );
+
+                            // Remove button (right-aligned)
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button(
+                                    egui::RichText::new("X").size(10.0).color(egui::Color32::from_rgb(180, 80, 80))
+                                ).clicked() {
+                                    remove_idx = Some(idx);
+                                }
+                            });
+                        });
+
+                        // Parameters (skip Bypass since we have the toggle)
+                        if !is_bypassed {
+                            let descs: Vec<ParamDescriptor> = effect.param_descriptors()
+                                .into_iter()
+                                .filter(|d| d.name != "Bypass")
+                                .collect();
+
+                            for desc in &descs {
+                                let mut val = effect.get_param(desc.id);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&desc.name)
+                                            .size(10.0)
+                                            .color(egui::Color32::from_rgb(160, 165, 170)),
+                                    );
+
+                                    let changed = match &desc.kind {
+                                        ParamKind::Bool => {
+                                            let mut b = val > 0.5;
+                                            let c = ui.checkbox(&mut b, "").changed();
+                                            if c { val = if b { 1.0 } else { 0.0 }; }
+                                            c
+                                        }
+                                        ParamKind::Enum(labels) => {
+                                            let current_idx = val.round() as usize;
+                                            let current_label = labels.get(current_idx)
+                                                .cloned()
+                                                .unwrap_or_else(|| format!("{}", current_idx));
+                                            let mut changed = false;
+                                            egui::ComboBox::from_id_salt(format!("{}_{}", type_id, desc.id.0))
+                                                .selected_text(&current_label)
+                                                .width(120.0)
+                                                .show_ui(ui, |ui| {
+                                                    for (i, label) in labels.iter().enumerate() {
+                                                        if ui.selectable_value(&mut val, i as f32, label).changed() {
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                });
+                                            changed
+                                        }
+                                        ParamKind::Int => {
+                                            let mut ival = val.round() as i32;
+                                            let c = ui.add(
+                                                egui::Slider::new(&mut ival, desc.min as i32..=desc.max as i32)
+                                            ).changed();
+                                            if c { val = ival as f32; }
+                                            c
+                                        }
+                                        ParamKind::Float => {
+                                            let unit = &desc.unit;
+                                            let c = ui.add(
+                                                egui::Slider::new(&mut val, desc.min..=desc.max)
+                                                    .custom_formatter(move |v, _| {
+                                                        if unit.is_empty() {
+                                                            format!("{:.2}", v)
+                                                        } else {
+                                                            format!("{:.1} {}", v, unit)
+                                                        }
+                                                    })
+                                            ).changed();
+                                            c
+                                        }
+                                    };
+
+                                    if changed {
+                                        effect.set_param(desc.id, val);
+                                    }
+                                });
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        if idx + 1 < chain.len() {
+                            ui.separator();
+                        }
+                    }
+                }
+
+                // Remove effect if requested
+                if let Some(idx) = remove_idx {
+                    chain.remove(idx);
+                }
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 120),
+                    "Audio engine busy...",
+                );
+            }
+        });
     }
 
     fn draw_tuner_settings(&mut self, ctx: &egui::Context) {

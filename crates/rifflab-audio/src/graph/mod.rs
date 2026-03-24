@@ -3,6 +3,7 @@ pub mod bus;
 
 use rifflab_core::audio::{AudioProcessor, ProcessContext};
 use rifflab_core::metering::MeterData;
+use rifflab_fx::chain::EffectChain;
 
 /// Fixed-topology audio graph.
 ///
@@ -21,7 +22,7 @@ pub struct AudioGraph {
     /// Per-stem solo flags.
     pub stem_solos: Vec<bool>,
     /// Effect chain applied to the live input.
-    pub fx_chain: Option<Box<dyn AudioProcessor>>,
+    pub fx_chain: EffectChain,
     /// Input gain.
     pub input_volume: f32,
     /// Master volume.
@@ -42,7 +43,7 @@ impl AudioGraph {
             stem_volumes: Vec::new(),
             stem_mutes: Vec::new(),
             stem_solos: Vec::new(),
-            fx_chain: None,
+            fx_chain: EffectChain::new(),
             input_volume: 1.0,
             master_volume: 1.0,
             mix_buffer: vec![0.0; buf_size * 2], // stereo
@@ -102,8 +103,8 @@ impl AudioGraph {
         if self.input_volume > 0.0 {
             self.input_buffer[..stereo_frames].copy_from_slice(&input[..stereo_frames.min(input.len())]);
 
-            if let Some(ref mut fx) = self.fx_chain {
-                fx.process(&mut self.input_buffer[..stereo_frames], context.sample_rate);
+            if !self.fx_chain.is_empty() {
+                self.fx_chain.process(&mut self.input_buffer[..stereo_frames], context.sample_rate);
             }
 
             for i in 0..stereo_frames {
