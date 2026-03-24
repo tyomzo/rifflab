@@ -25,7 +25,7 @@ pub enum TransportCommand {
 }
 
 /// A loop region defined by sample positions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct LoopRegion {
     pub start_frame: u64,
     pub end_frame: u64,

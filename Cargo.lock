@@ -3452,6 +3452,7 @@ dependencies = [
  "log",
  "rifflab-analysis",
  "rifflab-core",
+ "rifflab-fx",
  "thiserror 2.0.18",
 ]
 
@@ -3465,6 +3466,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "rifflab-cue"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rifflab-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

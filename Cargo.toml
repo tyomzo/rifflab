@@ -8,6 +8,7 @@ members = [
     "crates/rifflab-analysis",
     "crates/rifflab-practice",
     "crates/rifflab-ui",
+    "crates/rifflab-cue",
     "crates/rifflab-app",
 ]
 resolver = "2"
@@ -34,3 +35,4 @@ rifflab-stems = { path = "crates/rifflab-stems" }
 rifflab-analysis = { path = "crates/rifflab-analysis" }
 rifflab-practice = { path = "crates/rifflab-practice" }
 rifflab-ui = { path = "crates/rifflab-ui" }
+rifflab-cue = { path = "crates/rifflab-cue" }
