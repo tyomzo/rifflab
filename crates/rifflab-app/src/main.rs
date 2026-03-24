@@ -2691,22 +2691,29 @@ impl RiffLabApp {
 
         ui.separator();
 
-        // Render effects as horizontal cards that wrap on overflow
-        egui::ScrollArea::both().show(ui, |ui| {
+        // Render effects as horizontal cards that wrap on overflow.
+        // Use horizontal scroll so cards flow left-to-right.
+        let available_height = ui.available_height();
+        egui::ScrollArea::horizontal()
+            .min_scrolled_height(available_height)
+            .show(ui, |ui| {
             if fx_snap.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 110, 120),
-                    "No effects loaded. Click '+ Add Effect' to start.",
-                );
+                ui.set_min_height(available_height);
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 110, 120),
+                        "No effects loaded. Click '+ Add Effect' to start.",
+                    );
+                });
                 return;
             }
 
-            let card_width = 180.0f32;
+            let card_width = 170.0f32;
             let card_bg = egui::Color32::from_rgb(32, 35, 40);
             let card_bg_bypassed = egui::Color32::from_rgb(28, 30, 34);
 
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
 
                 for (idx, fx) in fx_snap.iter().enumerate() {
                     let bg = if fx.bypassed { card_bg_bypassed } else { card_bg };
@@ -2716,57 +2723,58 @@ impl RiffLabApp {
                         .corner_radius(4.0)
                         .inner_margin(6.0)
                         .show(ui, |ui| {
+                            // Force vertical layout inside the card
                             ui.set_width(card_width);
+                            ui.vertical(|ui| {
+                                // Header: bypass + name + remove
+                                ui.horizontal(|ui| {
+                                    let (label, color) = if fx.bypassed {
+                                        ("OFF", egui::Color32::from_rgb(120, 120, 120))
+                                    } else {
+                                        ("ON", egui::Color32::from_rgb(80, 200, 120))
+                                    };
+                                    if ui.add(
+                                        egui::Button::new(egui::RichText::new(label).size(9.0).color(color))
+                                            .min_size(egui::vec2(28.0, 16.0))
+                                    ).clicked() {
+                                        bypass_toggles.push(idx);
+                                    }
 
-                            // Header: bypass + name + remove
-                            ui.horizontal(|ui| {
-                                let (label, color) = if fx.bypassed {
-                                    ("OFF", egui::Color32::from_rgb(120, 120, 120))
-                                } else {
-                                    ("ON", egui::Color32::from_rgb(80, 200, 120))
-                                };
-                                if ui.add(
-                                    egui::Button::new(egui::RichText::new(label).size(9.0).color(color))
-                                        .min_size(egui::vec2(28.0, 16.0))
-                                ).clicked() {
-                                    bypass_toggles.push(idx);
-                                }
+                                    let name_color = if fx.bypassed {
+                                        egui::Color32::from_rgb(100, 100, 100)
+                                    } else {
+                                        egui::Color32::from_rgb(220, 225, 230)
+                                    };
+                                    ui.label(egui::RichText::new(&fx.name).strong().size(11.0).color(name_color));
 
-                                let name_color = if fx.bypassed {
-                                    egui::Color32::from_rgb(100, 100, 100)
-                                } else {
-                                    egui::Color32::from_rgb(220, 225, 230)
-                                };
-                                ui.label(egui::RichText::new(&fx.name).strong().size(11.0).color(name_color));
+                                    if ui.small_button(
+                                        egui::RichText::new("\u{2716}").size(9.0).color(egui::Color32::from_rgb(160, 70, 70))
+                                    ).clicked() {
+                                        remove_idx = Some(idx);
+                                    }
+                                });
 
-                                if ui.small_button(
-                                    egui::RichText::new("\u{2716}").size(9.0).color(egui::Color32::from_rgb(160, 70, 70))
-                                ).clicked() {
-                                    remove_idx = Some(idx);
-                                }
-                            });
+                                // Parameters stacked vertically
+                                if !fx.bypassed {
+                                    ui.add_space(2.0);
+                                    for (desc, val) in &fx.params {
+                                        let mut v = *val;
 
-                            // Parameters (vertical inside the card)
-                            if !fx.bypassed {
-                                for (desc, val) in &fx.params {
-                                    let mut v = *val;
-
-                                    let changed = match &desc.kind {
-                                        ParamKind::Bool => {
-                                            let mut b = v > 0.5;
-                                            let c = ui.checkbox(&mut b, &desc.name).changed();
-                                            if c { v = if b { 1.0 } else { 0.0 }; }
-                                            c
-                                        }
-                                        ParamKind::Enum(labels) => {
-                                            let cur = v.round() as usize;
-                                            let cur_label = labels.get(cur).cloned().unwrap_or_default();
-                                            let mut changed = false;
-                                            ui.horizontal(|ui| {
+                                        let changed = match &desc.kind {
+                                            ParamKind::Bool => {
+                                                let mut b = v > 0.5;
+                                                let c = ui.checkbox(&mut b, &desc.name).changed();
+                                                if c { v = if b { 1.0 } else { 0.0 }; }
+                                                c
+                                            }
+                                            ParamKind::Enum(labels) => {
                                                 ui.label(egui::RichText::new(&desc.name).size(9.0).color(egui::Color32::from_rgb(140, 145, 150)));
+                                                let cur = v.round() as usize;
+                                                let cur_label = labels.get(cur).cloned().unwrap_or_default();
+                                                let mut changed = false;
                                                 egui::ComboBox::from_id_salt(format!("fx{}_{}", idx, desc.id.0))
                                                     .selected_text(&cur_label)
-                                                    .width(90.0)
+                                                    .width(card_width - 12.0)
                                                     .show_ui(ui, |ui| {
                                                         for (i, l) in labels.iter().enumerate() {
                                                             if ui.selectable_value(&mut v, i as f32, l).changed() {
@@ -2774,38 +2782,43 @@ impl RiffLabApp {
                                                             }
                                                         }
                                                     });
-                                            });
-                                            changed
-                                        }
-                                        ParamKind::Int => {
-                                            let mut iv = v.round() as i32;
-                                            let c = ui.add(
-                                                egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32)
-                                                    .text(&desc.name)
-                                            ).changed();
-                                            if c { v = iv as f32; }
-                                            c
-                                        }
-                                        ParamKind::Float => {
-                                            let unit = desc.unit.clone();
-                                            let name = desc.name.clone();
-                                            ui.add(
-                                                egui::Slider::new(&mut v, desc.min..=desc.max)
-                                                    .text(&name)
-                                                    .custom_formatter(move |val, _| {
-                                                        if unit.is_empty() { format!("{:.2}", val) }
-                                                        else { format!("{:.1}{}", val, unit) }
-                                                    })
-                                            ).changed()
-                                        }
-                                    };
+                                                changed
+                                            }
+                                            ParamKind::Int => {
+                                                let mut iv = v.round() as i32;
+                                                let c = ui.add(
+                                                    egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32)
+                                                        .text(&desc.name)
+                                                ).changed();
+                                                if c { v = iv as f32; }
+                                                c
+                                            }
+                                            ParamKind::Float => {
+                                                let unit = desc.unit.clone();
+                                                let name = desc.name.clone();
+                                                ui.add(
+                                                    egui::Slider::new(&mut v, desc.min..=desc.max)
+                                                        .text(&name)
+                                                        .custom_formatter(move |val, _| {
+                                                            if unit.is_empty() { format!("{:.2}", val) }
+                                                            else { format!("{:.1}{}", val, unit) }
+                                                        })
+                                                ).changed()
+                                            }
+                                        };
 
-                                    if changed {
-                                        param_changes.push((idx, desc.id, v));
+                                        if changed {
+                                            param_changes.push((idx, desc.id, v));
+                                        }
                                     }
                                 }
-                            }
+                            });
                         });
+
+                    // Arrow between cards
+                    if idx + 1 < fx_snap.len() {
+                        ui.label(egui::RichText::new("\u{25B6}").size(14.0).color(egui::Color32::from_rgb(80, 85, 95)));
+                    }
                 }
             });
         });
