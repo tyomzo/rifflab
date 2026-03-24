@@ -279,6 +279,14 @@ enum BottomTab {
 
 /// A played note recorded during practice, for piano roll display.
 #[derive(Debug, Clone)]
+/// Cached snapshot of a single effect's state for the UI.
+struct FxSnapCached {
+    name: String,
+    type_id: String,
+    bypassed: bool,
+    params: Vec<(ParamDescriptor, f32)>,
+}
+
 struct PlayedNote {
     midi_note: u8,
     start_seconds: f64,
@@ -595,6 +603,12 @@ struct RiffLabApp {
     fx_registry: EffectRegistry,
     /// Whether the "Add Effect" dropdown is open.
     fx_add_open: bool,
+    /// Cached effects snapshot to avoid locking every frame.
+    fx_snapshot: Vec<FxSnapCached>,
+    /// When the effects snapshot was last refreshed.
+    fx_snapshot_time: std::time::Instant,
+    /// Force refresh on next frame (after add/remove/reorder).
+    fx_snapshot_dirty: bool,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -678,6 +692,9 @@ impl RiffLabApp {
             sidebar_snapshot: None,
             fx_registry: EffectRegistry::new(),
             fx_add_open: false,
+            fx_snapshot: Vec::new(),
+            fx_snapshot_time: std::time::Instant::now(),
+            fx_snapshot_dirty: true,
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -2629,31 +2646,30 @@ impl RiffLabApp {
     fn draw_effects_rack(&mut self, ui: &mut egui::Ui) {
         let graph_arc = self.engine.lock().unwrap().graph().clone();
 
-        // Snapshot effect state (brief lock, no rendering while locked)
-        struct FxSnap {
-            name: String,
-            type_id: String,
-            bypassed: bool,
-            params: Vec<(ParamDescriptor, f32)>,
+        // Snapshot effect state only when needed (dirty flag or periodic refresh).
+        // This avoids locking the graph every frame which causes audio clicks.
+        let needs_refresh = self.fx_snapshot_dirty
+            || self.fx_snapshot_time.elapsed() > std::time::Duration::from_millis(200);
+        if needs_refresh {
+            if let Ok(graph) = graph_arc.try_lock() {
+                self.fx_snapshot = graph.fx_chain.effects().iter().map(|e| {
+                    let descs = e.param_descriptors();
+                    let params = descs.into_iter()
+                        .filter(|d| d.name != "Bypass")
+                        .map(|d| { let v = e.get_param(d.id); (d, v) })
+                        .collect();
+                    FxSnapCached {
+                        name: e.name().to_string(),
+                        type_id: e.effect_type_id().to_string(),
+                        bypassed: e.is_bypassed(),
+                        params,
+                    }
+                }).collect();
+                self.fx_snapshot_time = std::time::Instant::now();
+                self.fx_snapshot_dirty = false;
+            }
         }
-        let fx_snap: Vec<FxSnap> = if let Ok(graph) = graph_arc.try_lock() {
-            graph.fx_chain.effects().iter().map(|e| {
-                let descs = e.param_descriptors();
-                let params = descs.into_iter()
-                    .filter(|d| d.name != "Bypass")
-                    .map(|d| { let v = e.get_param(d.id); (d, v) })
-                    .collect();
-                FxSnap {
-                    name: e.name().to_string(),
-                    type_id: e.effect_type_id().to_string(),
-                    bypassed: e.is_bypassed(),
-                    params,
-                }
-            }).collect()
-        } else {
-            // Lock failed — use empty (no flicker, just show what we had)
-            Vec::new()
-        };
+        let fx_snap = &self.fx_snapshot;
 
         // Collect mutations to apply after rendering
         let mut add_effect: Option<String> = None;
@@ -2889,6 +2905,9 @@ impl RiffLabApp {
                 if let Some((from, to)) = reorder {
                     graph.fx_chain.move_effect(from, to);
                 }
+
+                // Mark snapshot dirty so it refreshes next frame
+                self.fx_snapshot_dirty = true;
             }
         }
     }
