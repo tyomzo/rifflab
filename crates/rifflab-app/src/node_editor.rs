@@ -1,0 +1,524 @@
+//! Node-graph effects editor: draggable effect nodes connected by cables.
+
+use eframe::egui;
+use rifflab_core::audio::{EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
+use serde::{Deserialize, Serialize};
+
+// ─── Data Model ──────────────────────────────────────────────────────────────
+
+const NODE_WIDTH: f32 = 160.0;
+const NODE_HEADER_HEIGHT: f32 = 22.0;
+const PORT_RADIUS: f32 = 5.0;
+const PORT_HIT_RADIUS: f32 = 10.0;
+
+/// Unique port identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PortId {
+    pub node_id: u64,
+    pub index: u8,
+    pub is_output: bool,
+}
+
+/// A cable connecting an output port to an input port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cable {
+    pub from: PortId, // output
+    pub to: PortId,   // input
+}
+
+/// What kind of node this is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NodeKind {
+    /// Audio input (live input / stems).
+    Input,
+    /// Audio output (to master mix).
+    Output,
+    /// A DSP effect from the registry.
+    Effect { type_id: String },
+    /// Crossover splitter: 1 input → 3 outputs (Low/Mid/High).
+    CrossoverSplit {
+        low_mid_hz: f32,
+        mid_high_hz: f32,
+    },
+    /// Crossover merge: 3 inputs → 1 output, with per-band gain.
+    CrossoverMerge {
+        gains: [f32; 3],
+    },
+}
+
+/// A node in the effects graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FxNode {
+    pub id: u64,
+    pub pos: [f32; 2], // canvas position
+    pub kind: NodeKind,
+    pub label: String,
+}
+
+impl FxNode {
+    pub fn num_inputs(&self) -> u8 {
+        match &self.kind {
+            NodeKind::Input => 0,
+            NodeKind::Output => 1,
+            NodeKind::Effect { .. } => 1,
+            NodeKind::CrossoverSplit { .. } => 1,
+            NodeKind::CrossoverMerge { .. } => 3,
+        }
+    }
+
+    pub fn num_outputs(&self) -> u8 {
+        match &self.kind {
+            NodeKind::Input => 1,
+            NodeKind::Output => 0,
+            NodeKind::Effect { .. } => 1,
+            NodeKind::CrossoverSplit { .. } => 3,
+            NodeKind::CrossoverMerge { .. } => 1,
+        }
+    }
+
+    pub fn output_labels(&self) -> Vec<&str> {
+        match &self.kind {
+            NodeKind::CrossoverSplit { .. } => vec!["Low", "Mid", "High"],
+            _ => vec!["Out"],
+        }
+    }
+
+    pub fn input_labels(&self) -> Vec<&str> {
+        match &self.kind {
+            NodeKind::CrossoverMerge { .. } => vec!["Low", "Mid", "High"],
+            _ => vec!["In"],
+        }
+    }
+}
+
+/// The full graph state (serializable for save/load).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FxGraph {
+    pub nodes: Vec<FxNode>,
+    pub cables: Vec<Cable>,
+    pub next_id: u64,
+    /// Canvas pan offset.
+    #[serde(default)]
+    pub pan: [f32; 2],
+}
+
+impl Default for FxGraph {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+impl FxGraph {
+    /// Create a default graph with Input → Output.
+    pub fn new_default() -> Self {
+        Self {
+            nodes: vec![
+                FxNode { id: 1, pos: [50.0, 100.0], kind: NodeKind::Input, label: "Input".into() },
+                FxNode { id: 2, pos: [400.0, 100.0], kind: NodeKind::Output, label: "Output".into() },
+            ],
+            cables: vec![
+                Cable {
+                    from: PortId { node_id: 1, index: 0, is_output: true },
+                    to: PortId { node_id: 2, index: 0, is_output: false },
+                },
+            ],
+            next_id: 3,
+            pan: [0.0, 0.0],
+        }
+    }
+
+    pub fn add_node(&mut self, kind: NodeKind, label: String, pos: [f32; 2]) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.nodes.push(FxNode { id, pos, kind, label });
+        id
+    }
+
+    pub fn remove_node(&mut self, id: u64) {
+        self.cables.retain(|c| c.from.node_id != id && c.to.node_id != id);
+        self.nodes.retain(|n| n.id != id);
+    }
+
+    pub fn add_cable(&mut self, from: PortId, to: PortId) {
+        // Remove any existing cable to this input port
+        self.cables.retain(|c| c.to != to);
+        self.cables.push(Cable { from, to });
+    }
+
+    pub fn remove_cables_to(&mut self, port: PortId) {
+        self.cables.retain(|c| c.to != port);
+    }
+
+    pub fn find_node(&self, id: u64) -> Option<&FxNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    pub fn find_node_mut(&mut self, id: u64) -> Option<&mut FxNode> {
+        self.nodes.iter_mut().find(|n| n.id == id)
+    }
+}
+
+// ─── Interaction State ───────────────────────────────────────────────────────
+
+/// Transient interaction state (not serialized).
+pub struct NodeEditorState {
+    /// Node being dragged, with offset from node origin.
+    pub dragging_node: Option<(u64, egui::Vec2)>,
+    /// Cable being dragged from an output port.
+    pub dragging_cable: Option<(PortId, egui::Pos2)>,
+    /// Canvas is being panned.
+    pub panning: bool,
+}
+
+impl Default for NodeEditorState {
+    fn default() -> Self {
+        Self {
+            dragging_node: None,
+            dragging_cable: None,
+            panning: false,
+        }
+    }
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────────
+
+/// Colors for different node types.
+fn node_color(kind: &NodeKind) -> egui::Color32 {
+    match kind {
+        NodeKind::Input => egui::Color32::from_rgb(60, 140, 200),
+        NodeKind::Output => egui::Color32::from_rgb(200, 80, 80),
+        NodeKind::Effect { .. } => egui::Color32::from_rgb(60, 180, 120),
+        NodeKind::CrossoverSplit { .. } => egui::Color32::from_rgb(200, 160, 60),
+        NodeKind::CrossoverMerge { .. } => egui::Color32::from_rgb(200, 160, 60),
+    }
+}
+
+fn port_color(is_output: bool) -> egui::Color32 {
+    if is_output {
+        egui::Color32::from_rgb(120, 220, 160)
+    } else {
+        egui::Color32::from_rgb(100, 180, 240)
+    }
+}
+
+/// Get the canvas position of a port on a node.
+fn port_position(node: &FxNode, port_idx: u8, is_output: bool, pan: egui::Vec2) -> egui::Pos2 {
+    let x = node.pos[0] + pan.x;
+    let y = node.pos[1] + pan.y;
+
+    if is_output {
+        let count = node.num_outputs();
+        let spacing = if count > 1 { 20.0 } else { 0.0 };
+        let total_h = (count as f32 - 1.0) * spacing;
+        let start_y = y + NODE_HEADER_HEIGHT + 10.0 - total_h / 2.0;
+        egui::pos2(x + NODE_WIDTH, start_y + port_idx as f32 * spacing)
+    } else {
+        let count = node.num_inputs();
+        let spacing = if count > 1 { 20.0 } else { 0.0 };
+        let total_h = (count as f32 - 1.0) * spacing;
+        let start_y = y + NODE_HEADER_HEIGHT + 10.0 - total_h / 2.0;
+        egui::pos2(x, start_y + port_idx as f32 * spacing)
+    }
+}
+
+/// Estimate node height based on kind.
+fn node_height(node: &FxNode) -> f32 {
+    let ports = node.num_inputs().max(node.num_outputs()) as f32;
+    NODE_HEADER_HEIGHT + 10.0 + (ports - 1.0).max(0.0) * 20.0 + 10.0
+}
+
+/// Draw the entire node editor.
+pub fn draw_node_editor(
+    ui: &mut egui::Ui,
+    graph: &mut FxGraph,
+    state: &mut NodeEditorState,
+    registry_effects: &[(String, String, String)], // (type_id, name, category)
+) {
+    let (response, painter) = ui.allocate_painter(
+        ui.available_size(),
+        egui::Sense::click_and_drag(),
+    );
+    let canvas_rect = response.rect;
+    let pan = egui::vec2(graph.pan[0], graph.pan[1]);
+
+    // Dark background
+    painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(20, 22, 26));
+
+    // Grid dots
+    let grid_size = 30.0;
+    let dot_color = egui::Color32::from_rgb(35, 38, 44);
+    let start_x = ((-pan.x / grid_size).floor() * grid_size) + pan.x;
+    let start_y = ((-pan.y / grid_size).floor() * grid_size) + pan.y;
+    let mut gx = canvas_rect.left() + start_x % grid_size;
+    while gx < canvas_rect.right() {
+        let mut gy = canvas_rect.top() + start_y % grid_size;
+        while gy < canvas_rect.bottom() {
+            painter.circle_filled(egui::pos2(gx, gy), 1.0, dot_color);
+            gy += grid_size;
+        }
+        gx += grid_size;
+    }
+
+    // Draw cables
+    for cable in &graph.cables {
+        let from_node = graph.nodes.iter().find(|n| n.id == cable.from.node_id);
+        let to_node = graph.nodes.iter().find(|n| n.id == cable.to.node_id);
+        if let (Some(from_n), Some(to_n)) = (from_node, to_node) {
+            let p0 = port_position(from_n, cable.from.index, true, pan) + canvas_rect.left_top().to_vec2();
+            let p1 = port_position(to_n, cable.to.index, false, pan) + canvas_rect.left_top().to_vec2();
+            draw_cable(&painter, p0, p1, egui::Color32::from_rgb(100, 180, 140));
+        }
+    }
+
+    // Draw cable being dragged
+    if let Some((port, mouse_pos)) = &state.dragging_cable {
+        if let Some(from_node) = graph.nodes.iter().find(|n| n.id == port.node_id) {
+            let p0 = port_position(from_node, port.index, true, pan) + canvas_rect.left_top().to_vec2();
+            draw_cable(&painter, p0, *mouse_pos, egui::Color32::from_rgb(180, 220, 100));
+        }
+    }
+
+    // Draw nodes (collect interactions to avoid borrow issues)
+    let mut node_drag_start: Option<(u64, egui::Vec2)> = None;
+    let mut cable_drag_start: Option<PortId> = None;
+    let mut cable_drop_target: Option<PortId> = None;
+    let mut context_menu_pos: Option<egui::Pos2> = None;
+    let mut remove_node_id: Option<u64> = None;
+
+    for node in &graph.nodes {
+        let nx = canvas_rect.left() + node.pos[0] + pan.x;
+        let ny = canvas_rect.top() + node.pos[1] + pan.y;
+        let height = node_height(node);
+        let node_rect = egui::Rect::from_min_size(egui::pos2(nx, ny), egui::vec2(NODE_WIDTH, height));
+
+        // Skip if not visible
+        if !canvas_rect.intersects(node_rect) {
+            continue;
+        }
+
+        let color = node_color(&node.kind);
+        let bg = egui::Color32::from_rgb(30, 33, 40);
+
+        // Node body
+        painter.rect_filled(node_rect, 4.0, bg);
+        // Header bar
+        let header_rect = egui::Rect::from_min_size(
+            node_rect.min,
+            egui::vec2(NODE_WIDTH, NODE_HEADER_HEIGHT),
+        );
+        painter.rect_filled(header_rect, 4, color);
+        // Label
+        painter.text(
+            header_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            &node.label,
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+
+        // Border
+        painter.rect_stroke(node_rect, 4.0, egui::Stroke::new(1.0, color.gamma_multiply(0.6)), egui::StrokeKind::Outside);
+
+        // Draw output ports
+        for i in 0..node.num_outputs() {
+            let pos = port_position(node, i, true, pan) + canvas_rect.left_top().to_vec2();
+            painter.circle_filled(pos, PORT_RADIUS, port_color(true));
+            // Label
+            let labels = node.output_labels();
+            if labels.len() > 1 {
+                painter.text(
+                    pos + egui::vec2(-12.0, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    labels[i as usize],
+                    egui::FontId::proportional(8.0),
+                    egui::Color32::from_rgb(160, 170, 180),
+                );
+            }
+        }
+
+        // Draw input ports
+        for i in 0..node.num_inputs() {
+            let pos = port_position(node, i, false, pan) + canvas_rect.left_top().to_vec2();
+            painter.circle_filled(pos, PORT_RADIUS, port_color(false));
+            let labels = node.input_labels();
+            if labels.len() > 1 {
+                painter.text(
+                    pos + egui::vec2(12.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    labels[i as usize],
+                    egui::FontId::proportional(8.0),
+                    egui::Color32::from_rgb(160, 170, 180),
+                );
+            }
+        }
+
+        // Check interaction with this node
+        if let Some(pointer) = response.interact_pointer_pos() {
+            if node_rect.contains(pointer) {
+                // Check port hits first
+                let mut hit_port = false;
+                for i in 0..node.num_outputs() {
+                    let pos = port_position(node, i, true, pan) + canvas_rect.left_top().to_vec2();
+                    if pos.distance(pointer) < PORT_HIT_RADIUS {
+                        if response.drag_started() {
+                            cable_drag_start = Some(PortId { node_id: node.id, index: i, is_output: true });
+                        }
+                        hit_port = true;
+                    }
+                }
+                for i in 0..node.num_inputs() {
+                    let pos = port_position(node, i, false, pan) + canvas_rect.left_top().to_vec2();
+                    if pos.distance(pointer) < PORT_HIT_RADIUS {
+                        if state.dragging_cable.is_some() {
+                            cable_drop_target = Some(PortId { node_id: node.id, index: i, is_output: false });
+                        }
+                        hit_port = true;
+                    }
+                }
+
+                if !hit_port && response.drag_started() {
+                    let offset = pointer - node_rect.min;
+                    node_drag_start = Some((node.id, offset));
+                }
+            }
+        }
+    }
+
+    // Handle node dragging
+    if let Some((id, offset)) = node_drag_start {
+        state.dragging_node = Some((id, offset));
+    }
+    if let Some((id, offset)) = state.dragging_node {
+        if response.dragged() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                if let Some(node) = graph.find_node_mut(id) {
+                    node.pos[0] = pointer.x - canvas_rect.left() - pan.x - offset.x;
+                    node.pos[1] = pointer.y - canvas_rect.top() - pan.y - offset.y;
+                }
+            }
+        }
+        if response.drag_stopped() {
+            state.dragging_node = None;
+        }
+    }
+
+    // Handle cable dragging
+    if let Some(port) = cable_drag_start {
+        state.dragging_cable = Some((port, egui::Pos2::ZERO));
+    }
+    if let Some((port, _)) = &mut state.dragging_cable {
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            state.dragging_cable = Some((*port, pointer));
+        }
+        if response.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
+            if let Some(target) = cable_drop_target {
+                let from = state.dragging_cable.unwrap().0;
+                if from.node_id != target.node_id {
+                    graph.add_cable(from, target);
+                }
+            }
+            state.dragging_cable = None;
+        }
+    }
+
+    // Canvas panning (middle mouse or ctrl+drag on background)
+    if response.dragged() && state.dragging_node.is_none() && state.dragging_cable.is_none() {
+        let delta = response.drag_delta();
+        graph.pan[0] += delta.x;
+        graph.pan[1] += delta.y;
+    }
+
+    // Right-click context menu
+    response.context_menu(|ui| {
+        let click_pos = response.interact_pointer_pos()
+            .map(|p| [p.x - canvas_rect.left() - pan.x, p.y - canvas_rect.top() - pan.y])
+            .unwrap_or([200.0, 100.0]);
+
+        ui.label(egui::RichText::new("Add Node").strong().size(11.0));
+        ui.separator();
+
+        if ui.button("Crossover Split").clicked() {
+            let id = graph.add_node(
+                NodeKind::CrossoverSplit { low_mid_hz: 250.0, mid_high_hz: 2500.0 },
+                "Crossover".into(),
+                click_pos,
+            );
+            ui.close_menu();
+        }
+        if ui.button("Crossover Merge").clicked() {
+            graph.add_node(
+                NodeKind::CrossoverMerge { gains: [0.0; 3] },
+                "Merge".into(),
+                click_pos,
+            );
+            ui.close_menu();
+        }
+        ui.separator();
+        for (type_id, name, _) in registry_effects {
+            if type_id == "builtin:tuner" || type_id == "builtin:multiband" { continue; }
+            if ui.button(name).clicked() {
+                graph.add_node(
+                    NodeKind::Effect { type_id: type_id.clone() },
+                    name.clone(),
+                    click_pos,
+                );
+                ui.close_menu();
+            }
+        }
+
+        // Delete hovered node
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            for node in &graph.nodes {
+                let nx = canvas_rect.left() + node.pos[0] + pan.x;
+                let ny = canvas_rect.top() + node.pos[1] + pan.y;
+                let node_rect = egui::Rect::from_min_size(
+                    egui::pos2(nx, ny),
+                    egui::vec2(NODE_WIDTH, node_height(node)),
+                );
+                if node_rect.contains(pointer) {
+                    if !matches!(node.kind, NodeKind::Input | NodeKind::Output) {
+                        ui.separator();
+                        if ui.button(format!("Delete {}", node.label)).clicked() {
+                            remove_node_id = Some(node.id);
+                            ui.close_menu();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    // Apply deferred removal
+    if let Some(id) = remove_node_id {
+        graph.remove_node(id);
+    }
+}
+
+/// Draw a Bezier cable between two points.
+fn draw_cable(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2, color: egui::Color32) {
+    let dx = (p1.x - p0.x).abs() * 0.5;
+    let cp0 = egui::pos2(p0.x + dx, p0.y);
+    let cp1 = egui::pos2(p1.x - dx, p1.y);
+    painter.add(egui::Shape::CubicBezier(egui::epaint::CubicBezierShape::from_points_stroke(
+        [p0, cp0, cp1, p1],
+        false,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(2.0, color),
+    )));
+}
+
+// ─── Persistence ─────────────────────────────────────────────────────────────
+
+/// Save graph to JSON.
+pub fn save_graph(path: &std::path::Path, graph: &FxGraph) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(graph)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+/// Load graph from JSON.
+pub fn load_graph(path: &std::path::Path) -> Result<FxGraph, Box<dyn std::error::Error>> {
+    let json = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&json)?)
+}

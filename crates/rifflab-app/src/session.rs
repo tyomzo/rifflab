@@ -30,6 +30,7 @@ pub fn save_session(
     stems: &[(StemType, &[f32], u16, u64)], // (type, data, channels, frames)
     effects_preset: Option<&EffectPreset>,
     cue_list: Option<&rifflab_cue::CueList>,
+    fx_graph: Option<&crate::node_editor::FxGraph>,
 ) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create session dir: {}", dir.display()))?;
@@ -78,6 +79,12 @@ pub fn save_session(
         }
     }
 
+    // Write effects graph if present
+    if let Some(graph) = fx_graph {
+        crate::node_editor::save_graph(&dir.join("graph.json"), graph)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     log::info!("Session saved to {}", dir.display());
     Ok(())
 }
@@ -120,11 +127,22 @@ pub fn load_session(dir: &Path) -> Result<LoadedSession> {
         None
     };
 
+    // Load effects graph if present
+    let graph_path = dir.join("graph.json");
+    let fx_graph = if graph_path.exists() {
+        crate::node_editor::load_graph(&graph_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .ok()
+    } else {
+        None
+    };
+
     Ok(LoadedSession {
         manifest,
         stems,
         effects_preset,
         cue_list,
+        fx_graph,
         session_dir: dir.to_path_buf(),
     })
 }
@@ -134,6 +152,7 @@ pub struct LoadedSession {
     pub stems: Vec<(StemType, crate::decode::DecodedAudio)>,
     pub effects_preset: Option<EffectPreset>,
     pub cue_list: Option<rifflab_cue::CueList>,
+    pub fx_graph: Option<crate::node_editor::FxGraph>,
     pub session_dir: PathBuf,
 }
 

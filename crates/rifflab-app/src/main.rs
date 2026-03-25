@@ -2,6 +2,7 @@ mod config;
 mod decode;
 mod import;
 mod library;
+mod node_editor;
 mod session;
 
 use anyhow::Result;
@@ -67,7 +68,7 @@ const DEFAULT_DRAWER_HEIGHT: f32 = 200.0;
 /// Minimum bottom drawer height.
 const MIN_DRAWER_HEIGHT: f32 = 80.0;
 /// Maximum bottom drawer height.
-const MAX_DRAWER_HEIGHT: f32 = 500.0;
+const MAX_DRAWER_HEIGHT: f32 = 2000.0; // effectively unlimited — user controls via drag
 /// Width of the piano keyboard strip on the left of the piano roll.
 const PIANO_KEY_WIDTH: f32 = 48.0;
 /// Height of each semitone row in the piano roll.
@@ -694,6 +695,10 @@ struct RiffLabApp {
     arrangement_view: ArrangementView,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
+    /// Node graph for effects routing.
+    fx_graph: node_editor::FxGraph,
+    /// Node editor interaction state (not serialized).
+    node_editor_state: node_editor::NodeEditorState,
 }
 
 impl RiffLabApp {
@@ -788,6 +793,8 @@ impl RiffLabApp {
             spectrogram_pending_key: (0, 0, 0, 0, 0),
             arrangement_view: ArrangementView::Waveform,
             cue_engine: CueEngine::new(sample_rate),
+            fx_graph: node_editor::FxGraph::new_default(),
+            node_editor_state: node_editor::NodeEditorState::default(),
         }
     }
 
@@ -1745,7 +1752,13 @@ impl eframe::App for RiffLabApp {
                             });
                         }
                         BottomTab::Effects => {
-                            self.draw_effects_rack(ui);
+                            let effects_list = self.fx_registry.list_effects();
+                            node_editor::draw_node_editor(
+                                ui,
+                                &mut self.fx_graph,
+                                &mut self.node_editor_state,
+                                &effects_list,
+                            );
                         }
                     }
                 });
@@ -3806,12 +3819,12 @@ impl RiffLabApp {
 
         let file_name = self.file_name.clone();
         let sample_rate = self.sample_rate;
+        let fx_graph = self.fx_graph.clone();
         self.session_path = Some(dir.clone());
         self.message_log.push("Saving session...".into(), false);
 
         // Spawn background thread for I/O
         let tx = {
-            // Reuse the load message channel pattern
             let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
             let tx_clone = tx.clone();
             std::thread::spawn(move || {
@@ -3821,6 +3834,7 @@ impl RiffLabApp {
                 match session::save_session(
                     &dir, &file_name, &original, sample_rate,
                     &stems_refs, effects_preset.as_ref(), cue_list.as_ref(),
+                    Some(&fx_graph),
                 ) {
                     Ok(()) => { let _ = tx_clone.send((false, format!("Session saved to {}", dir.display()))); }
                     Err(e) => { let _ = tx_clone.send((true, format!("Save failed: {e}"))); }
@@ -3890,6 +3904,11 @@ impl RiffLabApp {
                 // Load cues
                 if let Some(cues) = loaded.cue_list {
                     self.cue_engine.set_cue_list(cues);
+                }
+
+                // Load effects graph
+                if let Some(graph) = loaded.fx_graph {
+                    self.fx_graph = graph;
                 }
 
                 self.file_name = loaded.manifest.name;
