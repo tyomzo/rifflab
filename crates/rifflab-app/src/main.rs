@@ -699,6 +699,8 @@ struct RiffLabApp {
     fx_graph: node_editor::FxGraph,
     /// Node editor interaction state (not serialized).
     node_editor_state: node_editor::NodeEditorState,
+    /// Hash of last compiled graph (to detect changes).
+    fx_graph_compiled_hash: u64,
 }
 
 impl RiffLabApp {
@@ -795,6 +797,7 @@ impl RiffLabApp {
             cue_engine: CueEngine::new(sample_rate),
             fx_graph: node_editor::FxGraph::new_default(),
             node_editor_state: node_editor::NodeEditorState::default(),
+            fx_graph_compiled_hash: 0,
         }
     }
 
@@ -1759,6 +1762,8 @@ impl eframe::App for RiffLabApp {
                                 &mut self.node_editor_state,
                                 &effects_list,
                             );
+                            // Compile graph to audio engine when it changes
+                            self.compile_graph_if_changed();
                         }
                     }
                 });
@@ -3093,6 +3098,80 @@ impl RiffLabApp {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width_px, height_px), egui::Sense::hover());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 20, 24));
         }
+    }
+
+    /// Compile the visual node graph into audio engine configuration when it changes.
+    fn compile_graph_if_changed(&mut self) {
+        // Simple hash: number of nodes + cables + node IDs
+        let hash = {
+            let mut h: u64 = self.fx_graph.nodes.len() as u64 * 1000003;
+            for n in &self.fx_graph.nodes {
+                h = h.wrapping_add(n.id.wrapping_mul(7919));
+            }
+            h = h.wrapping_add(self.fx_graph.cables.len() as u64 * 104729);
+            for c in &self.fx_graph.cables {
+                h = h.wrapping_add(c.from.node_id.wrapping_mul(31) + c.to.node_id.wrapping_mul(37));
+            }
+            h
+        };
+
+        if hash == self.fx_graph_compiled_hash {
+            return;
+        }
+        self.fx_graph_compiled_hash = hash;
+
+        let route = self.fx_graph.compile();
+        // Get graph Arc once, outside the match
+        let graph_arc: Arc<Mutex<rifflab_audio::graph::AudioGraph>> = {
+            let eng = self.engine.lock().unwrap();
+            Arc::clone(eng.graph())
+        };
+
+        match route {
+            node_editor::CompiledRoute::Empty => {
+                if let Ok(mut g) = graph_arc.try_lock() {
+                    g.fx_chain = rifflab_fx::chain::EffectChain::new();
+                    g.fx_multiband_active = false;
+                }
+            }
+            node_editor::CompiledRoute::SingleChain(type_ids) => {
+                let mut chain = rifflab_fx::chain::EffectChain::new();
+                for type_id in &type_ids {
+                    if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                        chain.add(effect);
+                    }
+                }
+                if let Ok(mut g) = graph_arc.try_lock() {
+                    g.fx_chain = chain;
+                    g.fx_multiband_active = false;
+                }
+            }
+            node_editor::CompiledRoute::Multiband {
+                low_mid_hz, mid_high_hz, gains,
+                low_chain, mid_chain, high_chain,
+            } => {
+                let build = |tids: &[String]| {
+                    let mut c = rifflab_fx::chain::EffectChain::new();
+                    for tid in tids {
+                        if let Some(e) = self.fx_registry.create_effect(tid) { c.add(e); }
+                    }
+                    c
+                };
+                let chains = [build(&low_chain), build(&mid_chain), build(&high_chain)];
+
+                if let Ok(mut g) = graph_arc.try_lock() {
+                    let mut mb = g.fx_multiband.take().unwrap_or_else(MultibandRouter::new);
+                    mb.set_crossover_low_mid(low_mid_hz);
+                    mb.set_crossover_mid_high(mid_high_hz);
+                    mb.band_gains = gains;
+                    let [cl, cm, ch] = chains;
+                    mb.chains = [cl, cm, ch];
+                    g.fx_multiband = Some(mb);
+                    g.fx_multiband_active = true;
+                }
+            }
+        }
+        self.fx_snapshot_dirty = true;
     }
 
     #[allow(clippy::too_many_arguments)]

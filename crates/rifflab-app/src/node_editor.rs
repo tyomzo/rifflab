@@ -508,6 +508,159 @@ fn draw_cable(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2, color: eg
     )));
 }
 
+// ─── Graph Compilation (Visual → Audio Engine) ──────────────────────────────
+
+/// Compiled audio routing from the visual graph.
+pub enum CompiledRoute {
+    /// Linear chain of effect type IDs (Input → Effect → ... → Output).
+    SingleChain(Vec<String>),
+    /// Multiband routing: crossover freqs + per-band effect chains.
+    Multiband {
+        low_mid_hz: f32,
+        mid_high_hz: f32,
+        gains: [f32; 3],
+        low_chain: Vec<String>,
+        mid_chain: Vec<String>,
+        high_chain: Vec<String>,
+    },
+    /// Empty (Input → Output directly, or broken graph).
+    Empty,
+}
+
+impl FxGraph {
+    /// Compile the visual graph into an audio routing configuration.
+    /// Traces cables from Input to Output, collecting effect type_ids in order.
+    pub fn compile(&self) -> CompiledRoute {
+        // Find the Input node
+        let input_node = match self.nodes.iter().find(|n| matches!(n.kind, NodeKind::Input)) {
+            Some(n) => n,
+            None => return CompiledRoute::Empty,
+        };
+
+        // Trace from Input's output port
+        let start_port = PortId { node_id: input_node.id, index: 0, is_output: true };
+        let chain = self.trace_chain(start_port);
+
+        // Check if the chain contains a crossover split
+        let split_pos = chain.iter().position(|id| {
+            self.find_node(*id).map_or(false, |n| matches!(n.kind, NodeKind::CrossoverSplit { .. }))
+        });
+
+        if let Some(split_idx) = split_pos {
+            let split_node_id = chain[split_idx];
+            let split_node = self.find_node(split_node_id).unwrap();
+
+            // Get crossover params
+            let (low_mid_hz, mid_high_hz) = match &split_node.kind {
+                NodeKind::CrossoverSplit { low_mid_hz, mid_high_hz } => (*low_mid_hz, *mid_high_hz),
+                _ => (250.0, 2500.0),
+            };
+
+            // Collect effects before the split
+            let pre_split: Vec<String> = chain[..split_idx].iter()
+                .filter_map(|id| match &self.find_node(*id)?.kind {
+                    NodeKind::Effect { type_id } => Some(type_id.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            // Trace each band output from the split node
+            let band_labels = ["Low", "Mid", "High"];
+            let mut band_chains: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut gains = [0.0f32; 3];
+
+            for band_idx in 0..3u8 {
+                let band_port = PortId { node_id: split_node_id, index: band_idx, is_output: true };
+                let band_node_ids = self.trace_chain(band_port);
+                for node_id in &band_node_ids {
+                    if let Some(node) = self.find_node(*node_id) {
+                        match &node.kind {
+                            NodeKind::Effect { type_id } => {
+                                band_chains[band_idx as usize].push(type_id.clone());
+                            }
+                            NodeKind::CrossoverMerge { gains: g } => {
+                                gains = *g;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            // Prepend pre-split effects to each band (they apply to all bands)
+            // Actually, pre-split effects should be in a separate single chain before the split.
+            // For now, the multiband route only uses effects after the split.
+
+            CompiledRoute::Multiband {
+                low_mid_hz,
+                mid_high_hz,
+                gains,
+                low_chain: band_chains[0].clone(),
+                mid_chain: band_chains[1].clone(),
+                high_chain: band_chains[2].clone(),
+            }
+        } else {
+            // Simple linear chain
+            let effects: Vec<String> = chain.iter()
+                .filter_map(|id| match &self.find_node(*id)?.kind {
+                    NodeKind::Effect { type_id } => Some(type_id.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            if effects.is_empty() {
+                CompiledRoute::Empty
+            } else {
+                CompiledRoute::SingleChain(effects)
+            }
+        }
+    }
+
+    /// Trace a chain of nodes starting from a given output port.
+    /// Returns node IDs in order (excluding the starting node).
+    fn trace_chain(&self, start_port: PortId) -> Vec<u64> {
+        let mut result = Vec::new();
+        let mut current_port = start_port;
+
+        loop {
+            // Find cable from current output port
+            let cable = self.cables.iter().find(|c| c.from == current_port);
+            let cable = match cable {
+                Some(c) => c,
+                None => break, // dead end
+            };
+
+            let next_node_id = cable.to.node_id;
+
+            // Avoid loops
+            if result.contains(&next_node_id) {
+                break;
+            }
+
+            result.push(next_node_id);
+
+            // Find the next node
+            let next_node = match self.find_node(next_node_id) {
+                Some(n) => n,
+                None => break,
+            };
+
+            // If this node is Output or CrossoverSplit (which has multiple outputs), stop
+            match &next_node.kind {
+                NodeKind::Output => break,
+                NodeKind::CrossoverSplit { .. } => break, // caller handles multi-output
+                NodeKind::CrossoverMerge { .. } => break, // stop at merge
+                _ => {
+                    // Continue from this node's output port 0
+                    current_port = PortId { node_id: next_node_id, index: 0, is_output: true };
+                }
+            }
+        }
+
+        result
+    }
+}
+
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
 /// Save graph to JSON.
