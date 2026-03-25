@@ -53,6 +53,9 @@ pub struct FxNode {
     pub pos: [f32; 2], // canvas position
     pub kind: NodeKind,
     pub label: String,
+    /// Saved parameter values: Vec of (param_id, value). Loaded into param_cache on graph load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<(u32, f32)>,
 }
 
 impl FxNode {
@@ -113,8 +116,8 @@ impl FxGraph {
     pub fn new_default() -> Self {
         Self {
             nodes: vec![
-                FxNode { id: 1, pos: [50.0, 100.0], kind: NodeKind::Input, label: "Input".into() },
-                FxNode { id: 2, pos: [400.0, 100.0], kind: NodeKind::Output, label: "Output".into() },
+                FxNode { id: 1, pos: [50.0, 100.0], kind: NodeKind::Input, label: "Input".into(), params: Vec::new() },
+                FxNode { id: 2, pos: [400.0, 100.0], kind: NodeKind::Output, label: "Output".into(), params: Vec::new() },
             ],
             cables: vec![
                 Cable {
@@ -130,7 +133,7 @@ impl FxGraph {
     pub fn add_node(&mut self, kind: NodeKind, label: String, pos: [f32; 2]) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.push(FxNode { id, pos, kind, label });
+        self.nodes.push(FxNode { id, pos, kind, label, params: Vec::new() });
         id
     }
 
@@ -147,6 +150,29 @@ impl FxGraph {
 
     pub fn remove_cables_to(&mut self, port: PortId) {
         self.cables.retain(|c| c.to != port);
+    }
+
+    /// Save parameter cache values into node params for serialization.
+    pub fn save_params_from_cache(&mut self, cache: &std::collections::HashMap<(u64, u32), f32>) {
+        for node in &mut self.nodes {
+            node.params.clear();
+            for (&(nid, pid), &val) in cache {
+                if nid == node.id {
+                    node.params.push((pid, val));
+                }
+            }
+            node.params.sort_by_key(|(pid, _)| *pid);
+        }
+    }
+
+    /// Load node params into a parameter cache.
+    pub fn load_params_to_cache(&self, cache: &mut std::collections::HashMap<(u64, u32), f32>) {
+        cache.clear();
+        for node in &self.nodes {
+            for &(pid, val) in &node.params {
+                cache.insert((node.id, pid), val);
+            }
+        }
     }
 
     pub fn find_node(&self, id: u64) -> Option<&FxNode> {

@@ -1772,6 +1772,8 @@ impl eframe::App for RiffLabApp {
                             }
                             match action {
                                 node_editor::GraphAction::Save => {
+                                    // Save param cache into graph nodes before serializing
+                                    self.fx_graph.save_params_from_cache(&self.node_editor_state.param_cache);
                                     if let Some(path) = rfd::FileDialog::new()
                                         .add_filter("RiffLab Graph", &["json"])
                                         .set_file_name("graph.json")
@@ -1792,8 +1794,8 @@ impl eframe::App for RiffLabApp {
                                         match node_editor::load_graph(&path) {
                                             Ok(g) => {
                                                 self.fx_graph = g;
+                                                self.fx_graph.load_params_to_cache(&mut self.node_editor_state.param_cache);
                                                 self.fx_graph_compiled_hash = 0;
-                                                self.node_editor_state.param_cache.clear();
                                                 self.compile_graph_if_changed();
                                                 self.message_log.push(format!("Graph loaded from {}", path.display()), false);
                                             }
@@ -3253,9 +3255,28 @@ impl RiffLabApp {
                 }
             }
             node_editor::CompiledRoute::SingleChain(type_ids) => {
+                // Get effect node IDs in traversal order to match params
+                let effect_node_ids: Vec<u64> = {
+                    let input = self.fx_graph.nodes.iter().find(|n| matches!(n.kind, node_editor::NodeKind::Input));
+                    if let Some(inp) = input {
+                        let start = node_editor::PortId { node_id: inp.id, index: 0, is_output: true };
+                        self.fx_graph.trace_chain(start).into_iter()
+                            .filter(|id| self.fx_graph.find_node(*id).map_or(false, |n| matches!(n.kind, node_editor::NodeKind::Effect { .. })))
+                            .collect()
+                    } else { Vec::new() }
+                };
+
                 let mut chain = rifflab_fx::chain::EffectChain::new();
-                for type_id in &type_ids {
-                    if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                for (i, type_id) in type_ids.iter().enumerate() {
+                    if let Some(mut effect) = self.fx_registry.create_effect(type_id) {
+                        // Apply cached param values
+                        if let Some(&node_id) = effect_node_ids.get(i) {
+                            for (&(nid, pid), &val) in &self.node_editor_state.param_cache {
+                                if nid == node_id {
+                                    effect.set_param(ParamId(pid), val);
+                                }
+                            }
+                        }
                         chain.add(effect);
                     }
                 }
@@ -4018,6 +4039,7 @@ impl RiffLabApp {
 
         let file_name = self.file_name.clone();
         let sample_rate = self.sample_rate;
+        self.fx_graph.save_params_from_cache(&self.node_editor_state.param_cache);
         let fx_graph = self.fx_graph.clone();
         self.session_path = Some(dir.clone());
         self.message_log.push("Saving session...".into(), false);
@@ -4108,8 +4130,8 @@ impl RiffLabApp {
                 // Load effects graph and compile to audio engine
                 if let Some(graph) = loaded.fx_graph {
                     self.fx_graph = graph;
-                    self.fx_graph_compiled_hash = 0; // force recompile
-                    self.node_editor_state.param_cache.clear();
+                    self.fx_graph.load_params_to_cache(&mut self.node_editor_state.param_cache);
+                    self.fx_graph_compiled_hash = 0;
                     self.compile_graph_if_changed();
                 }
 
