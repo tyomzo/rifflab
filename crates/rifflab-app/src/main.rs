@@ -773,26 +773,38 @@ impl RiffLabApp {
             let stem_dir = std::env::temp_dir().join(format!("rifflab_stems_{}", std::process::id()));
             let _ = std::fs::create_dir_all(&stem_dir);
 
+            // Find the run_demucs.py script relative to the binary
+            let worker_script = {
+                let exe = std::env::current_exe().unwrap_or_default();
+                let workspace_root = exe.parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                workspace_root.join("workers").join("run_demucs.py")
+            };
+
+            let demucs_out_dir = stem_dir.join("stems");
             let demucs_result = std::process::Command::new("python3")
-                .arg("-m")
-                .arg("demucs")
-                .args(["--out", stem_dir.to_str().unwrap_or("/tmp")])
-                .arg("-n")
-                .arg("htdemucs")
+                .arg(&worker_script)
                 .arg(&path_buf)
+                .arg(&demucs_out_dir)
+                .arg("htdemucs")
                 .output();
 
-            // Check which stems demucs produced
             let stem_names = ["vocals", "drums", "bass", "other"];
             let stem_types = [StemType::Vocals, StemType::Drums, StemType::Bass, StemType::Other];
 
-            // Find the output directory (demucs creates htdemucs/<filename>/)
-            let file_stem = path_buf.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-            let demucs_out_dir = stem_dir.join("htdemucs").join(file_stem);
-
             let mut stems: Vec<StemTrack> = Vec::new();
 
-            if demucs_result.is_ok() && demucs_out_dir.exists() {
+            // Log demucs output for debugging
+            if let Ok(ref output) = demucs_result {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!("Demucs stderr: {}", stderr);
+                }
+            }
+
+            if demucs_result.as_ref().map(|o| o.status.success()).unwrap_or(false) && demucs_out_dir.exists() {
                 let _ = tx.send(LoadMsg::Status("Loading separated stems...".into()));
 
                 for (i, (stem_name, stem_type)) in stem_names.iter().zip(stem_types.iter()).enumerate() {
