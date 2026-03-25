@@ -16,7 +16,7 @@
 | **Noise Gate** | Threshold | -36 dB |
 | | Attack | 1 ms |
 | | Release | 80 ms |
-| **Compressor** | Threshold | -18 dB |
+| **Compressor** | Threshold | -45 dB |
 | | Ratio | 3.5 |
 | | Attack | 35 ms (slow — lets pick transient punch through) |
 | | Release | 60 ms |
