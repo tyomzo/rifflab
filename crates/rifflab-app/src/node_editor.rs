@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
 
-const NODE_WIDTH: f32 = 160.0;
+const NODE_WIDTH: f32 = 190.0;
 const NODE_HEADER_HEIGHT: f32 = 22.0;
 const PORT_RADIUS: f32 = 5.0;
 const PORT_HIT_RADIUS: f32 = 10.0;
