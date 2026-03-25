@@ -56,7 +56,7 @@ def main():
     print("Separating stems...", flush=True)
     with torch.no_grad():
         from demucs.apply import apply_model
-        sources = apply_model(model, wav, progress=True)
+        sources = apply_model(model, wav, progress=True, overlap=0.5)
 
     # sources shape: (batch, num_sources, channels, samples)
     sources = sources[0]  # remove batch dim

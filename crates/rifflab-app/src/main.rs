@@ -824,7 +824,7 @@ impl RiffLabApp {
                     .arg(&worker_script)
                     .arg(&path_buf)
                     .arg(&demucs_out_dir)
-                    .arg("htdemucs")
+                    .arg("htdemucs_ft")
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
