@@ -165,12 +165,14 @@ pub struct NodeEditorState {
     /// Node being dragged, with offset from node origin.
     pub dragging_node: Option<(u64, egui::Vec2)>,
     /// Cable being dragged from a port (can be output OR input).
-    /// The bool indicates if the drag source is an output port.
     pub dragging_cable: Option<(PortId, egui::Pos2)>,
     /// Currently selected port (for delete key).
     pub selected_port: Option<PortId>,
     /// Canvas is being panned.
     pub panning: bool,
+    /// Local parameter value cache — holds slider values between frames
+    /// so they don't jump back when snapshots are stale or missing.
+    pub param_cache: std::collections::HashMap<(u64, u32), f32>, // (node_id, param_id) → value
 }
 
 impl Default for NodeEditorState {
@@ -180,6 +182,7 @@ impl Default for NodeEditorState {
             dragging_cable: None,
             selected_port: None,
             panning: false,
+            param_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -413,11 +416,13 @@ pub fn draw_node_editor(
 
         // Render parameter sliders for effect nodes (connected or not)
         if let NodeKind::Effect { type_id } = &node.kind {
-            // Get params from snapshot (connected) or create defaults (unconnected)
-            let params: Vec<(ParamDescriptor, f32)> = if let Some(s) = snap {
+            // Get param descriptors and values:
+            // 1. From snapshot (if connected and engine has the effect)
+            // 2. From local cache (persists slider values between frames)
+            // 3. From registry defaults (initial values)
+            let base_params: Vec<(ParamDescriptor, f32)> = if let Some(s) = snap {
                 s.params.clone()
             } else {
-                // Create a temporary effect to get default param values
                 registry.create_effect(type_id)
                     .map(|e| {
                         e.param_descriptors().into_iter()
@@ -426,6 +431,21 @@ pub fn draw_node_editor(
                     })
                     .unwrap_or_default()
             };
+            // Apply cached values on top (so slider changes stick)
+            let params: Vec<(ParamDescriptor, f32)> = base_params.into_iter()
+                .map(|(d, v)| {
+                    let cached = state.param_cache.get(&(node.id, d.id.0)).copied();
+                    (d, cached.unwrap_or(v))
+                })
+                .collect();
+            // Update cache from snapshot (so cache stays in sync with engine)
+            if snap.is_some() {
+                for (d, v) in &params {
+                    if !state.param_cache.contains_key(&(node.id, d.id.0)) {
+                        state.param_cache.insert((node.id, d.id.0), *v);
+                    }
+                }
+            }
             let bypassed = snap.map_or(false, |s| s.bypassed);
 
             if !bypassed {
@@ -490,6 +510,7 @@ pub fn draw_node_editor(
                                 }
                             };
                             if changed {
+                                state.param_cache.insert((node_id, desc.id.0), v);
                                 param_changes.push(NodeParamChange { node_id, param_id: desc.id, value: v });
                             }
                         }
