@@ -328,14 +328,40 @@ enum FileLoadState {
     },
 }
 
-/// Persistent load status shown in the status bar.
-struct LoadStatus {
-    /// Current status message.
+/// A single log entry.
+struct LogEntry {
     text: String,
-    /// Whether the last operation was an error.
     is_error: bool,
-    /// When the status was last updated (for auto-clear of success messages).
     timestamp: std::time::Instant,
+}
+
+/// Scrollable message log for file loading and other operations.
+struct MessageLog {
+    entries: Vec<LogEntry>,
+    /// Whether the log popup is open.
+    open: bool,
+}
+
+impl MessageLog {
+    fn new() -> Self {
+        Self { entries: Vec::new(), open: false }
+    }
+
+    fn push(&mut self, text: String, is_error: bool) {
+        self.entries.push(LogEntry {
+            text,
+            is_error,
+            timestamp: std::time::Instant::now(),
+        });
+    }
+
+    fn last(&self) -> Option<&LogEntry> {
+        self.entries.last()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 // ─── Audio Settings Panel ────────────────────────────────────────────────────
@@ -600,8 +626,8 @@ struct RiffLabApp {
     app_config: AppConfig,
     /// Background file loading state.
     file_load_state: FileLoadState,
-    /// Status message for file loading (shown in status bar).
-    load_status: LoadStatus,
+    /// Scrollable message log for status/errors.
+    message_log: MessageLog,
     /// Cached sidebar state to avoid locking every frame.
     /// (num_stems, solos, mutes, volumes, master_vol, input_vol)
     sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32)>,
@@ -694,11 +720,7 @@ impl RiffLabApp {
             audio_settings: AudioSettings::new(&app_config),
             app_config,
             file_load_state: FileLoadState::Idle,
-            load_status: LoadStatus {
-                text: String::new(),
-                is_error: false,
-                timestamp: std::time::Instant::now(),
-            },
+            message_log: MessageLog::new(),
             sidebar_snapshot: None,
             fx_registry: EffectRegistry::new(),
             fx_add_open: false,
@@ -784,27 +806,86 @@ impl RiffLabApp {
             };
 
             let demucs_out_dir = stem_dir.join("stems");
-            let demucs_result = std::process::Command::new("python3")
-                .arg(&worker_script)
-                .arg(&path_buf)
-                .arg(&demucs_out_dir)
-                .arg("htdemucs")
-                .output();
+
+            // Run demucs with streaming stdout to status bar
+            let demucs_success = {
+                use std::io::BufRead;
+                let mut child = match std::process::Command::new("python3")
+                    .arg(&worker_script)
+                    .arg(&path_buf)
+                    .arg(&demucs_out_dir)
+                    .arg("htdemucs")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(LoadMsg::Status(format!("Demucs spawn failed: {e}")));
+                        // Fall through to single-track loading
+                        let _ = tx.send(LoadMsg::Status("Loading as single track...".into()));
+                        let decoded_rs = if src_rate != target_rate {
+                            decode::resample(decoded, target_rate)
+                        } else {
+                            decoded
+                        };
+                        let overview = WaveformOverview::from_interleaved(
+                            &decoded_rs.data, decoded_rs.channels,
+                            OVERVIEW_SAMPLES_PER_PEAK, TRACK_COLORS[0], name_clone.clone(),
+                        );
+                        let _ = tx.send(LoadMsg::Done(LoadedFile {
+                            file_name: name_clone,
+                            stems: vec![StemTrack { stem_type: StemType::Other, decoded: decoded_rs, overview }],
+                        }));
+                        return;
+                    }
+                };
+
+                // Stream stdout lines as status messages
+                if let Some(stdout) = child.stdout.take() {
+                    let reader = std::io::BufReader::new(stdout);
+                    let tx2 = tx.clone();
+                    std::thread::spawn(move || {
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                if !line.trim().is_empty() {
+                                    let _ = tx2.send(LoadMsg::Status(format!("[demucs] {}", line.trim())));
+                                }
+                            }
+                        }
+                    });
+                }
+                // Stream stderr lines as error messages
+                if let Some(stderr) = child.stderr.take() {
+                    let reader = std::io::BufReader::new(stderr);
+                    let tx3 = tx.clone();
+                    std::thread::spawn(move || {
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() && !trimmed.contains("UserWarning") {
+                                    let _ = tx3.send(LoadMsg::Status(format!("[demucs] {}", trimmed)));
+                                }
+                            }
+                        }
+                    });
+                }
+
+                match child.wait() {
+                    Ok(status) => status.success(),
+                    Err(e) => {
+                        let _ = tx.send(LoadMsg::Status(format!("Demucs wait failed: {e}")));
+                        false
+                    }
+                }
+            };
 
             let stem_names = ["vocals", "drums", "bass", "other"];
             let stem_types = [StemType::Vocals, StemType::Drums, StemType::Bass, StemType::Other];
 
             let mut stems: Vec<StemTrack> = Vec::new();
 
-            // Log demucs output for debugging
-            if let Ok(ref output) = demucs_result {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    log::warn!("Demucs stderr: {}", stderr);
-                }
-            }
-
-            if demucs_result.as_ref().map(|o| o.status.success()).unwrap_or(false) && demucs_out_dir.exists() {
+            if demucs_success && demucs_out_dir.exists() {
                 let _ = tx.send(LoadMsg::Status("Loading separated stems...".into()));
 
                 for (i, (stem_name, stem_type)) in stem_names.iter().zip(stem_types.iter()).enumerate() {
@@ -846,12 +927,11 @@ impl RiffLabApp {
 
             // If demucs failed or produced no stems, fall back to single track
             if stems.is_empty() {
-                if let Err(ref e) = demucs_result {
-                    log::warn!("Demucs failed: {e}, loading as single track");
+                if !demucs_success {
+                    let _ = tx.send(LoadMsg::Status("Demucs failed, loading as single track...".into()));
                 } else {
-                    log::warn!("No stems found in {:?}, loading as single track", demucs_out_dir);
+                    let _ = tx.send(LoadMsg::Status("No stems found, loading as single track...".into()));
                 }
-                let _ = tx.send(LoadMsg::Status("Loading as single track...".into()));
 
                 let decoded = if src_rate != target_rate {
                     decode::resample(decoded, target_rate)
@@ -879,11 +959,8 @@ impl RiffLabApp {
         });
 
         self.file_name = format!("Loading {}...", file_name);
-        self.load_status = LoadStatus {
-            text: format!("Opening {}...", file_name),
-            is_error: false,
-            timestamp: std::time::Instant::now(),
-        };
+        self.message_log.clear();
+        self.message_log.push(format!("Opening {}...", file_name), false);
         self.file_load_state = FileLoadState::Loading {
             file_name,
             receiver: rx,
@@ -902,14 +979,9 @@ impl RiffLabApp {
                     match receiver.try_recv() {
                         Ok(LoadMsg::Status(msg)) => {
                             log::info!("[load] {msg}");
-                            self.load_status = LoadStatus {
-                                text: msg,
-                                is_error: false,
-                                timestamp: std::time::Instant::now(),
-                            };
+                            self.message_log.push(msg, false);
                         }
                         Ok(LoadMsg::Done(loaded)) => {
-                            // Apply stems to engine
                             let num_stems = loaded.stems.len();
                             let load_msg = {
                                 let mut eng = self.engine.lock().unwrap();
@@ -945,7 +1017,6 @@ impl RiffLabApp {
                                 .map(|s| s.overview)
                                 .collect();
 
-                            // Reset practice state
                             self.comparator = None;
                             self.reference_notes.clear();
                             self.scorer = SessionScorer::new();
@@ -953,37 +1024,24 @@ impl RiffLabApp {
                             self.scroll_offset_frames = 0.0;
 
                             log::info!("{load_msg}");
-                            self.load_status = LoadStatus {
-                                text: load_msg,
-                                is_error: false,
-                                timestamp: std::time::Instant::now(),
-                            };
+                            self.message_log.push(load_msg, false);
                             keep_loading = false;
                             break;
                         }
                         Ok(LoadMsg::Error(e)) => {
                             log::error!("File load error: {e}");
                             self.file_name = "No file loaded".to_string();
-                            self.load_status = LoadStatus {
-                                text: e,
-                                is_error: true,
-                                timestamp: std::time::Instant::now(),
-                            };
+                            self.message_log.push(e, true);
                             keep_loading = false;
                             break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            break; // no more messages yet
+                            break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             if keep_loading {
-                                // Thread died without sending Done/Error
                                 self.file_name = "No file loaded".to_string();
-                                self.load_status = LoadStatus {
-                                    text: "File loader thread crashed".into(),
-                                    is_error: true,
-                                    timestamp: std::time::Instant::now(),
-                                };
+                                self.message_log.push("File loader thread crashed".into(), true);
                             }
                             keep_loading = false;
                             break;
@@ -1440,28 +1498,37 @@ impl eframe::App for RiffLabApp {
                             .color(status_color),
                         );
 
-                        // File load status
-                        if !self.load_status.text.is_empty() {
+                        // Message log: show latest entry, click to expand full log
+                        if let Some(last) = self.message_log.last() {
                             let is_active = matches!(self.file_load_state, FileLoadState::Loading { .. });
-                            // Auto-clear success messages after 8 seconds
-                            let age = self.load_status.timestamp.elapsed();
-                            let show = self.load_status.is_error
+                            let age = last.timestamp.elapsed();
+                            let show = last.is_error
                                 || is_active
                                 || age < std::time::Duration::from_secs(8);
                             if show {
                                 ui.separator();
-                                let color = if self.load_status.is_error {
+                                let color = if last.is_error {
                                     egui::Color32::from_rgb(220, 80, 80)
                                 } else if is_active {
                                     egui::Color32::from_rgb(100, 180, 240)
                                 } else {
                                     egui::Color32::from_rgb(80, 200, 120)
                                 };
-                                ui.label(
-                                    egui::RichText::new(&self.load_status.text)
-                                        .small()
-                                        .color(color),
+                                let count = self.message_log.entries.len();
+                                let label_text = if count > 1 {
+                                    format!("[{}/{}] {}", count, count, last.text)
+                                } else {
+                                    last.text.clone()
+                                };
+                                let resp = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&label_text).small().color(color)
+                                    ).sense(egui::Sense::click()),
                                 );
+                                if resp.clicked() {
+                                    self.message_log.open = !self.message_log.open;
+                                }
+                                resp.on_hover_text("Click to show full log");
                             }
                         }
                     });
@@ -2333,6 +2400,7 @@ impl eframe::App for RiffLabApp {
         // ─── Audio Settings Window ───────────────────────────────
         self.draw_audio_settings(ctx);
         self.draw_tuner_settings(ctx);
+        self.draw_message_log(ctx);
 
         // Request continuous repaint for smooth animation
         ctx.request_repaint();
@@ -3074,6 +3142,42 @@ impl RiffLabApp {
             }
             Err(e) => log::error!("Failed to load preset: {e}"),
         }
+    }
+
+    fn draw_message_log(&mut self, ctx: &egui::Context) {
+        let mut open = self.message_log.open;
+        egui::Window::new("Message Log")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .default_height(200.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Clear").clicked() {
+                        self.message_log.clear();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} messages", self.message_log.entries.len()))
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(130, 135, 140)),
+                    );
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for entry in &self.message_log.entries {
+                            let color = if entry.is_error {
+                                egui::Color32::from_rgb(220, 80, 80)
+                            } else {
+                                egui::Color32::from_rgb(180, 190, 200)
+                            };
+                            ui.label(egui::RichText::new(&entry.text).size(11.0).color(color));
+                        }
+                    });
+            });
+        self.message_log.open = open;
     }
 
     fn draw_tuner_settings(&mut self, ctx: &egui::Context) {
