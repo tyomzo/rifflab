@@ -283,6 +283,12 @@ enum BottomTab {
     PianoRoll,
     Accuracy,
     Effects,
+}
+
+/// Which view is shown in the central arrangement area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrangementView {
+    Waveform,
     Spectrogram,
 }
 
@@ -665,8 +671,10 @@ struct RiffLabApp {
     spectrograms: Vec<SpectrogramDisplay>,
     /// Cached spectrogram texture.
     spectrogram_texture: Option<egui::TextureHandle>,
-    /// Cache key: (scroll_bits, zoom_bits, width, height).
-    spectrogram_cache_key: (u64, u64, u32, u32),
+    /// Cache key: (scroll_bits, zoom_bits, width, height, volumes_hash).
+    spectrogram_cache_key: (u64, u64, u32, u32, u64),
+    /// Which view mode is active in the arrangement area.
+    arrangement_view: ArrangementView,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -756,7 +764,8 @@ impl RiffLabApp {
             save_receiver: None,
             spectrograms: Vec::new(),
             spectrogram_texture: None,
-            spectrogram_cache_key: (0, 0, 0, 0),
+            spectrogram_cache_key: (0, 0, 0, 0, 0),
+            arrangement_view: ArrangementView::Waveform,
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -1648,7 +1657,6 @@ impl eframe::App for RiffLabApp {
                             (BottomTab::PianoRoll, "Piano Roll"),
                             (BottomTab::Accuracy, "Accuracy"),
                             (BottomTab::Effects, "Effects"),
-                            (BottomTab::Spectrogram, "Spectrogram"),
                         ];
                         for (tab, label) in &tabs {
                             let active = self.active_tab == *tab;
@@ -1717,9 +1725,6 @@ impl eframe::App for RiffLabApp {
                         }
                         BottomTab::Effects => {
                             self.draw_effects_rack(ui);
-                        }
-                        BottomTab::Spectrogram => {
-                            self.draw_spectrogram(ui, ctx);
                         }
                     }
                 });
@@ -2237,14 +2242,41 @@ impl eframe::App for RiffLabApp {
                 rect
             };
 
-            // ─── Waveform track lanes ───────────────────────────
+            // ─── View toggle (Waveform / Spectrogram) ───────────
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let views = [
+                    (ArrangementView::Waveform, "Waves"),
+                    (ArrangementView::Spectrogram, "Spectrogram"),
+                ];
+                for (view, label) in &views {
+                    let active = self.arrangement_view == *view;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(*label).size(10.0)
+                            .color(if active { egui::Color32::WHITE } else { egui::Color32::from_rgb(130, 135, 140) })
+                    )
+                    .fill(if active { egui::Color32::from_rgb(50, 55, 65) } else { egui::Color32::TRANSPARENT })
+                    .corner_radius(2)
+                    .min_size(egui::vec2(70.0, 16.0));
+                    if ui.add(btn).clicked() {
+                        self.arrangement_view = *view;
+                        self.spectrogram_texture = None; // invalidate
+                    }
+                }
+            });
+
+            // ─── Track lanes ─────────────────────────────────────
             let track_area_height =
-                available.y - RULER_HEIGHT - 10.0; // leave some margin
+                available.y - RULER_HEIGHT - 26.0; // ruler + toggle bar margin
             let num_tracks = self.waveform_overviews.len().max(1);
             let lane_height =
                 (track_area_height / num_tracks as f32).clamp(60.0, TRACK_LANE_HEIGHT);
 
-            if self.waveform_overviews.is_empty() {
+            if self.arrangement_view == ArrangementView::Spectrogram && !self.spectrograms.is_empty() {
+                // ─── Spectrogram view ─────────────────────────────
+                let spec_height = track_area_height.max(60.0);
+                self.draw_spectrogram(ui, ctx, available.x, spec_height);
+            } else if self.waveform_overviews.is_empty() {
                 // No tracks — show placeholder
                 let (_, painter) = ui.allocate_painter(
                     egui::vec2(available.x, lane_height),
@@ -2903,40 +2935,46 @@ impl RiffLabApp {
         }
     }
 
-    fn draw_spectrogram(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let available = ui.available_size();
-        if available.x < 10.0 || available.y < 10.0 || self.spectrograms.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 110, 120),
-                    "Load a file to see spectrograms",
-                );
-            });
-            return;
-        }
+    fn draw_spectrogram(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, width_px: f32, height_px: f32) {
+        let width = width_px as usize;
+        let height = height_px as usize;
+        if width < 10 || height < 10 { return; }
 
-        let width = available.x as usize;
-        let height = available.y as usize;
+        // Get track volumes from sidebar snapshot for opacity control
+        let track_volumes: Vec<f32> = self.sidebar_snapshot
+            .as_ref()
+            .map(|(_, _, _, vols, _, _)| vols.clone())
+            .unwrap_or_default();
 
-        // Check if cached texture is still valid
+        // Hash volumes into cache key so texture regenerates when volumes change
+        let vol_hash: u64 = track_volumes.iter()
+            .enumerate()
+            .fold(0u64, |h, (i, v)| h.wrapping_add((v.to_bits() as u64).wrapping_mul(i as u64 + 1)));
+
         let cache_key = (
             self.scroll_offset_frames.to_bits(),
             self.frames_per_pixel.to_bits(),
             width as u32,
             height as u32,
+            vol_hash,
         );
 
         if self.spectrogram_cache_key != cache_key || self.spectrogram_texture.is_none() {
-            // Regenerate texture
-            let mut pixels = vec![0u8; width * height * 4]; // RGBA flat
+            let mut pixels = vec![0u8; width * height * 4];
 
             let freq_min = 20.0f64;
             let freq_max = (self.sample_rate as f64) / 2.0;
             let log_min = freq_min.ln();
             let log_max = freq_max.ln();
 
-            for spec in &self.spectrograms {
+            for (spec_idx, spec) in self.spectrograms.iter().enumerate() {
                 if spec.data.num_columns == 0 { continue; }
+
+                // Track volume controls spectrogram opacity
+                let track_vol = track_volumes.get(spec_idx).copied().unwrap_or(1.0);
+                if track_vol <= 0.0 { continue; }
+                let opacity = 0.65 * track_vol.min(1.0); // 0–0.65 based on volume
+
                 let base_r = spec.color.r() as f32;
                 let base_g = spec.color.g() as f32;
                 let base_b = spec.color.b() as f32;
@@ -2947,7 +2985,6 @@ impl RiffLabApp {
                     if col >= spec.data.num_columns { continue; }
 
                     for py in 0..height {
-                        // Log frequency scale (low freq at bottom)
                         let frac = (height - 1 - py) as f64 / height as f64;
                         let freq = (log_min + frac * (log_max - log_min)).exp();
                         let bin = (freq * spec.data.fft_size as f64 / self.sample_rate as f64) as usize;
@@ -2956,7 +2993,7 @@ impl RiffLabApp {
                         let mag_u8 = spec.data.magnitudes[col * spec.data.num_bins + bin];
                         if mag_u8 == 0 { continue; }
 
-                        let alpha = (mag_u8 as f32 / 255.0) * 0.65; // 0.5-0.8 range
+                        let alpha = (mag_u8 as f32 / 255.0) * opacity;
 
                         let idx = (py * width + px) * 4;
                         let inv = 1.0 - alpha;
@@ -2973,9 +3010,8 @@ impl RiffLabApp {
             self.spectrogram_cache_key = cache_key;
         }
 
-        // Draw the texture
         if let Some(tex) = &self.spectrogram_texture {
-            let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width_px, height_px), egui::Sense::hover());
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
         }
