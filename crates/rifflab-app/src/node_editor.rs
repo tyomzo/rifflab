@@ -800,6 +800,9 @@ impl FxGraph {
             }
         } else {
             // Simple linear chain
+            let has_output = chain.iter().any(|id| {
+                self.find_node(*id).map_or(false, |n| matches!(n.kind, NodeKind::Output))
+            });
             let effects: Vec<String> = chain.iter()
                 .filter_map(|id| match &self.find_node(*id)?.kind {
                     NodeKind::Effect { type_id } => Some(type_id.clone()),
@@ -807,10 +810,12 @@ impl FxGraph {
                 })
                 .collect();
 
-            if effects.is_empty() {
-                CompiledRoute::Empty
-            } else {
+            if has_output {
+                // Connected path (may have zero effects = passthrough)
                 CompiledRoute::SingleChain(effects)
+            } else {
+                // No path to output
+                CompiledRoute::Empty
             }
         }
     }

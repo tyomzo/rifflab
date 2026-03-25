@@ -3209,6 +3209,7 @@ impl RiffLabApp {
                 if let Ok(mut g) = graph_arc.try_lock() {
                     g.fx_chain = rifflab_fx::chain::EffectChain::new();
                     g.fx_multiband_active = false;
+                    g.fx_input_connected = false;
                 }
             }
             node_editor::CompiledRoute::SingleChain(type_ids) => {
@@ -3221,6 +3222,7 @@ impl RiffLabApp {
                 if let Ok(mut g) = graph_arc.try_lock() {
                     g.fx_chain = chain;
                     g.fx_multiband_active = false;
+                    g.fx_input_connected = true;
                 }
             }
             node_editor::CompiledRoute::Multiband {
@@ -3245,6 +3247,7 @@ impl RiffLabApp {
                     mb.chains = [cl, cm, ch];
                     g.fx_multiband = Some(mb);
                     g.fx_multiband_active = true;
+                    g.fx_input_connected = true;
                 }
             }
         }

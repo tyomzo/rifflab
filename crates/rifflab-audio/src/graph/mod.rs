@@ -28,6 +28,9 @@ pub struct AudioGraph {
     pub fx_multiband: Option<MultibandRouter>,
     /// Whether multiband mode is active.
     pub fx_multiband_active: bool,
+    /// Whether the node graph has a connected Input→Output path.
+    /// When false, live input monitoring is muted.
+    pub fx_input_connected: bool,
     /// Input gain.
     pub input_volume: f32,
     /// Master volume.
@@ -51,6 +54,7 @@ impl AudioGraph {
             fx_chain: EffectChain::new(),
             fx_multiband: None,
             fx_multiband_active: false,
+            fx_input_connected: true, // default: connected (backward compat)
             input_volume: 1.0,
             master_volume: 1.0,
             mix_buffer: vec![0.0; buf_size * 2], // stereo
@@ -106,8 +110,8 @@ impl AudioGraph {
             }
         }
 
-        // Live input monitoring — always active when input_volume > 0
-        if self.input_volume > 0.0 {
+        // Live input monitoring — active when input_volume > 0 AND graph has a connected path
+        if self.input_volume > 0.0 && self.fx_input_connected {
             self.input_buffer[..stereo_frames].copy_from_slice(&input[..stereo_frames.min(input.len())]);
 
             // Route through either multiband crossover or single chain
