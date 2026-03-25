@@ -229,8 +229,8 @@ fn port_position(node: &FxNode, port_idx: u8, is_output: bool, pan: egui::Vec2) 
 fn node_height(node: &FxNode, param_count: usize) -> f32 {
     let ports = node.num_inputs().max(node.num_outputs()) as f32;
     let port_height = (ports - 1.0).max(0.0) * 20.0 + 20.0;
-    // Each slider/param needs ~24px, plus some padding
-    let param_height = if param_count > 0 { param_count as f32 * 24.0 + 8.0 } else { 0.0 };
+    // Each param: ~12px label + ~18px control = ~30px, plus padding
+    let param_height = if param_count > 0 { param_count as f32 * 30.0 + 8.0 } else { 0.0 };
     NODE_HEADER_HEIGHT + port_height.max(param_height) + 12.0
 }
 
@@ -437,48 +437,54 @@ pub fn draw_node_editor(
                     let node_id = node.id;
                     ui.allocate_ui_at_rect(params_rect, |ui| {
                         ui.set_clip_rect(canvas_rect);
+                        let param_width = NODE_WIDTH - 24.0;
                         for (desc, val) in &params {
                             if desc.name == "Bypass" { continue; }
                             let mut v = *val;
+                            // Param name as tiny label above the control
+                            ui.label(egui::RichText::new(&desc.name).size(8.0)
+                                .color(egui::Color32::from_rgb(140, 145, 155)));
                             let changed = match &desc.kind {
                                 ParamKind::Float => {
                                     let unit = desc.unit.clone();
-                                    ui.add(egui::Slider::new(&mut v, desc.min..=desc.max)
-                                        .text(&desc.name)
-                                        .custom_formatter(move |val, _| {
-                                            if unit.is_empty() { format!("{:.2}", val) }
-                                            else { format!("{:.1}{}", val, unit) }
-                                        })
+                                    ui.add_sized(
+                                        egui::vec2(param_width, 16.0),
+                                        egui::Slider::new(&mut v, desc.min..=desc.max)
+                                            .show_value(true)
+                                            .custom_formatter(move |val, _| {
+                                                if unit.is_empty() { format!("{:.2}", val) }
+                                                else { format!("{:.1}{}", val, unit) }
+                                            })
                                     ).changed()
                                 }
                                 ParamKind::Enum(labels) => {
                                     let cur = v.round() as usize;
                                     let cur_label = labels.get(cur).cloned().unwrap_or_default();
                                     let mut changed = false;
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(&desc.name).size(9.0));
-                                        egui::ComboBox::from_id_salt(format!("ne_{}_{}", node_id, desc.id.0))
-                                            .selected_text(&cur_label)
-                                            .width(70.0)
-                                            .show_ui(ui, |ui| {
-                                                for (i, l) in labels.iter().enumerate() {
-                                                    if ui.selectable_value(&mut v, i as f32, l).changed() {
-                                                        changed = true;
-                                                    }
+                                    egui::ComboBox::from_id_salt(format!("ne_{}_{}", node_id, desc.id.0))
+                                        .selected_text(&cur_label)
+                                        .width(param_width)
+                                        .show_ui(ui, |ui| {
+                                            for (i, l) in labels.iter().enumerate() {
+                                                if ui.selectable_value(&mut v, i as f32, l).changed() {
+                                                    changed = true;
                                                 }
-                                            });
-                                    });
+                                            }
+                                        });
                                     changed
                                 }
                                 ParamKind::Int => {
                                     let mut iv = v.round() as i32;
-                                    let c = ui.add(egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32).text(&desc.name)).changed();
+                                    let c = ui.add_sized(
+                                        egui::vec2(param_width, 16.0),
+                                        egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32)
+                                    ).changed();
                                     if c { v = iv as f32; }
                                     c
                                 }
                                 ParamKind::Bool => {
                                     let mut b = v > 0.5;
-                                    let c = ui.checkbox(&mut b, &desc.name).changed();
+                                    let c = ui.checkbox(&mut b, "").changed();
                                     if c { v = if b { 1.0 } else { 0.0 }; }
                                     c
                                 }
