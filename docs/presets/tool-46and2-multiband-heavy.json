@@ -1,0 +1,92 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "pos": [30.0, 150.0],
+      "kind": "Input",
+      "label": "Input"
+    },
+    {
+      "id": 2,
+      "pos": [1050.0, 150.0],
+      "kind": "Output",
+      "label": "Output"
+    },
+    {
+      "id": 3,
+      "pos": [200.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:compressor" } },
+      "label": "Compressor"
+    },
+    {
+      "id": 4,
+      "pos": [400.0, 150.0],
+      "kind": { "CrossoverSplit": { "low_mid_hz": 250.0, "mid_high_hz": 2500.0 } },
+      "label": "Crossover"
+    },
+    {
+      "id": 5,
+      "pos": [620.0, 20.0],
+      "kind": { "Effect": { "type_id": "builtin:eq" } },
+      "label": "Low EQ"
+    },
+    {
+      "id": 6,
+      "pos": [620.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:overdrive" } },
+      "label": "Mid Drive (Rat)"
+    },
+    {
+      "id": 7,
+      "pos": [620.0, 310.0],
+      "kind": { "Effect": { "type_id": "builtin:eq" } },
+      "label": "High EQ"
+    },
+    {
+      "id": 8,
+      "pos": [850.0, 150.0],
+      "kind": { "CrossoverMerge": { "gains": [2.0, 1.0, -2.0] } },
+      "label": "Merge"
+    }
+  ],
+  "cables": [
+    {
+      "from": { "node_id": 1, "index": 0, "is_output": true },
+      "to": { "node_id": 3, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 3, "index": 0, "is_output": true },
+      "to": { "node_id": 4, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 4, "index": 0, "is_output": true },
+      "to": { "node_id": 5, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 4, "index": 1, "is_output": true },
+      "to": { "node_id": 6, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 4, "index": 2, "is_output": true },
+      "to": { "node_id": 7, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 5, "index": 0, "is_output": true },
+      "to": { "node_id": 8, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 6, "index": 0, "is_output": true },
+      "to": { "node_id": 8, "index": 1, "is_output": false }
+    },
+    {
+      "from": { "node_id": 7, "index": 0, "is_output": true },
+      "to": { "node_id": 8, "index": 2, "is_output": false }
+    },
+    {
+      "from": { "node_id": 8, "index": 0, "is_output": true },
+      "to": { "node_id": 2, "index": 0, "is_output": false }
+    }
+  ],
+  "next_id": 9,
+  "pan": [0.0, 0.0]
+}

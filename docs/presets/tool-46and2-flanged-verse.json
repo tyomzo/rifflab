@@ -1,0 +1,64 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "pos": [30.0, 120.0],
+      "kind": "Input",
+      "label": "Input"
+    },
+    {
+      "id": 2,
+      "pos": [830.0, 120.0],
+      "kind": "Output",
+      "label": "Output"
+    },
+    {
+      "id": 3,
+      "pos": [200.0, 30.0],
+      "kind": { "Effect": { "type_id": "builtin:compressor" } },
+      "label": "Compressor"
+    },
+    {
+      "id": 4,
+      "pos": [200.0, 250.0],
+      "kind": { "Effect": { "type_id": "builtin:eq" } },
+      "label": "EQ (Mid Boost)"
+    },
+    {
+      "id": 5,
+      "pos": [430.0, 120.0],
+      "kind": { "Effect": { "type_id": "builtin:flanger" } },
+      "label": "Flanger (BF-2)"
+    },
+    {
+      "id": 6,
+      "pos": [640.0, 120.0],
+      "kind": { "Effect": { "type_id": "builtin:cabinet" } },
+      "label": "Cabinet 4x12"
+    }
+  ],
+  "cables": [
+    {
+      "from": { "node_id": 1, "index": 0, "is_output": true },
+      "to": { "node_id": 3, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 3, "index": 0, "is_output": true },
+      "to": { "node_id": 4, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 4, "index": 0, "is_output": true },
+      "to": { "node_id": 5, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 5, "index": 0, "is_output": true },
+      "to": { "node_id": 6, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 6, "index": 0, "is_output": true },
+      "to": { "node_id": 2, "index": 0, "is_output": false }
+    }
+  ],
+  "next_id": 7,
+  "pan": [0.0, 0.0]
+}
