@@ -35,10 +35,10 @@
 | **Cabinet** | Type | Guitar 4x12 (dark, full body) |
 | | Tone | 0.35 (dark) |
 | | Resonance | 0.4 |
-| **Reverb** | Room Size | 0.3 (small room / cab ambience) |
-| | Damping | 0.5 |
-| | Wet | 0.15 (subtle — space, not wash) |
-| | Dry | 0.85 |
+| **Reverb** | Room Size | 0.16 (tight room) |
+| | Damping | 0.25 (bright reflections) |
+| | Wet | 0.4 (prominent — studio room character) |
+| | Dry | 0.28 |
 
 ---
 

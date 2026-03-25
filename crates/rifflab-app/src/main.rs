@@ -1758,7 +1758,18 @@ impl eframe::App for RiffLabApp {
                             // Compile graph FIRST so chain matches nodes
                             self.compile_graph_if_changed();
                             let effects_list = self.fx_registry.list_effects();
-                            let snapshots = self.build_node_param_snapshots();
+                            // Throttle snapshot reads to avoid lock contention with audio thread
+                            let needs_snap = self.fx_snapshot_dirty
+                                || self.fx_snapshot_time.elapsed() > std::time::Duration::from_millis(200);
+                            if needs_snap {
+                                self.fx_snapshot_time = std::time::Instant::now();
+                                self.fx_snapshot_dirty = false;
+                            }
+                            let snapshots = if needs_snap {
+                                self.build_node_param_snapshots()
+                            } else {
+                                Vec::new() // use param_cache for values between refreshes
+                            };
                             let (changes, action) = node_editor::draw_node_editor(
                                 ui,
                                 &mut self.fx_graph,
@@ -3198,12 +3209,16 @@ impl RiffLabApp {
 
     /// Apply parameter changes from the node editor to the audio engine.
     fn apply_node_param_changes(&mut self, changes: &[node_editor::NodeParamChange]) {
-        let effect_nodes: Vec<u64> = self.fx_graph.nodes.iter()
-            .filter_map(|n| match &n.kind {
-                node_editor::NodeKind::Effect { .. } => Some(n.id),
-                _ => None,
-            })
-            .collect();
+        // Get effect node IDs in cable-traversal order (matches compiled chain order)
+        let effect_nodes: Vec<u64> = {
+            let input = self.fx_graph.nodes.iter().find(|n| matches!(n.kind, node_editor::NodeKind::Input));
+            if let Some(inp) = input {
+                let start = node_editor::PortId { node_id: inp.id, index: 0, is_output: true };
+                self.fx_graph.trace_chain(start).into_iter()
+                    .filter(|id| self.fx_graph.find_node(*id).map_or(false, |n| matches!(n.kind, node_editor::NodeKind::Effect { .. })))
+                    .collect()
+            } else { Vec::new() }
+        };
 
         // Use the same single-statement pattern that works in the sidebar
         {
