@@ -2,6 +2,7 @@ use rifflab_core::audio::EffectDescriptor;
 
 use crate::effects::cabinet::Cabinet;
 use crate::effects::multiband::Multiband;
+use crate::effects::transient::TransientShaper;
 use crate::effects::chorus::Chorus;
 use crate::effects::compressor::Compressor;
 use crate::effects::delay::Delay;
@@ -118,6 +119,13 @@ impl EffectRegistry {
             "Multiband",
             "Built-in",
             || Box::new(Multiband::new(48000)),
+        );
+
+        reg.register(
+            "builtin:transient",
+            "Transient Shaper",
+            "Built-in",
+            || Box::new(TransientShaper::new(48000)),
         );
 
         reg

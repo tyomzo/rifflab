@@ -200,7 +200,7 @@ fn overdrive_shaper_roundtrip() {
 fn registry_lists_all_builtins() {
     let reg = EffectRegistry::new();
     let list = reg.list_effects();
-    assert_eq!(list.len(), 12, "Expected 12 built-in effects, got {}", list.len());
+    assert_eq!(list.len(), 13, "Expected 13 built-in effects, got {}", list.len());
 
     let type_ids: Vec<&str> = list.iter().map(|(id, _, _)| id.as_str()).collect();
     assert!(type_ids.contains(&"builtin:noise_gate"));
@@ -215,6 +215,7 @@ fn registry_lists_all_builtins() {
     assert!(type_ids.contains(&"builtin:phaser"));
     assert!(type_ids.contains(&"builtin:cabinet"));
     assert!(type_ids.contains(&"builtin:multiband"));
+    assert!(type_ids.contains(&"builtin:transient"));
 
     // All should be "Built-in" category
     for (_, _, cat) in &list {

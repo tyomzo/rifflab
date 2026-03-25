@@ -1,0 +1,127 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "pos": [30.0, 150.0],
+      "kind": "Input",
+      "label": "Input"
+    },
+    {
+      "id": 2,
+      "pos": [1100.0, 150.0],
+      "kind": "Output",
+      "label": "Output"
+    },
+    {
+      "id": 3,
+      "pos": [200.0, 30.0],
+      "kind": { "Effect": { "type_id": "builtin:transient" } },
+      "label": "Transient (soften)",
+      "params": [
+        [0, -12.0],
+        [1, -18.0],
+        [2, 15.0],
+        [3, 1.0]
+      ]
+    },
+    {
+      "id": 4,
+      "pos": [200.0, 300.0],
+      "kind": { "Effect": { "type_id": "builtin:eq" } },
+      "label": "EQ (body resonance)",
+      "params": [
+        [0, 80.0],
+        [1, -3.0],
+        [2, 0.8],
+        [3, 300.0],
+        [4, 4.0],
+        [5, 1.2],
+        [6, 1200.0],
+        [7, 2.0],
+        [8, 1.5],
+        [9, 6000.0],
+        [10, -6.0],
+        [11, 1.0]
+      ]
+    },
+    {
+      "id": 5,
+      "pos": [450.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:compressor" } },
+      "label": "Compressor (even out)",
+      "params": [
+        [0, -30.0],
+        [1, 3.0],
+        [2, 5.0],
+        [3, 40.0],
+        [4, 2.0]
+      ]
+    },
+    {
+      "id": 6,
+      "pos": [670.0, 30.0],
+      "kind": { "Effect": { "type_id": "builtin:chorus" } },
+      "label": "Chorus (warmth)",
+      "params": [
+        [0, 0.8],
+        [1, 1.5],
+        [2, 0.2]
+      ]
+    },
+    {
+      "id": 7,
+      "pos": [670.0, 280.0],
+      "kind": { "Effect": { "type_id": "builtin:cabinet" } },
+      "label": "Cabinet (body sim)",
+      "params": [
+        [0, 2.0],
+        [1, 0.25],
+        [2, 0.5]
+      ]
+    },
+    {
+      "id": 8,
+      "pos": [900.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:reverb" } },
+      "label": "Hall Reverb",
+      "params": [
+        [0, 0.6],
+        [1, 0.35],
+        [2, 0.35],
+        [3, 0.65]
+      ]
+    }
+  ],
+  "cables": [
+    {
+      "from": { "node_id": 1, "index": 0, "is_output": true },
+      "to": { "node_id": 3, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 3, "index": 0, "is_output": true },
+      "to": { "node_id": 4, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 4, "index": 0, "is_output": true },
+      "to": { "node_id": 5, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 5, "index": 0, "is_output": true },
+      "to": { "node_id": 6, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 6, "index": 0, "is_output": true },
+      "to": { "node_id": 7, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 7, "index": 0, "is_output": true },
+      "to": { "node_id": 8, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 8, "index": 0, "is_output": true },
+      "to": { "node_id": 2, "index": 0, "is_output": false }
+    }
+  ],
+  "next_id": 9,
+  "pan": [0.0, 0.0]
+}
