@@ -650,6 +650,8 @@ struct RiffLabApp {
     session_path: Option<std::path::PathBuf>,
     /// Original file path for session saving.
     original_file_path: Option<std::path::PathBuf>,
+    /// Background save receiver.
+    save_receiver: Option<std::sync::mpsc::Receiver<(bool, String)>>,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -736,6 +738,7 @@ impl RiffLabApp {
             fx_preset_name: "Untitled".to_string(),
             session_path: None,
             original_file_path: None,
+            save_receiver: None,
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -1075,6 +1078,20 @@ impl eframe::App for RiffLabApp {
         // ─── Poll background file loading ────────────────────────
         self.poll_file_load();
 
+        // ─── Poll background save ────────────────────────────────
+        if let Some(ref rx) = self.save_receiver {
+            match rx.try_recv() {
+                Ok((is_error, msg)) => {
+                    self.message_log.push(msg, is_error);
+                    self.save_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.save_receiver = None;
+                }
+                _ => {} // still saving
+            }
+        }
+
         // ─── Drain channels ──────────────────────────────────────
         while let Ok(meter) = self.meter_rx.pop() {
             // Smooth with exponential moving average
@@ -1231,13 +1248,17 @@ impl eframe::App for RiffLabApp {
 
                     // Save session
                     let has_stems = !self.waveform_overviews.is_empty();
+                    let is_saving = self.save_receiver.is_some();
                     if has_stems {
                         if self.session_path.is_some() {
-                            if ui.small_button("Save").on_hover_text("Save session (overwrite)").clicked() {
+                            if ui.add_enabled(!is_saving, egui::Button::new("Save"))
+                                .on_hover_text("Save session (overwrite)").clicked() {
                                 self.save_current_session(false);
                             }
                         }
-                        if ui.small_button("Save As").on_hover_text("Save session to new folder").clicked() {
+                        let save_as_label = if is_saving { "Saving..." } else { "Save As" };
+                        if ui.add_enabled(!is_saving, egui::Button::new(save_as_label))
+                            .on_hover_text("Save session to new folder").clicked() {
                             self.save_current_session(true);
                         }
                     }
@@ -3220,27 +3241,34 @@ impl RiffLabApp {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
 
-        let stems_refs: Vec<(StemType, &[f32], u16, u64)> = stems_data.iter()
-            .map(|(t, d, c, f)| (*t, d.as_slice(), *c, *f))
-            .collect();
+        let file_name = self.file_name.clone();
+        let sample_rate = self.sample_rate;
+        self.session_path = Some(dir.clone());
+        self.message_log.push("Saving session...".into(), false);
 
-        match session::save_session(
-            &dir,
-            &self.file_name,
-            &original,
-            self.sample_rate,
-            &stems_refs,
-            effects_preset.as_ref(),
-            cue_list.as_ref(),
-        ) {
-            Ok(()) => {
-                self.session_path = Some(dir.clone());
-                self.message_log.push(format!("Session saved to {}", dir.display()), false);
-            }
-            Err(e) => {
-                self.message_log.push(format!("Save failed: {e}"), true);
-            }
-        }
+        // Spawn background thread for I/O
+        let tx = {
+            // Reuse the load message channel pattern
+            let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                let stems_refs: Vec<(StemType, &[f32], u16, u64)> = stems_data.iter()
+                    .map(|(t, d, c, f)| (*t, d.as_slice(), *c, *f))
+                    .collect();
+                match session::save_session(
+                    &dir, &file_name, &original, sample_rate,
+                    &stems_refs, effects_preset.as_ref(), cue_list.as_ref(),
+                ) {
+                    Ok(()) => { let _ = tx_clone.send((false, format!("Session saved to {}", dir.display()))); }
+                    Err(e) => { let _ = tx_clone.send((true, format!("Save failed: {e}"))); }
+                }
+            });
+            rx
+        };
+        // Poll save result on next frames
+        // Simple approach: check once per frame until we get a message
+        // Store the receiver temporarily
+        self.save_receiver = Some(tx);
     }
 
     fn open_session(&mut self, dir: &std::path::Path) {
