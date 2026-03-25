@@ -164,8 +164,11 @@ impl FxGraph {
 pub struct NodeEditorState {
     /// Node being dragged, with offset from node origin.
     pub dragging_node: Option<(u64, egui::Vec2)>,
-    /// Cable being dragged from an output port.
+    /// Cable being dragged from a port (can be output OR input).
+    /// The bool indicates if the drag source is an output port.
     pub dragging_cable: Option<(PortId, egui::Pos2)>,
+    /// Currently selected port (for delete key).
+    pub selected_port: Option<PortId>,
     /// Canvas is being panned.
     pub panning: bool,
 }
@@ -175,6 +178,7 @@ impl Default for NodeEditorState {
         Self {
             dragging_node: None,
             dragging_cable: None,
+            selected_port: None,
             panning: false,
         }
     }
@@ -259,22 +263,34 @@ pub fn draw_node_editor(
         gx += grid_size;
     }
 
-    // Draw cables
+    // Draw cables (highlight if connected to selected port)
     for cable in &graph.cables {
         let from_node = graph.nodes.iter().find(|n| n.id == cable.from.node_id);
         let to_node = graph.nodes.iter().find(|n| n.id == cable.to.node_id);
         if let (Some(from_n), Some(to_n)) = (from_node, to_node) {
             let p0 = port_position(from_n, cable.from.index, true, pan) + canvas_rect.left_top().to_vec2();
             let p1 = port_position(to_n, cable.to.index, false, pan) + canvas_rect.left_top().to_vec2();
-            draw_cable(&painter, p0, p1, egui::Color32::from_rgb(100, 180, 140));
+            let is_selected = state.selected_port.map_or(false, |sp| sp == cable.from || sp == cable.to);
+            let color = if is_selected {
+                egui::Color32::from_rgb(255, 220, 80)
+            } else {
+                egui::Color32::from_rgb(100, 180, 140)
+            };
+            let width = if is_selected { 3.0 } else { 2.0 };
+            draw_cable_width(&painter, p0, p1, color, width);
         }
     }
 
     // Draw cable being dragged
     if let Some((port, mouse_pos)) = &state.dragging_cable {
         if let Some(from_node) = graph.nodes.iter().find(|n| n.id == port.node_id) {
-            let p0 = port_position(from_node, port.index, true, pan) + canvas_rect.left_top().to_vec2();
-            draw_cable(&painter, p0, *mouse_pos, egui::Color32::from_rgb(180, 220, 100));
+            let port_pos = port_position(from_node, port.index, port.is_output, pan) + canvas_rect.left_top().to_vec2();
+            let (p0, p1) = if port.is_output {
+                (port_pos, *mouse_pos)
+            } else {
+                (*mouse_pos, port_pos)
+            };
+            draw_cable(&painter, p0, p1, egui::Color32::from_rgb(180, 220, 100));
         }
     }
 
@@ -282,7 +298,7 @@ pub fn draw_node_editor(
     let mut node_drag_start: Option<(u64, egui::Vec2)> = None;
     let mut cable_drag_start: Option<PortId> = None;
     let mut cable_drop_target: Option<PortId> = None;
-    let mut context_menu_pos: Option<egui::Pos2> = None;
+    let mut port_clicked: Option<PortId> = None;
     let mut remove_node_id: Option<u64> = None;
 
     for node in &graph.nodes {
@@ -321,9 +337,15 @@ pub fn draw_node_editor(
 
         // Draw output ports
         for i in 0..node.num_outputs() {
+            let port_id = PortId { node_id: node.id, index: i, is_output: true };
             let pos = port_position(node, i, true, pan) + canvas_rect.left_top().to_vec2();
-            painter.circle_filled(pos, PORT_RADIUS, port_color(true));
-            // Label
+            let is_selected = state.selected_port == Some(port_id);
+            let color = if is_selected { egui::Color32::from_rgb(255, 255, 100) } else { port_color(true) };
+            let radius = if is_selected { PORT_RADIUS + 2.0 } else { PORT_RADIUS };
+            painter.circle_filled(pos, radius, color);
+            if is_selected {
+                painter.circle_stroke(pos, radius + 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 255, 100)));
+            }
             let labels = node.output_labels();
             if labels.len() > 1 {
                 painter.text(
@@ -338,8 +360,15 @@ pub fn draw_node_editor(
 
         // Draw input ports
         for i in 0..node.num_inputs() {
+            let port_id = PortId { node_id: node.id, index: i, is_output: false };
             let pos = port_position(node, i, false, pan) + canvas_rect.left_top().to_vec2();
-            painter.circle_filled(pos, PORT_RADIUS, port_color(false));
+            let is_selected = state.selected_port == Some(port_id);
+            let color = if is_selected { egui::Color32::from_rgb(255, 255, 100) } else { port_color(false) };
+            let radius = if is_selected { PORT_RADIUS + 2.0 } else { PORT_RADIUS };
+            painter.circle_filled(pos, radius, color);
+            if is_selected {
+                painter.circle_stroke(pos, radius + 2.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 255, 100)));
+            }
             let labels = node.input_labels();
             if labels.len() > 1 {
                 painter.text(
@@ -352,28 +381,45 @@ pub fn draw_node_editor(
             }
         }
 
-        // Check port hits (extend beyond node rect for output ports on the edge)
+        // Check port hits (extend beyond node rect for ports on the edge)
         if let Some(pointer) = ui.ctx().pointer_latest_pos() {
             if canvas_rect.contains(pointer) {
-                // Output ports — cable drag start
+                let pressed = ui.input(|inp| inp.pointer.primary_pressed());
+                let idle = state.dragging_cable.is_none() && state.dragging_node.is_none();
+
+                // Output ports — drag start or selection
                 for i in 0..node.num_outputs() {
                     let pos = port_position(node, i, true, pan) + canvas_rect.left_top().to_vec2();
                     if pos.distance(pointer) < PORT_HIT_RADIUS {
-                        if ui.input(|inp| inp.pointer.primary_pressed()) && state.dragging_cable.is_none() && state.dragging_node.is_none() {
-                            cable_drag_start = Some(PortId { node_id: node.id, index: i, is_output: true });
+                        let port_id = PortId { node_id: node.id, index: i, is_output: true };
+                        if pressed && idle {
+                            cable_drag_start = Some(port_id);
+                            port_clicked = Some(port_id);
+                        }
+                        // Drop target when dragging FROM an input port
+                        if state.dragging_cable.as_ref().map_or(false, |(p, _)| !p.is_output) {
+                            cable_drop_target = Some(port_id);
                         }
                     }
                 }
-                // Input ports — cable drop target
+                // Input ports — drag start or selection, or drop target
                 for i in 0..node.num_inputs() {
                     let pos = port_position(node, i, false, pan) + canvas_rect.left_top().to_vec2();
                     if pos.distance(pointer) < PORT_HIT_RADIUS {
-                        cable_drop_target = Some(PortId { node_id: node.id, index: i, is_output: false });
+                        let port_id = PortId { node_id: node.id, index: i, is_output: false };
+                        if pressed && idle {
+                            cable_drag_start = Some(port_id);
+                            port_clicked = Some(port_id);
+                        }
+                        // Drop target when dragging FROM an output port
+                        if state.dragging_cable.as_ref().map_or(false, |(p, _)| p.is_output) {
+                            cable_drop_target = Some(port_id);
+                        }
                     }
                 }
                 // Node drag (only if not near a port)
                 if cable_drag_start.is_none() && node_rect.contains(pointer) {
-                    if ui.input(|inp| inp.pointer.primary_pressed()) && state.dragging_cable.is_none() && state.dragging_node.is_none() {
+                    if pressed && idle {
                         let offset = pointer - node_rect.min;
                         node_drag_start = Some((node.id, offset));
                     }
@@ -399,7 +445,30 @@ pub fn draw_node_editor(
         }
     }
 
-    // Handle cable dragging
+    // Handle port selection (click without drag)
+    if let Some(port) = port_clicked {
+        state.selected_port = Some(port);
+    } else if ui.input(|i| i.pointer.primary_pressed()) {
+        // Click on empty space deselects
+        if state.dragging_cable.is_none() && state.dragging_node.is_none() {
+            state.selected_port = None;
+        }
+    }
+
+    // Handle Delete key on selected port — remove connected cables
+    if state.selected_port.is_some() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+        let port = state.selected_port.unwrap();
+        graph.cables.retain(|c| {
+            if port.is_output {
+                c.from != port
+            } else {
+                c.to != port
+            }
+        });
+        state.selected_port = None;
+    }
+
+    // Handle cable dragging (from either input or output port)
     if let Some(port) = cable_drag_start {
         state.dragging_cable = Some((port, egui::Pos2::ZERO));
     }
@@ -411,9 +480,17 @@ pub fn draw_node_editor(
         if !ui.input(|i| i.pointer.primary_down()) {
             // Mouse released — check for drop target
             if let Some(target) = cable_drop_target {
-                let from = state.dragging_cable.unwrap().0;
-                if from.node_id != target.node_id {
-                    graph.add_cable(from, target);
+                let source = state.dragging_cable.unwrap().0;
+                if source.node_id != target.node_id {
+                    // Normalize: ensure cable goes from output to input
+                    let (from, to) = if source.is_output {
+                        (source, target)
+                    } else {
+                        (target, source)
+                    };
+                    if from.is_output && !to.is_output {
+                        graph.add_cable(from, to);
+                    }
                 }
             }
             state.dragging_cable = None;
@@ -496,6 +573,10 @@ pub fn draw_node_editor(
 
 /// Draw a Bezier cable between two points.
 fn draw_cable(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2, color: egui::Color32) {
+    draw_cable_width(painter, p0, p1, color, 2.0);
+}
+
+fn draw_cable_width(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2, color: egui::Color32, width: f32) {
     let dx = (p1.x - p0.x).abs() * 0.5;
     let cp0 = egui::pos2(p0.x + dx, p0.y);
     let cp1 = egui::pos2(p1.x - dx, p1.y);
@@ -503,7 +584,7 @@ fn draw_cable(painter: &egui::Painter, p0: egui::Pos2, p1: egui::Pos2, color: eg
         [p0, cp0, cp1, p1],
         false,
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(2.0, color),
+        egui::Stroke::new(width, color),
     )));
 }
 
