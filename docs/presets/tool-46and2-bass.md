@@ -9,25 +9,36 @@
 
 ## Tone 1: Flanged Verse (signature swirling riff)
 
-**Signal chain:** Input → Compressor → EQ → Flanger → Cabinet → Output
+**Signal chain:** Input → Gate → Compressor → EQ → Flanger → Light Drive → Cabinet → Reverb → Output
 
 | Effect | Parameter | Value |
 |--------|-----------|-------|
-| **Compressor** | Threshold | -20 dB |
-| | Ratio | 4.0 |
-| | Attack | 15 ms |
+| **Noise Gate** | Threshold | -36 dB |
+| | Attack | 1 ms |
 | | Release | 80 ms |
+| **Compressor** | Threshold | -18 dB |
+| | Ratio | 3.5 |
+| | Attack | 35 ms (slow — lets pick transient punch through) |
+| | Release | 60 ms |
+| | Makeup | +3 dB |
 | **Parametric EQ** | Band 1 (Low Shelf 100 Hz) | +2 dB |
 | | Band 2 (Mid-Low 800 Hz) | +5 dB, Q=1.5 |
-| | Band 3 (Mid-High 1.2 kHz) | +3 dB, Q=2.0 |
+| | Band 3 (Mid-High 2.5 kHz) | +3 dB, Q=2.0 (pick presence) |
 | | Band 4 (High Shelf 8 kHz) | -2 dB |
-| **Flanger** | Rate | 0.15 Hz (very slow sweep) |
-| | Depth | 3.5 ms |
-| | Feedback | 0.6 (high resonance, metallic) |
+| **Flanger** | Rate | 0.12 Hz (very slow sweep) |
+| | Depth | 4.0 ms |
+| | Feedback | 0.65 (high resonance, metallic BF-2) |
 | | Mix | 0.5 |
+| **Light Overdrive** | Drive | 0.15 (harmonic sustain, not grit) |
+| | Tone | 0.5 |
+| | Mix | 0.3 |
 | **Cabinet** | Type | Guitar 4x12 (dark, full body) |
 | | Tone | 0.35 (dark) |
 | | Resonance | 0.4 |
+| **Reverb** | Room Size | 0.3 (small room / cab ambience) |
+| | Damping | 0.5 |
+| | Wet | 0.15 (subtle — space, not wash) |
+| | Dry | 0.85 |
 
 ---
 

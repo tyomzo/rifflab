@@ -8,7 +8,7 @@
     },
     {
       "id": 2,
-      "pos": [1050.0, 150.0],
+      "pos": [1220.0, 150.0],
       "kind": "Output",
       "label": "Output"
     },
@@ -70,7 +70,7 @@
     },
     {
       "id": 7,
-      "pos": [700.0, 150.0],
+      "pos": [700.0, 50.0],
       "kind": { "Effect": { "type_id": "builtin:overdrive" } },
       "label": "Light Drive",
       "params": [
@@ -81,13 +81,25 @@
     },
     {
       "id": 8,
-      "pos": [870.0, 150.0],
+      "pos": [700.0, 300.0],
       "kind": { "Effect": { "type_id": "builtin:cabinet" } },
       "label": "Cabinet 4x12",
       "params": [
         [0, 1.0],
         [1, 0.35],
         [2, 0.4]
+      ]
+    },
+    {
+      "id": 9,
+      "pos": [970.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:reverb" } },
+      "label": "Room Reverb",
+      "params": [
+        [0, 0.3],
+        [1, 0.5],
+        [2, 0.15],
+        [3, 0.85]
       ]
     }
   ],
@@ -118,9 +130,13 @@
     },
     {
       "from": { "node_id": 8, "index": 0, "is_output": true },
+      "to": { "node_id": 9, "index": 0, "is_output": false }
+    },
+    {
+      "from": { "node_id": 9, "index": 0, "is_output": true },
       "to": { "node_id": 2, "index": 0, "is_output": false }
     }
   ],
-  "next_id": 9,
+  "next_id": 10,
   "pan": [0.0, 0.0]
 }
