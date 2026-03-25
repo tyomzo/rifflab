@@ -352,33 +352,31 @@ pub fn draw_node_editor(
             }
         }
 
-        // Check interaction with this node
-        if let Some(pointer) = response.interact_pointer_pos() {
-            if node_rect.contains(pointer) {
-                // Check port hits first
-                let mut hit_port = false;
+        // Check port hits (extend beyond node rect for output ports on the edge)
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            if canvas_rect.contains(pointer) {
+                // Output ports — cable drag start
                 for i in 0..node.num_outputs() {
                     let pos = port_position(node, i, true, pan) + canvas_rect.left_top().to_vec2();
                     if pos.distance(pointer) < PORT_HIT_RADIUS {
-                        if response.drag_started() {
+                        if ui.input(|inp| inp.pointer.primary_pressed()) && state.dragging_cable.is_none() && state.dragging_node.is_none() {
                             cable_drag_start = Some(PortId { node_id: node.id, index: i, is_output: true });
                         }
-                        hit_port = true;
                     }
                 }
+                // Input ports — cable drop target
                 for i in 0..node.num_inputs() {
                     let pos = port_position(node, i, false, pan) + canvas_rect.left_top().to_vec2();
                     if pos.distance(pointer) < PORT_HIT_RADIUS {
-                        if state.dragging_cable.is_some() {
-                            cable_drop_target = Some(PortId { node_id: node.id, index: i, is_output: false });
-                        }
-                        hit_port = true;
+                        cable_drop_target = Some(PortId { node_id: node.id, index: i, is_output: false });
                     }
                 }
-
-                if !hit_port && response.drag_started() {
-                    let offset = pointer - node_rect.min;
-                    node_drag_start = Some((node.id, offset));
+                // Node drag (only if not near a port)
+                if cable_drag_start.is_none() && node_rect.contains(pointer) {
+                    if ui.input(|inp| inp.pointer.primary_pressed()) && state.dragging_cable.is_none() && state.dragging_node.is_none() {
+                        let offset = pointer - node_rect.min;
+                        node_drag_start = Some((node.id, offset));
+                    }
                 }
             }
         }
@@ -389,15 +387,14 @@ pub fn draw_node_editor(
         state.dragging_node = Some((id, offset));
     }
     if let Some((id, offset)) = state.dragging_node {
-        if response.dragged() {
-            if let Some(pointer) = response.interact_pointer_pos() {
+        if ui.input(|i| i.pointer.primary_down()) {
+            if let Some(pointer) = ui.ctx().pointer_latest_pos() {
                 if let Some(node) = graph.find_node_mut(id) {
                     node.pos[0] = pointer.x - canvas_rect.left() - pan.x - offset.x;
                     node.pos[1] = pointer.y - canvas_rect.top() - pan.y - offset.y;
                 }
             }
-        }
-        if response.drag_stopped() {
+        } else {
             state.dragging_node = None;
         }
     }
@@ -406,11 +403,13 @@ pub fn draw_node_editor(
     if let Some(port) = cable_drag_start {
         state.dragging_cable = Some((port, egui::Pos2::ZERO));
     }
-    if let Some((port, _)) = &mut state.dragging_cable {
+    if state.dragging_cable.is_some() {
         if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-            state.dragging_cable = Some((*port, pointer));
+            let port = state.dragging_cable.as_ref().unwrap().0;
+            state.dragging_cable = Some((port, pointer));
         }
-        if response.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
+        if !ui.input(|i| i.pointer.primary_down()) {
+            // Mouse released — check for drop target
             if let Some(target) = cable_drop_target {
                 let from = state.dragging_cable.unwrap().0;
                 if from.node_id != target.node_id {
@@ -421,7 +420,7 @@ pub fn draw_node_editor(
         }
     }
 
-    // Canvas panning (middle mouse or ctrl+drag on background)
+    // Canvas panning (drag on empty background only)
     if response.dragged() && state.dragging_node.is_none() && state.dragging_cable.is_none() {
         let delta = response.drag_delta();
         graph.pan[0] += delta.x;
