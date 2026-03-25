@@ -9,3 +9,4 @@ pub mod chorus;
 pub mod flanger;
 pub mod phaser;
 pub mod cabinet;
+pub mod multiband;

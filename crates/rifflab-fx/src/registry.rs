@@ -1,6 +1,7 @@
 use rifflab_core::audio::EffectDescriptor;
 
 use crate::effects::cabinet::Cabinet;
+use crate::effects::multiband::Multiband;
 use crate::effects::chorus::Chorus;
 use crate::effects::compressor::Compressor;
 use crate::effects::delay::Delay;
@@ -110,6 +111,13 @@ impl EffectRegistry {
             "Cabinet Sim",
             "Built-in",
             || Box::new(Cabinet::new(48000)),
+        );
+
+        reg.register(
+            "builtin:multiband",
+            "Multiband",
+            "Built-in",
+            || Box::new(Multiband::new(48000)),
         );
 
         reg
