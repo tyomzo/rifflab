@@ -1759,7 +1759,7 @@ impl eframe::App for RiffLabApp {
                             self.compile_graph_if_changed();
                             let effects_list = self.fx_registry.list_effects();
                             let snapshots = self.build_node_param_snapshots();
-                            let changes = node_editor::draw_node_editor(
+                            let (changes, action) = node_editor::draw_node_editor(
                                 ui,
                                 &mut self.fx_graph,
                                 &mut self.node_editor_state,
@@ -1769,6 +1769,46 @@ impl eframe::App for RiffLabApp {
                             );
                             if !changes.is_empty() {
                                 self.apply_node_param_changes(&changes);
+                            }
+                            match action {
+                                node_editor::GraphAction::Save => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"])
+                                        .set_file_name("graph.json")
+                                        .save_file()
+                                    {
+                                        if let Err(e) = node_editor::save_graph(&path, &self.fx_graph) {
+                                            self.message_log.push(format!("Save graph failed: {e}"), true);
+                                        } else {
+                                            self.message_log.push(format!("Graph saved to {}", path.display()), false);
+                                        }
+                                    }
+                                }
+                                node_editor::GraphAction::Load => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"])
+                                        .pick_file()
+                                    {
+                                        match node_editor::load_graph(&path) {
+                                            Ok(g) => {
+                                                self.fx_graph = g;
+                                                self.fx_graph_compiled_hash = 0;
+                                                self.node_editor_state.param_cache.clear();
+                                                self.compile_graph_if_changed();
+                                                self.message_log.push(format!("Graph loaded from {}", path.display()), false);
+                                            }
+                                            Err(e) => {
+                                                self.message_log.push(format!("Load graph failed: {e}"), true);
+                                            }
+                                        }
+                                    }
+                                }
+                                node_editor::GraphAction::Changed => {
+                                    self.fx_graph_compiled_hash = 0;
+                                    self.node_editor_state.param_cache.clear();
+                                    self.compile_graph_if_changed();
+                                }
+                                node_editor::GraphAction::None => {}
                             }
                         }
                     }
@@ -4065,9 +4105,12 @@ impl RiffLabApp {
                     self.cue_engine.set_cue_list(cues);
                 }
 
-                // Load effects graph
+                // Load effects graph and compile to audio engine
                 if let Some(graph) = loaded.fx_graph {
                     self.fx_graph = graph;
+                    self.fx_graph_compiled_hash = 0; // force recompile
+                    self.node_editor_state.param_cache.clear();
+                    self.compile_graph_if_changed();
                 }
 
                 self.file_name = loaded.manifest.name;

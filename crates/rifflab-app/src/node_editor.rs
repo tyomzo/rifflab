@@ -237,6 +237,14 @@ fn node_height(node: &FxNode, param_count: usize) -> f32 {
     NODE_HEADER_HEIGHT + port_height.max(param_height) + 12.0
 }
 
+/// Action requested by the node editor toolbar.
+pub enum GraphAction {
+    None,
+    Save,
+    Load,
+    Changed,
+}
+
 /// Parameter snapshot for an effect node (passed from the app).
 pub struct NodeParamSnapshot {
     pub node_id: u64,
@@ -259,8 +267,26 @@ pub fn draw_node_editor(
     registry_effects: &[(String, String, String)],
     param_snapshots: &[NodeParamSnapshot],
     registry: &rifflab_fx::registry::EffectRegistry,
-) -> Vec<NodeParamChange> {
+) -> (Vec<NodeParamChange>, GraphAction) {
     let mut param_changes: Vec<NodeParamChange> = Vec::new();
+    let mut action = GraphAction::None;
+
+    // Toolbar
+    ui.horizontal(|ui| {
+        if ui.small_button("Save Graph").clicked() {
+            action = GraphAction::Save;
+        }
+        if ui.small_button("Load Graph").clicked() {
+            action = GraphAction::Load;
+        }
+        ui.separator();
+        if ui.small_button("Reset").clicked() {
+            *graph = FxGraph::new_default();
+            state.param_cache.clear();
+            action = GraphAction::Changed;
+        }
+    });
+
     let (response, painter) = ui.allocate_painter(
         ui.available_size(),
         egui::Sense::click_and_drag(),
@@ -712,7 +738,7 @@ pub fn draw_node_editor(
         graph.remove_node(id);
     }
 
-    param_changes
+    (param_changes, action)
 }
 
 /// Draw a Bezier cable between two points.
