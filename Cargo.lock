@@ -3427,6 +3427,7 @@ dependencies = [
  "rifflab-analysis",
  "rifflab-audio",
  "rifflab-core",
+ "rifflab-cue",
  "rifflab-fx",
  "rifflab-ipc",
  "rifflab-practice",
