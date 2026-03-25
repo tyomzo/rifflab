@@ -1756,12 +1756,19 @@ impl eframe::App for RiffLabApp {
                         }
                         BottomTab::Effects => {
                             let effects_list = self.fx_registry.list_effects();
-                            node_editor::draw_node_editor(
+                            // Build param snapshots for effect nodes
+                            let snapshots = self.build_node_param_snapshots();
+                            let changes = node_editor::draw_node_editor(
                                 ui,
                                 &mut self.fx_graph,
                                 &mut self.node_editor_state,
                                 &effects_list,
+                                &snapshots,
                             );
+                            // Apply parameter changes to audio engine
+                            if !changes.is_empty() {
+                                self.apply_node_param_changes(&changes);
+                            }
                             // Compile graph to audio engine when it changes
                             self.compile_graph_if_changed();
                         }
@@ -3097,6 +3104,71 @@ impl RiffLabApp {
             // No texture yet — allocate space with dark background
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width_px, height_px), egui::Sense::hover());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 20, 24));
+        }
+    }
+
+    /// Build parameter snapshots for all effect nodes in the graph.
+    fn build_node_param_snapshots(&self) -> Vec<node_editor::NodeParamSnapshot> {
+        let graph_arc: Arc<Mutex<rifflab_audio::graph::AudioGraph>> = {
+            let eng = self.engine.lock().unwrap();
+            Arc::clone(eng.graph())
+        };
+        let mut snapshots = Vec::new();
+
+        if let Ok(graph) = graph_arc.try_lock() {
+            // Single chain effects — match by order to node graph Effect nodes
+            let effect_nodes: Vec<(u64, &str)> = self.fx_graph.nodes.iter()
+                .filter_map(|n| match &n.kind {
+                    node_editor::NodeKind::Effect { type_id } => Some((n.id, type_id.as_str())),
+                    _ => None,
+                })
+                .collect();
+
+            // Match effects by position in chain to nodes
+            for (chain_idx, effect) in graph.fx_chain.effects().iter().enumerate() {
+                if let Some((node_id, _)) = effect_nodes.get(chain_idx) {
+                    let descs = effect.param_descriptors();
+                    let params: Vec<_> = descs.into_iter()
+                        .map(|d| { let v = effect.get_param(d.id); (d, v) })
+                        .collect();
+                    snapshots.push(node_editor::NodeParamSnapshot {
+                        node_id: *node_id,
+                        params,
+                        bypassed: effect.is_bypassed(),
+                    });
+                }
+            }
+
+            // Multiband chain effects
+            if let Some(ref mb) = graph.fx_multiband {
+                // TODO: match multiband chain effects to nodes
+                let _ = mb;
+            }
+        }
+
+        snapshots
+    }
+
+    /// Apply parameter changes from the node editor to the audio engine.
+    fn apply_node_param_changes(&mut self, changes: &[node_editor::NodeParamChange]) {
+        let effect_nodes: Vec<u64> = self.fx_graph.nodes.iter()
+            .filter_map(|n| match &n.kind {
+                node_editor::NodeKind::Effect { .. } => Some(n.id),
+                _ => None,
+            })
+            .collect();
+
+        // Use the same single-statement pattern that works in the sidebar
+        {
+            let ga = self.engine.lock().unwrap().graph().clone();
+            let Ok(mut graph) = ga.try_lock() else { return };
+            for change in changes {
+                if let Some(chain_idx) = effect_nodes.iter().position(|id| *id == change.node_id) {
+                    if let Some(effect) = graph.fx_chain.effects_mut().get_mut(chain_idx) {
+                        effect.set_param(change.param_id, change.value);
+                    }
+                }
+            }
         }
     }
 

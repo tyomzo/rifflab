@@ -225,19 +225,37 @@ fn port_position(node: &FxNode, port_idx: u8, is_output: bool, pan: egui::Vec2) 
     }
 }
 
-/// Estimate node height based on kind.
-fn node_height(node: &FxNode) -> f32 {
+/// Estimate node height based on kind and number of parameters.
+fn node_height(node: &FxNode, param_count: usize) -> f32 {
     let ports = node.num_inputs().max(node.num_outputs()) as f32;
-    NODE_HEADER_HEIGHT + 10.0 + (ports - 1.0).max(0.0) * 20.0 + 10.0
+    let port_height = (ports - 1.0).max(0.0) * 20.0 + 20.0;
+    let param_height = if param_count > 0 { param_count as f32 * 20.0 + 4.0 } else { 0.0 };
+    NODE_HEADER_HEIGHT + port_height.max(param_height) + 8.0
 }
 
-/// Draw the entire node editor.
+/// Parameter snapshot for an effect node (passed from the app).
+pub struct NodeParamSnapshot {
+    pub node_id: u64,
+    pub params: Vec<(ParamDescriptor, f32)>,
+    pub bypassed: bool,
+}
+
+/// A parameter change from the node editor UI.
+pub struct NodeParamChange {
+    pub node_id: u64,
+    pub param_id: ParamId,
+    pub value: f32,
+}
+
+/// Draw the entire node editor. Returns parameter changes to apply.
 pub fn draw_node_editor(
     ui: &mut egui::Ui,
     graph: &mut FxGraph,
     state: &mut NodeEditorState,
-    registry_effects: &[(String, String, String)], // (type_id, name, category)
-) {
+    registry_effects: &[(String, String, String)],
+    param_snapshots: &[NodeParamSnapshot],
+) -> Vec<NodeParamChange> {
+    let mut param_changes: Vec<NodeParamChange> = Vec::new();
     let (response, painter) = ui.allocate_painter(
         ui.available_size(),
         egui::Sense::click_and_drag(),
@@ -304,7 +322,9 @@ pub fn draw_node_editor(
     for node in &graph.nodes {
         let nx = canvas_rect.left() + node.pos[0] + pan.x;
         let ny = canvas_rect.top() + node.pos[1] + pan.y;
-        let height = node_height(node);
+        let snap = param_snapshots.iter().find(|s| s.node_id == node.id);
+        let param_count = snap.map_or(0, |s| s.params.iter().filter(|(d, _)| d.name != "Bypass").count());
+        let height = node_height(node, param_count);
         let node_rect = egui::Rect::from_min_size(egui::pos2(nx, ny), egui::vec2(NODE_WIDTH, height));
 
         // Skip if not visible
@@ -378,6 +398,72 @@ pub fn draw_node_editor(
                     egui::FontId::proportional(8.0),
                     egui::Color32::from_rgb(160, 170, 180),
                 );
+            }
+        }
+
+        // Render parameter sliders for effect nodes
+        if let Some(snap) = snap {
+            if matches!(node.kind, NodeKind::Effect { .. }) && !snap.bypassed {
+                let params_rect = egui::Rect::from_min_size(
+                    egui::pos2(nx + 8.0, ny + NODE_HEADER_HEIGHT + 4.0),
+                    egui::vec2(NODE_WIDTH - 16.0, height - NODE_HEADER_HEIGHT - 12.0),
+                );
+                if canvas_rect.intersects(params_rect) {
+                    let node_id = node.id;
+                    ui.allocate_ui_at_rect(params_rect, |ui| {
+                        ui.set_clip_rect(canvas_rect);
+                        for (desc, val) in &snap.params {
+                            if desc.name == "Bypass" { continue; }
+                            let mut v = *val;
+                            let changed = match &desc.kind {
+                                ParamKind::Float => {
+                                    let unit = desc.unit.clone();
+                                    ui.add(egui::Slider::new(&mut v, desc.min..=desc.max)
+                                        .text(&desc.name)
+                                        .custom_formatter(move |val, _| {
+                                            if unit.is_empty() { format!("{:.2}", val) }
+                                            else { format!("{:.1}{}", val, unit) }
+                                        })
+                                    ).changed()
+                                }
+                                ParamKind::Enum(labels) => {
+                                    let cur = v.round() as usize;
+                                    let cur_label = labels.get(cur).cloned().unwrap_or_default();
+                                    let mut changed = false;
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(&desc.name).size(9.0));
+                                        egui::ComboBox::from_id_salt(format!("ne_{}_{}", node_id, desc.id.0))
+                                            .selected_text(&cur_label)
+                                            .width(70.0)
+                                            .show_ui(ui, |ui| {
+                                                for (i, l) in labels.iter().enumerate() {
+                                                    if ui.selectable_value(&mut v, i as f32, l).changed() {
+                                                        changed = true;
+                                                    }
+                                                }
+                                            });
+                                    });
+                                    changed
+                                }
+                                ParamKind::Int => {
+                                    let mut iv = v.round() as i32;
+                                    let c = ui.add(egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32).text(&desc.name)).changed();
+                                    if c { v = iv as f32; }
+                                    c
+                                }
+                                ParamKind::Bool => {
+                                    let mut b = v > 0.5;
+                                    let c = ui.checkbox(&mut b, &desc.name).changed();
+                                    if c { v = if b { 1.0 } else { 0.0 }; }
+                                    c
+                                }
+                            };
+                            if changed {
+                                param_changes.push(NodeParamChange { node_id, param_id: desc.id, value: v });
+                            }
+                        }
+                    });
+                }
             }
         }
 
@@ -549,7 +635,7 @@ pub fn draw_node_editor(
                 let ny = canvas_rect.top() + node.pos[1] + pan.y;
                 let node_rect = egui::Rect::from_min_size(
                     egui::pos2(nx, ny),
-                    egui::vec2(NODE_WIDTH, node_height(node)),
+                    egui::vec2(NODE_WIDTH, node_height(node, 0)),
                 );
                 if node_rect.contains(pointer) {
                     if !matches!(node.kind, NodeKind::Input | NodeKind::Output) {
@@ -569,6 +655,8 @@ pub fn draw_node_editor(
     if let Some(id) = remove_node_id {
         graph.remove_node(id);
     }
+
+    param_changes
 }
 
 /// Draw a Bezier cable between two points.
