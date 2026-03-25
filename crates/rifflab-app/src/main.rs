@@ -270,12 +270,20 @@ struct LoopDragState {
 
 // ─── Bottom Drawer Types ─────────────────────────────────────────────────────
 
+/// Pre-computed spectrogram for one audio source, with display metadata.
+struct SpectrogramDisplay {
+    data: rifflab_analysis::spectrogram::SpectrogramResult,
+    color: egui::Color32,
+    name: String,
+}
+
 /// Which tab is active in the bottom drawer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     PianoRoll,
     Accuracy,
     Effects,
+    Spectrogram,
 }
 
 /// A played note recorded during practice, for piano roll display.
@@ -302,6 +310,7 @@ struct StemTrack {
     stem_type: StemType,
     decoded: decode::DecodedAudio,
     overview: WaveformOverview,
+    spectrogram: rifflab_analysis::spectrogram::SpectrogramResult,
 }
 
 /// Result of background file decoding + optional stem separation.
@@ -652,6 +661,12 @@ struct RiffLabApp {
     original_file_path: Option<std::path::PathBuf>,
     /// Background save receiver.
     save_receiver: Option<std::sync::mpsc::Receiver<(bool, String)>>,
+    /// Pre-computed spectrograms (one per stem).
+    spectrograms: Vec<SpectrogramDisplay>,
+    /// Cached spectrogram texture.
+    spectrogram_texture: Option<egui::TextureHandle>,
+    /// Cache key: (scroll_bits, zoom_bits, width, height).
+    spectrogram_cache_key: (u64, u64, u32, u32),
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -739,6 +754,9 @@ impl RiffLabApp {
             session_path: None,
             original_file_path: None,
             save_receiver: None,
+            spectrograms: Vec::new(),
+            spectrogram_texture: None,
+            spectrogram_cache_key: (0, 0, 0, 0),
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -845,7 +863,12 @@ impl RiffLabApp {
                         );
                         let _ = tx.send(LoadMsg::Done(LoadedFile {
                             file_name: name_clone,
-                            stems: vec![StemTrack { stem_type: StemType::Other, decoded: decoded_rs, overview }],
+                            stems: vec![StemTrack {
+                                stem_type: StemType::Other, decoded: decoded_rs, overview,
+                                spectrogram: rifflab_analysis::spectrogram::SpectrogramResult {
+                                    magnitudes: Vec::new(), num_bins: 0, num_columns: 0, hop_size: 512, fft_size: 2048,
+                                },
+                            }],
                         }));
                         return;
                     }
@@ -917,10 +940,17 @@ impl RiffLabApp {
                                     color,
                                     stem_name.to_string(),
                                 );
+                                let mono = rifflab_analysis::spectrogram::downmix_to_mono(
+                                    &stem_decoded.data, stem_decoded.channels,
+                                );
+                                let spec = rifflab_analysis::spectrogram::compute_spectrogram(
+                                    &mono, stem_decoded.sample_rate,
+                                );
                                 stems.push(StemTrack {
                                     stem_type: *stem_type,
                                     decoded: stem_decoded,
                                     overview,
+                                    spectrogram: spec,
                                 });
                                 let _ = tx.send(LoadMsg::Status(format!("Loaded stem: {}", stem_name)));
                             }
@@ -955,10 +985,17 @@ impl RiffLabApp {
                     TRACK_COLORS[0],
                     name_clone.clone(),
                 );
+                let mono = rifflab_analysis::spectrogram::downmix_to_mono(
+                    &decoded.data, decoded.channels,
+                );
+                let spec = rifflab_analysis::spectrogram::compute_spectrogram(
+                    &mono, decoded.sample_rate,
+                );
                 stems.push(StemTrack {
                     stem_type: StemType::Other,
                     decoded,
                     overview,
+                    spectrogram: spec,
                 });
             }
 
@@ -1025,9 +1062,20 @@ impl RiffLabApp {
                             };
 
                             self.file_name = loaded.file_name;
-                            self.waveform_overviews = loaded.stems.into_iter()
-                                .map(|s| s.overview)
-                                .collect();
+                            let mut overviews = Vec::new();
+                            let mut specs = Vec::new();
+                            for (i, stem) in loaded.stems.into_iter().enumerate() {
+                                let color = TRACK_COLORS[i % TRACK_COLORS.len()];
+                                specs.push(SpectrogramDisplay {
+                                    data: stem.spectrogram,
+                                    color,
+                                    name: stem.overview.name.clone(),
+                                });
+                                overviews.push(stem.overview);
+                            }
+                            self.waveform_overviews = overviews;
+                            self.spectrograms = specs;
+                            self.spectrogram_texture = None; // invalidate cache
 
                             self.comparator = None;
                             self.reference_notes.clear();
@@ -1600,6 +1648,7 @@ impl eframe::App for RiffLabApp {
                             (BottomTab::PianoRoll, "Piano Roll"),
                             (BottomTab::Accuracy, "Accuracy"),
                             (BottomTab::Effects, "Effects"),
+                            (BottomTab::Spectrogram, "Spectrogram"),
                         ];
                         for (tab, label) in &tabs {
                             let active = self.active_tab == *tab;
@@ -1668,6 +1717,9 @@ impl eframe::App for RiffLabApp {
                         }
                         BottomTab::Effects => {
                             self.draw_effects_rack(ui);
+                        }
+                        BottomTab::Spectrogram => {
+                            self.draw_spectrogram(ui, ctx);
                         }
                     }
                 });
@@ -2848,6 +2900,84 @@ impl RiffLabApp {
                 self.audio_settings.status_msg = format!("Error: {e}");
                 log::error!("Engine restart failed: {e}");
             }
+        }
+    }
+
+    fn draw_spectrogram(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let available = ui.available_size();
+        if available.x < 10.0 || available.y < 10.0 || self.spectrograms.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(100, 110, 120),
+                    "Load a file to see spectrograms",
+                );
+            });
+            return;
+        }
+
+        let width = available.x as usize;
+        let height = available.y as usize;
+
+        // Check if cached texture is still valid
+        let cache_key = (
+            self.scroll_offset_frames.to_bits(),
+            self.frames_per_pixel.to_bits(),
+            width as u32,
+            height as u32,
+        );
+
+        if self.spectrogram_cache_key != cache_key || self.spectrogram_texture.is_none() {
+            // Regenerate texture
+            let mut pixels = vec![0u8; width * height * 4]; // RGBA flat
+
+            let freq_min = 20.0f64;
+            let freq_max = (self.sample_rate as f64) / 2.0;
+            let log_min = freq_min.ln();
+            let log_max = freq_max.ln();
+
+            for spec in &self.spectrograms {
+                if spec.data.num_columns == 0 { continue; }
+                let base_r = spec.color.r() as f32;
+                let base_g = spec.color.g() as f32;
+                let base_b = spec.color.b() as f32;
+
+                for px in 0..width {
+                    let frame = self.scroll_offset_frames + px as f64 * self.frames_per_pixel;
+                    let col = (frame / spec.data.hop_size as f64) as usize;
+                    if col >= spec.data.num_columns { continue; }
+
+                    for py in 0..height {
+                        // Log frequency scale (low freq at bottom)
+                        let frac = (height - 1 - py) as f64 / height as f64;
+                        let freq = (log_min + frac * (log_max - log_min)).exp();
+                        let bin = (freq * spec.data.fft_size as f64 / self.sample_rate as f64) as usize;
+                        if bin >= spec.data.num_bins { continue; }
+
+                        let mag_u8 = spec.data.magnitudes[col * spec.data.num_bins + bin];
+                        if mag_u8 == 0 { continue; }
+
+                        let alpha = (mag_u8 as f32 / 255.0) * 0.65; // 0.5-0.8 range
+
+                        let idx = (py * width + px) * 4;
+                        let inv = 1.0 - alpha;
+                        pixels[idx]     = (pixels[idx]     as f32 * inv + base_r * alpha) as u8;
+                        pixels[idx + 1] = (pixels[idx + 1] as f32 * inv + base_g * alpha) as u8;
+                        pixels[idx + 2] = (pixels[idx + 2] as f32 * inv + base_b * alpha) as u8;
+                        pixels[idx + 3] = (pixels[idx + 3] as f32 * inv + 255.0 * alpha).min(255.0) as u8;
+                    }
+                }
+            }
+
+            let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+            self.spectrogram_texture = Some(ctx.load_texture("spectrogram", image, egui::TextureOptions::LINEAR));
+            self.spectrogram_cache_key = cache_key;
+        }
+
+        // Draw the texture
+        if let Some(tex) = &self.spectrogram_texture {
+            let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
         }
     }
 
