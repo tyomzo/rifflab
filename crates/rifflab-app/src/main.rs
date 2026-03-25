@@ -1755,8 +1755,9 @@ impl eframe::App for RiffLabApp {
                             });
                         }
                         BottomTab::Effects => {
+                            // Compile graph FIRST so chain matches nodes
+                            self.compile_graph_if_changed();
                             let effects_list = self.fx_registry.list_effects();
-                            // Build param snapshots for effect nodes
                             let snapshots = self.build_node_param_snapshots();
                             let changes = node_editor::draw_node_editor(
                                 ui,
@@ -1765,12 +1766,9 @@ impl eframe::App for RiffLabApp {
                                 &effects_list,
                                 &snapshots,
                             );
-                            // Apply parameter changes to audio engine
                             if !changes.is_empty() {
                                 self.apply_node_param_changes(&changes);
                             }
-                            // Compile graph to audio engine when it changes
-                            self.compile_graph_if_changed();
                         }
                     }
                 });
@@ -3109,40 +3107,46 @@ impl RiffLabApp {
 
     /// Build parameter snapshots for all effect nodes in the graph.
     fn build_node_param_snapshots(&self) -> Vec<node_editor::NodeParamSnapshot> {
-        let graph_arc: Arc<Mutex<rifflab_audio::graph::AudioGraph>> = {
-            let eng = self.engine.lock().unwrap();
-            Arc::clone(eng.graph())
-        };
-        let mut snapshots = Vec::new();
+        // Get the compiled route to know which nodes map to which chain effects
+        let route = self.fx_graph.compile();
 
-        if let Ok(graph) = graph_arc.try_lock() {
-            // Single chain effects — match by order to node graph Effect nodes
-            let effect_nodes: Vec<(u64, &str)> = self.fx_graph.nodes.iter()
-                .filter_map(|n| match &n.kind {
-                    node_editor::NodeKind::Effect { type_id } => Some((n.id, type_id.as_str())),
-                    _ => None,
-                })
-                .collect();
-
-            // Match effects by position in chain to nodes
-            for (chain_idx, effect) in graph.fx_chain.effects().iter().enumerate() {
-                if let Some((node_id, _)) = effect_nodes.get(chain_idx) {
-                    let descs = effect.param_descriptors();
-                    let params: Vec<_> = descs.into_iter()
-                        .map(|d| { let v = effect.get_param(d.id); (d, v) })
-                        .collect();
-                    snapshots.push(node_editor::NodeParamSnapshot {
-                        node_id: *node_id,
-                        params,
-                        bypassed: effect.is_bypassed(),
-                    });
+        // Extract the ordered node IDs of effect nodes from the route
+        let effect_node_ids: Vec<u64> = match &route {
+            node_editor::CompiledRoute::SingleChain(type_ids) => {
+                // Find effect nodes in cable-traversal order by matching type_ids
+                let mut ids = Vec::new();
+                let input_node = self.fx_graph.nodes.iter().find(|n| matches!(n.kind, node_editor::NodeKind::Input));
+                if let Some(input) = input_node {
+                    let start = node_editor::PortId { node_id: input.id, index: 0, is_output: true };
+                    let traced = self.fx_graph.trace_chain(start);
+                    for nid in &traced {
+                        if let Some(node) = self.fx_graph.find_node(*nid) {
+                            if matches!(node.kind, node_editor::NodeKind::Effect { .. }) {
+                                ids.push(node.id);
+                            }
+                        }
+                    }
                 }
+                ids
             }
+            _ => Vec::new(), // TODO: multiband
+        };
 
-            // Multiband chain effects
-            if let Some(ref mb) = graph.fx_multiband {
-                // TODO: match multiband chain effects to nodes
-                let _ = mb;
+        let ga = self.engine.lock().unwrap().graph().clone();
+        let Ok(graph) = ga.try_lock() else { return Vec::new() };
+
+        let mut snapshots = Vec::new();
+        for (chain_idx, effect) in graph.fx_chain.effects().iter().enumerate() {
+            if let Some(&node_id) = effect_node_ids.get(chain_idx) {
+                let descs = effect.param_descriptors();
+                let params: Vec<_> = descs.into_iter()
+                    .map(|d| { let v = effect.get_param(d.id); (d, v) })
+                    .collect();
+                snapshots.push(node_editor::NodeParamSnapshot {
+                    node_id,
+                    params,
+                    bypassed: effect.is_bypassed(),
+                });
             }
         }
 

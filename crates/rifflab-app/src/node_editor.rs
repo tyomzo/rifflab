@@ -786,7 +786,7 @@ impl FxGraph {
 
     /// Trace a chain of nodes starting from a given output port.
     /// Returns node IDs in order (excluding the starting node).
-    fn trace_chain(&self, start_port: PortId) -> Vec<u64> {
+    pub fn trace_chain(&self, start_port: PortId) -> Vec<u64> {
         let mut result = Vec::new();
         let mut current_port = start_port;
 
