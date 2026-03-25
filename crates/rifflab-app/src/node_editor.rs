@@ -229,8 +229,9 @@ fn port_position(node: &FxNode, port_idx: u8, is_output: bool, pan: egui::Vec2) 
 fn node_height(node: &FxNode, param_count: usize) -> f32 {
     let ports = node.num_inputs().max(node.num_outputs()) as f32;
     let port_height = (ports - 1.0).max(0.0) * 20.0 + 20.0;
-    let param_height = if param_count > 0 { param_count as f32 * 20.0 + 4.0 } else { 0.0 };
-    NODE_HEADER_HEIGHT + port_height.max(param_height) + 8.0
+    // Each slider/param needs ~24px, plus some padding
+    let param_height = if param_count > 0 { param_count as f32 * 24.0 + 8.0 } else { 0.0 };
+    NODE_HEADER_HEIGHT + port_height.max(param_height) + 12.0
 }
 
 /// Parameter snapshot for an effect node (passed from the app).
@@ -254,6 +255,7 @@ pub fn draw_node_editor(
     state: &mut NodeEditorState,
     registry_effects: &[(String, String, String)],
     param_snapshots: &[NodeParamSnapshot],
+    registry: &rifflab_fx::registry::EffectRegistry,
 ) -> Vec<NodeParamChange> {
     let mut param_changes: Vec<NodeParamChange> = Vec::new();
     let (response, painter) = ui.allocate_painter(
@@ -323,7 +325,15 @@ pub fn draw_node_editor(
         let nx = canvas_rect.left() + node.pos[0] + pan.x;
         let ny = canvas_rect.top() + node.pos[1] + pan.y;
         let snap = param_snapshots.iter().find(|s| s.node_id == node.id);
-        let param_count = snap.map_or(0, |s| s.params.iter().filter(|(d, _)| d.name != "Bypass").count());
+        let param_count = if let Some(s) = snap {
+            s.params.iter().filter(|(d, _)| d.name != "Bypass").count()
+        } else if let NodeKind::Effect { type_id } = &node.kind {
+            registry.create_effect(type_id)
+                .map(|e| e.param_descriptors().iter().filter(|d| d.name != "Bypass").count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let height = node_height(node, param_count);
         let node_rect = egui::Rect::from_min_size(egui::pos2(nx, ny), egui::vec2(NODE_WIDTH, height));
 
@@ -401,9 +411,24 @@ pub fn draw_node_editor(
             }
         }
 
-        // Render parameter sliders for effect nodes
-        if let Some(snap) = snap {
-            if matches!(node.kind, NodeKind::Effect { .. }) && !snap.bypassed {
+        // Render parameter sliders for effect nodes (connected or not)
+        if let NodeKind::Effect { type_id } = &node.kind {
+            // Get params from snapshot (connected) or create defaults (unconnected)
+            let params: Vec<(ParamDescriptor, f32)> = if let Some(s) = snap {
+                s.params.clone()
+            } else {
+                // Create a temporary effect to get default param values
+                registry.create_effect(type_id)
+                    .map(|e| {
+                        e.param_descriptors().into_iter()
+                            .map(|d| { let v = e.get_param(d.id); (d, v) })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let bypassed = snap.map_or(false, |s| s.bypassed);
+
+            if !bypassed {
                 let params_rect = egui::Rect::from_min_size(
                     egui::pos2(nx + 8.0, ny + NODE_HEADER_HEIGHT + 4.0),
                     egui::vec2(NODE_WIDTH - 16.0, height - NODE_HEADER_HEIGHT - 12.0),
@@ -412,7 +437,7 @@ pub fn draw_node_editor(
                     let node_id = node.id;
                     ui.allocate_ui_at_rect(params_rect, |ui| {
                         ui.set_clip_rect(canvas_rect);
-                        for (desc, val) in &snap.params {
+                        for (desc, val) in &params {
                             if desc.name == "Bypass" { continue; }
                             let mut v = *val;
                             let changed = match &desc.kind {

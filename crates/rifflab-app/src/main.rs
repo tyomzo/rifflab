@@ -1765,6 +1765,7 @@ impl eframe::App for RiffLabApp {
                                 &mut self.node_editor_state,
                                 &effects_list,
                                 &snapshots,
+                                &self.fx_registry,
                             );
                             if !changes.is_empty() {
                                 self.apply_node_param_changes(&changes);
