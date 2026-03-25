@@ -534,8 +534,12 @@ pub fn draw_node_editor(
                         }
                     }
                 }
-                // Node drag (only if not near a port)
-                if cable_drag_start.is_none() && node_rect.contains(pointer) {
+                // Node drag — only from the header bar (not the param area)
+                let header_rect = egui::Rect::from_min_size(
+                    node_rect.min,
+                    egui::vec2(NODE_WIDTH, NODE_HEADER_HEIGHT),
+                );
+                if cable_drag_start.is_none() && header_rect.contains(pointer) {
                     if pressed && idle {
                         let offset = pointer - node_rect.min;
                         node_drag_start = Some((node.id, offset));
