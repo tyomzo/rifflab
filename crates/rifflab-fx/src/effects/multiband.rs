@@ -6,7 +6,7 @@ const MAX_BUF: usize = 4096; // max interleaved stereo samples (2048 frames)
 // ─── Stereo Biquad ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct LrBiquad {
+pub(crate) struct LrBiquad {
     b0: f64, b1: f64, b2: f64,
     a1: f64, a2: f64,
     x1_l: f64, x2_l: f64, y1_l: f64, y2_l: f64,
@@ -50,20 +50,20 @@ impl LrBiquad {
 
 /// Linkwitz-Riley 4th-order crossover: splits signal into LP + HP bands.
 /// Two cascaded 2nd-order Butterworth filters per path.
-struct LR4Crossover {
+pub(crate) struct LR4Crossover {
     lp: [LrBiquad; 2],
     hp: [LrBiquad; 2],
 }
 
 impl LR4Crossover {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             lp: [LrBiquad::new(), LrBiquad::new()],
             hp: [LrBiquad::new(), LrBiquad::new()],
         }
     }
 
-    fn set_frequency(&mut self, freq: f64, sample_rate: f64) {
+    pub(crate) fn set_frequency(&mut self, freq: f64, sample_rate: f64) {
         let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let cos_w0 = w0.cos();
         let sin_w0 = w0.sin();
@@ -95,20 +95,20 @@ impl LR4Crossover {
     }
 
     #[inline]
-    fn process_lp(&mut self, l: f32, r: f32) -> (f32, f32) {
+    pub(crate) fn process_lp(&mut self, l: f32, r: f32) -> (f32, f32) {
         let l1 = self.lp[0].process_l(l as f64);
         let r1 = self.lp[0].process_r(r as f64);
         (self.lp[1].process_l(l1) as f32, self.lp[1].process_r(r1) as f32)
     }
 
     #[inline]
-    fn process_hp(&mut self, l: f32, r: f32) -> (f32, f32) {
+    pub(crate) fn process_hp(&mut self, l: f32, r: f32) -> (f32, f32) {
         let l1 = self.hp[0].process_l(l as f64);
         let r1 = self.hp[0].process_r(r as f64);
         (self.hp[1].process_l(l1) as f32, self.hp[1].process_r(r1) as f32)
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         for bq in &mut self.lp { bq.reset(); }
         for bq in &mut self.hp { bq.reset(); }
     }

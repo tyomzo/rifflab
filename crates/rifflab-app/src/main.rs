@@ -17,6 +17,7 @@ use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
 use rifflab_core::transport::{LoopRegion, TransportState};
 use rifflab_cue::{Cue, CueAction, CueEngine, CueList, CuePosition, DispatchedAction};
+use rifflab_fx::multichain::MultibandRouter;
 use rifflab_fx::registry::EffectRegistry;
 use rifflab_practice::compare::Comparator;
 use rifflab_practice::scoring::SessionScorer;
@@ -269,6 +270,14 @@ struct LoopDragState {
 }
 
 // ─── Bottom Drawer Types ─────────────────────────────────────────────────────
+
+/// Cached snapshot of multiband router state.
+struct MultibandSnapshot {
+    crossover_low_mid: f32,
+    crossover_mid_high: f32,
+    band_gains: [f32; 3],
+    bands: [Vec<FxSnapCached>; 3],
+}
 
 /// Pre-computed spectrogram for one audio source, with display metadata.
 struct SpectrogramDisplay {
@@ -653,6 +662,10 @@ struct RiffLabApp {
     fx_add_open: bool,
     /// Cached effects snapshot to avoid locking every frame.
     fx_snapshot: Vec<FxSnapCached>,
+    /// Cached multiband snapshot.
+    fx_mb_snapshot: Option<MultibandSnapshot>,
+    /// Whether multiband mode is active in UI.
+    fx_multiband_mode: bool,
     /// When the effects snapshot was last refreshed.
     fx_snapshot_time: std::time::Instant,
     /// Force refresh on next frame (after add/remove/reorder).
@@ -759,6 +772,8 @@ impl RiffLabApp {
             fx_registry: EffectRegistry::new(),
             fx_add_open: false,
             fx_snapshot: Vec::new(),
+            fx_mb_snapshot: None,
+            fx_multiband_mode: false,
             fx_snapshot_time: std::time::Instant::now(),
             fx_snapshot_dirty: true,
             fx_preset_path: None,
@@ -3067,6 +3082,211 @@ impl RiffLabApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_multiband_rack(
+        &mut self,
+        ui: &mut egui::Ui,
+        _available_height: f32,
+        mb_add: &mut Option<(usize, String)>,
+        mb_remove: &mut Option<(usize, usize)>,
+        mb_param: &mut Vec<(usize, usize, ParamId, f32)>,
+        mb_bypass: &mut Vec<(usize, usize)>,
+        mb_reorder: &mut Option<(usize, usize, usize)>,
+        mb_xover_change: &mut Option<(f32, f32)>,
+        mb_gain_change: &mut Option<[f32; 3]>,
+    ) {
+        let snap = match &self.fx_mb_snapshot {
+            Some(s) => s,
+            None => {
+                ui.colored_label(egui::Color32::from_rgb(100, 110, 120), "Multiband not initialized");
+                return;
+            }
+        };
+
+        let band_names = ["Low", "Mid", "High"];
+        let band_colors = [
+            egui::Color32::from_rgb(60, 180, 120),
+            egui::Color32::from_rgb(200, 180, 60),
+            egui::Color32::from_rgb(180, 80, 120),
+        ];
+
+        // Crossover frequency sliders
+        let mut xover_low = snap.crossover_low_mid;
+        let mut xover_high = snap.crossover_mid_high;
+        let mut gains = snap.band_gains;
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Crossover:").size(10.0).color(egui::Color32::from_rgb(160, 165, 170)));
+            ui.add(egui::Slider::new(&mut xover_low, 20.0..=2000.0).text("Low/Mid").suffix(" Hz").logarithmic(true));
+            ui.add(egui::Slider::new(&mut xover_high, 100.0..=20000.0).text("Mid/High").suffix(" Hz").logarithmic(true));
+        });
+        if (xover_low - snap.crossover_low_mid).abs() > 0.1 || (xover_high - snap.crossover_mid_high).abs() > 0.1 {
+            *mb_xover_change = Some((xover_low, xover_high));
+        }
+
+        ui.separator();
+
+        // Band sections
+        let freq_ranges = [
+            format!("{:.0} Hz – {:.0} Hz", 20.0, xover_low),
+            format!("{:.0} Hz – {:.0} Hz", xover_low, xover_high),
+            format!("{:.0} Hz – {:.0} kHz", xover_high, self.sample_rate as f32 / 2000.0),
+        ];
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for band_idx in 0..3 {
+                let band_snap = &snap.bands[band_idx];
+                let color = band_colors[band_idx];
+
+                // Band header
+                ui.horizontal(|ui| {
+                    ui.colored_label(color,
+                        egui::RichText::new(format!("{} Band ({})", band_names[band_idx], freq_ranges[band_idx]))
+                            .strong().size(11.0));
+
+                    // Gain slider
+                    ui.label(egui::RichText::new("Gain").size(9.0).color(egui::Color32::from_rgb(140, 145, 150)));
+                    if ui.add(egui::Slider::new(&mut gains[band_idx], -24.0..=12.0)
+                        .suffix(" dB").show_value(true)).changed() {
+                        *mb_gain_change = Some(gains);
+                    }
+
+                    // Add effect button for this band
+                    let add_resp = ui.small_button("+ Add");
+                    let popup_id = ui.make_persistent_id(format!("mb_add_{}", band_idx));
+                    if add_resp.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(popup_id));
+                    }
+                    egui::popup_below_widget(ui, popup_id, &add_resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(180.0);
+                        for (type_id, name, _) in &self.fx_registry.list_effects() {
+                            if type_id == "builtin:tuner" || type_id == "builtin:multiband" { continue; }
+                            if ui.button(name).clicked() {
+                                *mb_add = Some((band_idx, type_id.clone()));
+                                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                            }
+                        }
+                    });
+                });
+
+                // Effect cards for this band (horizontal)
+                if band_snap.is_empty() {
+                    ui.label(egui::RichText::new("  (empty)").size(10.0).color(egui::Color32::from_rgb(90, 95, 100)));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let card_width = 160.0f32;
+                        let card_bg = egui::Color32::from_rgb(30, 33, 38);
+
+                        for (fx_idx, fx) in band_snap.iter().enumerate() {
+                            egui::Frame::new()
+                                .fill(card_bg)
+                                .corner_radius(3.0)
+                                .inner_margin(4.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(card_width);
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            // Move arrows
+                                            let arrow_color = egui::Color32::from_rgb(90, 95, 110);
+                                            let num_fx = band_snap.len();
+                                            if fx_idx > 0 {
+                                                if ui.add(egui::Button::new(egui::RichText::new("\u{25C0}").size(8.0).color(arrow_color)).min_size(egui::vec2(16.0, 14.0))).clicked() {
+                                                    *mb_reorder = Some((band_idx, fx_idx, fx_idx - 1));
+                                                }
+                                            }
+                                            if fx_idx + 1 < num_fx {
+                                                if ui.add(egui::Button::new(egui::RichText::new("\u{25B6}").size(8.0).color(arrow_color)).min_size(egui::vec2(16.0, 14.0))).clicked() {
+                                                    *mb_reorder = Some((band_idx, fx_idx, fx_idx + 1));
+                                                }
+                                            }
+
+                                            // Bypass
+                                            let (bp_label, bp_color) = if fx.bypassed {
+                                                ("OFF", egui::Color32::from_rgb(110, 110, 110))
+                                            } else {
+                                                ("ON", egui::Color32::from_rgb(70, 190, 110))
+                                            };
+                                            if ui.add(egui::Button::new(egui::RichText::new(bp_label).size(8.0).color(bp_color)).min_size(egui::vec2(24.0, 14.0))).clicked() {
+                                                mb_bypass.push((band_idx, fx_idx));
+                                            }
+
+                                            // Remove
+                                            if ui.small_button(egui::RichText::new("\u{2716}").size(8.0).color(egui::Color32::from_rgb(150, 60, 60))).clicked() {
+                                                *mb_remove = Some((band_idx, fx_idx));
+                                            }
+                                        });
+
+                                        ui.label(egui::RichText::new(&fx.name).size(10.0).color(color));
+
+                                        if !fx.bypassed {
+                                            for (desc, val) in &fx.params {
+                                                let mut v = *val;
+                                                let changed = match &desc.kind {
+                                                    ParamKind::Float => {
+                                                        let unit = desc.unit.clone();
+                                                        let name = desc.name.clone();
+                                                        ui.add(egui::Slider::new(&mut v, desc.min..=desc.max)
+                                                            .text(&name)
+                                                            .custom_formatter(move |val, _| {
+                                                                if unit.is_empty() { format!("{:.2}", val) }
+                                                                else { format!("{:.1}{}", val, unit) }
+                                                            })
+                                                        ).changed()
+                                                    }
+                                                    ParamKind::Enum(labels) => {
+                                                        let cur = v.round() as usize;
+                                                        let cur_label = labels.get(cur).cloned().unwrap_or_default();
+                                                        let mut changed = false;
+                                                        egui::ComboBox::from_id_salt(format!("mb{}_{}{}", band_idx, fx_idx, desc.id.0))
+                                                            .selected_text(&cur_label)
+                                                            .width(90.0)
+                                                            .show_ui(ui, |ui| {
+                                                                for (i, l) in labels.iter().enumerate() {
+                                                                    if ui.selectable_value(&mut v, i as f32, l).changed() {
+                                                                        changed = true;
+                                                                    }
+                                                                }
+                                                            });
+                                                        changed
+                                                    }
+                                                    ParamKind::Int => {
+                                                        let mut iv = v.round() as i32;
+                                                        let c = ui.add(egui::Slider::new(&mut iv, desc.min as i32..=desc.max as i32).text(&desc.name)).changed();
+                                                        if c { v = iv as f32; }
+                                                        c
+                                                    }
+                                                    ParamKind::Bool => {
+                                                        let mut b = v > 0.5;
+                                                        let c = ui.checkbox(&mut b, &desc.name).changed();
+                                                        if c { v = if b { 1.0 } else { 0.0 }; }
+                                                        c
+                                                    }
+                                                };
+                                                if changed {
+                                                    mb_param.push((band_idx, fx_idx, desc.id, v));
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+
+                            if fx_idx + 1 < band_snap.len() {
+                                ui.label(egui::RichText::new("\u{25B6}").size(10.0).color(egui::Color32::from_rgb(60, 65, 75)));
+                            }
+                        }
+                    });
+                }
+
+                if band_idx < 2 {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(2.0);
+                }
+            }
+        });
+    }
+
     fn draw_effects_rack(&mut self, ui: &mut egui::Ui) {
         let graph_arc = self.engine.lock().unwrap().graph().clone();
 
@@ -3076,19 +3296,38 @@ impl RiffLabApp {
             || self.fx_snapshot_time.elapsed() > std::time::Duration::from_millis(200);
         if needs_refresh {
             if let Ok(graph) = graph_arc.try_lock() {
-                self.fx_snapshot = graph.fx_chain.effects().iter().map(|e| {
-                    let descs = e.param_descriptors();
-                    let params = descs.into_iter()
-                        .filter(|d| d.name != "Bypass")
-                        .map(|d| { let v = e.get_param(d.id); (d, v) })
-                        .collect();
-                    FxSnapCached {
-                        name: e.name().to_string(),
-                        type_id: e.effect_type_id().to_string(),
-                        bypassed: e.is_bypassed(),
-                        params,
-                    }
-                }).collect();
+                let snap_chain = |chain: &rifflab_fx::chain::EffectChain| -> Vec<FxSnapCached> {
+                    chain.effects().iter().map(|e| {
+                        let descs = e.param_descriptors();
+                        let params = descs.into_iter()
+                            .filter(|d| d.name != "Bypass")
+                            .map(|d| { let v = e.get_param(d.id); (d, v) })
+                            .collect();
+                        FxSnapCached {
+                            name: e.name().to_string(),
+                            type_id: e.effect_type_id().to_string(),
+                            bypassed: e.is_bypassed(),
+                            params,
+                        }
+                    }).collect()
+                };
+
+                self.fx_snapshot = snap_chain(&graph.fx_chain);
+                self.fx_multiband_mode = graph.fx_multiband_active;
+
+                if let Some(ref mb) = graph.fx_multiband {
+                    self.fx_mb_snapshot = Some(MultibandSnapshot {
+                        crossover_low_mid: mb.crossover_low_mid,
+                        crossover_mid_high: mb.crossover_mid_high,
+                        band_gains: mb.band_gains,
+                        bands: [
+                            snap_chain(&mb.chains[0]),
+                            snap_chain(&mb.chains[1]),
+                            snap_chain(&mb.chains[2]),
+                        ],
+                    });
+                }
+
                 self.fx_snapshot_time = std::time::Instant::now();
                 self.fx_snapshot_dirty = false;
             }
@@ -3102,6 +3341,16 @@ impl RiffLabApp {
         let mut bypass_toggles: Vec<usize> = Vec::new();
         let mut reorder: Option<(usize, usize)> = None; // (from, to)
 
+        // Multiband-specific mutations
+        let mut mb_add: Option<(usize, String)> = None; // (band_idx, type_id)
+        let mut mb_remove: Option<(usize, usize)> = None; // (band_idx, effect_idx)
+        let mut mb_param: Vec<(usize, usize, ParamId, f32)> = Vec::new(); // (band, fx, param, val)
+        let mut mb_bypass: Vec<(usize, usize)> = Vec::new(); // (band, fx)
+        let mut mb_reorder: Option<(usize, usize, usize)> = None; // (band, from, to)
+        let mut mb_xover_change: Option<(f32, f32)> = None;
+        let mut mb_gain_change: Option<[f32; 3]> = None;
+        let mut toggle_mode = false;
+
         // Preset actions (collected for after header render)
         let mut do_save = false;
         let mut do_save_as = false;
@@ -3109,11 +3358,29 @@ impl RiffLabApp {
 
         // Header
         ui.horizontal(|ui| {
+            // Mode toggle
+            let single_active = !self.fx_multiband_mode;
+            let label_color = egui::Color32::from_rgb(200, 210, 220);
+            let dim_color = egui::Color32::from_rgb(120, 125, 135);
+            if ui.add(egui::Button::new(
+                egui::RichText::new("Single").size(10.0).color(if single_active { egui::Color32::WHITE } else { dim_color })
+            ).fill(if single_active { egui::Color32::from_rgb(50, 55, 65) } else { egui::Color32::TRANSPARENT })
+             .corner_radius(2).min_size(egui::vec2(50.0, 16.0))).clicked() && !single_active {
+                toggle_mode = true;
+            }
+            if ui.add(egui::Button::new(
+                egui::RichText::new("Multiband").size(10.0).color(if !single_active { egui::Color32::WHITE } else { dim_color })
+            ).fill(if !single_active { egui::Color32::from_rgb(50, 55, 65) } else { egui::Color32::TRANSPARENT })
+             .corner_radius(2).min_size(egui::vec2(70.0, 16.0))).clicked() && single_active {
+                toggle_mode = true;
+            }
+
+            ui.separator();
+
             ui.label(
                 egui::RichText::new(&self.fx_preset_name)
-                    .strong()
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(200, 210, 220)),
+                    .size(11.0)
+                    .color(label_color),
             );
 
             ui.separator();
@@ -3152,9 +3419,18 @@ impl RiffLabApp {
 
         ui.separator();
 
+        let available_height = ui.available_height();
+
+        if self.fx_multiband_mode {
+            // ─── Multiband view ──────────────────────────────────
+            self.draw_multiband_rack(ui, available_height,
+                &mut mb_add, &mut mb_remove, &mut mb_param, &mut mb_bypass,
+                &mut mb_reorder, &mut mb_xover_change, &mut mb_gain_change);
+        } else {
+        // ─── Single chain view ───────────────────────────────
         // Render effects as horizontal cards that wrap on overflow.
         // Use horizontal scroll so cards flow left-to-right.
-        let available_height = ui.available_height();
+        // (available_height already computed above)
         egui::ScrollArea::horizontal()
             .min_scrolled_height(available_height)
             .show(ui, |ui| {
@@ -3309,9 +3585,16 @@ impl RiffLabApp {
             });
         });
 
+        } // end single-chain view else branch
+
         // Apply mutations (brief lock)
         let needs_lock = add_effect.is_some() || remove_idx.is_some()
             || !param_changes.is_empty() || !bypass_toggles.is_empty()
+            || toggle_mode
+            || mb_add.is_some() || mb_remove.is_some()
+            || !mb_param.is_empty() || !mb_bypass.is_empty()
+            || mb_reorder.is_some() || mb_xover_change.is_some()
+            || mb_gain_change.is_some()
             || reorder.is_some();
         if needs_lock {
             if let Ok(mut graph) = graph_arc.try_lock() {
@@ -3348,6 +3631,70 @@ impl RiffLabApp {
                 // Reorder
                 if let Some((from, to)) = reorder {
                     graph.fx_chain.move_effect(from, to);
+                }
+
+                // Mode toggle
+                if toggle_mode {
+                    graph.fx_multiband_active = !graph.fx_multiband_active;
+                    if graph.fx_multiband_active && graph.fx_multiband.is_none() {
+                        graph.fx_multiband = Some(MultibandRouter::new());
+                    }
+                    self.fx_multiband_mode = graph.fx_multiband_active;
+                }
+
+                // Multiband mutations
+                if let Some(ref mb) = graph.fx_multiband.as_mut() {
+                    // handled below
+                }
+                if let Some((band, type_id)) = &mb_add {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                            mb.chains[*band].add(effect);
+                        }
+                    }
+                }
+                if let Some((band, fx_idx)) = mb_remove {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        if fx_idx < mb.chains[band].len() {
+                            mb.chains[band].remove(fx_idx);
+                        }
+                    }
+                }
+                for (band, fx_idx, param_id, val) in &mb_param {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        if let Some(effect) = mb.chains[*band].effects_mut().get_mut(*fx_idx) {
+                            effect.set_param(*param_id, *val);
+                        }
+                    }
+                }
+                for (band, fx_idx) in &mb_bypass {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        if let Some(effect) = mb.chains[*band].effects_mut().get_mut(*fx_idx) {
+                            for desc in effect.param_descriptors() {
+                                if desc.name == "Bypass" {
+                                    let cur = effect.get_param(desc.id);
+                                    effect.set_param(desc.id, if cur > 0.5 { 0.0 } else { 1.0 });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((band, from, to)) = mb_reorder {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        mb.chains[band].move_effect(from, to);
+                    }
+                }
+                if let Some((low, high)) = mb_xover_change {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        mb.set_crossover_low_mid(low);
+                        mb.set_crossover_mid_high(high);
+                    }
+                }
+                if let Some(gains) = mb_gain_change {
+                    if let Some(ref mut mb) = graph.fx_multiband {
+                        mb.band_gains = gains;
+                    }
                 }
 
                 // Mark snapshot dirty so it refreshes next frame

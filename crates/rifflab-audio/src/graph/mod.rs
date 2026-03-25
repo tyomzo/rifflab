@@ -4,6 +4,7 @@ pub mod bus;
 use rifflab_core::audio::{AudioProcessor, ProcessContext};
 use rifflab_core::metering::MeterData;
 use rifflab_fx::chain::EffectChain;
+use rifflab_fx::multichain::MultibandRouter;
 
 /// Fixed-topology audio graph.
 ///
@@ -21,8 +22,12 @@ pub struct AudioGraph {
     pub stem_mutes: Vec<bool>,
     /// Per-stem solo flags.
     pub stem_solos: Vec<bool>,
-    /// Effect chain applied to the live input.
+    /// Effect chain applied to the live input (single-chain mode).
     pub fx_chain: EffectChain,
+    /// Multiband crossover router (when enabled, replaces fx_chain for processing).
+    pub fx_multiband: Option<MultibandRouter>,
+    /// Whether multiband mode is active.
+    pub fx_multiband_active: bool,
     /// Input gain.
     pub input_volume: f32,
     /// Master volume.
@@ -44,6 +49,8 @@ impl AudioGraph {
             stem_mutes: Vec::new(),
             stem_solos: Vec::new(),
             fx_chain: EffectChain::new(),
+            fx_multiband: None,
+            fx_multiband_active: false,
             input_volume: 1.0,
             master_volume: 1.0,
             mix_buffer: vec![0.0; buf_size * 2], // stereo
@@ -103,7 +110,12 @@ impl AudioGraph {
         if self.input_volume > 0.0 {
             self.input_buffer[..stereo_frames].copy_from_slice(&input[..stereo_frames.min(input.len())]);
 
-            if !self.fx_chain.is_empty() {
+            // Route through either multiband crossover or single chain
+            if self.fx_multiband_active {
+                if let Some(ref mut mb) = self.fx_multiband {
+                    mb.process(&mut self.input_buffer[..stereo_frames], context.sample_rate);
+                }
+            } else if !self.fx_chain.is_empty() {
                 self.fx_chain.process(&mut self.input_buffer[..stereo_frames], context.sample_rate);
             }
 
