@@ -2,6 +2,7 @@ mod config;
 mod decode;
 mod import;
 mod library;
+mod session;
 
 use anyhow::Result;
 use clap::Parser;
@@ -645,6 +646,10 @@ struct RiffLabApp {
     fx_preset_path: Option<std::path::PathBuf>,
     /// Current preset name (shown in UI).
     fx_preset_name: String,
+    /// Current session directory (None = never saved).
+    session_path: Option<std::path::PathBuf>,
+    /// Original file path for session saving.
+    original_file_path: Option<std::path::PathBuf>,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -729,6 +734,8 @@ impl RiffLabApp {
             fx_snapshot_dirty: true,
             fx_preset_path: None,
             fx_preset_name: "Untitled".to_string(),
+            session_path: None,
+            original_file_path: None,
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -961,6 +968,8 @@ impl RiffLabApp {
         self.file_name = format!("Loading {}...", file_name);
         self.message_log.clear();
         self.message_log.push(format!("Opening {}...", file_name), false);
+        self.original_file_path = Some(path.to_path_buf());
+        self.session_path = None; // new file = no saved session yet
         self.file_load_state = FileLoadState::Loading {
             file_name,
             receiver: rx,
@@ -1217,6 +1226,26 @@ impl eframe::App for RiffLabApp {
                             .pick_file()
                         {
                             self.load_file(&path);
+                        }
+                    }
+
+                    // Save session
+                    let has_stems = !self.waveform_overviews.is_empty();
+                    if has_stems {
+                        if self.session_path.is_some() {
+                            if ui.small_button("Save").on_hover_text("Save session (overwrite)").clicked() {
+                                self.save_current_session(false);
+                            }
+                        }
+                        if ui.small_button("Save As").on_hover_text("Save session to new folder").clicked() {
+                            self.save_current_session(true);
+                        }
+                    }
+
+                    // Open session
+                    if ui.small_button("Open Session").on_hover_text("Open a saved session").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.open_session(&dir);
                         }
                     }
 
@@ -3141,6 +3170,157 @@ impl RiffLabApp {
                 }
             }
             Err(e) => log::error!("Failed to load preset: {e}"),
+        }
+    }
+
+    fn save_current_session(&mut self, save_as: bool) {
+        let dir = if save_as || self.session_path.is_none() {
+            rfd::FileDialog::new()
+                .set_title("Save Session — choose folder")
+                .pick_folder()
+        } else {
+            self.session_path.clone()
+        };
+
+        let dir = match dir {
+            Some(d) => d,
+            None => return,
+        };
+
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+        let graph = match graph_arc.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.message_log.push("Cannot save: audio engine busy".into(), true);
+                return;
+            }
+        };
+
+        // Collect stem data (clone so we can release the lock before I/O)
+        let stems_data: Vec<(StemType, Vec<f32>, u16, u64)> = graph.stem_players.iter()
+            .map(|p| (p.stem_type, p.data().as_ref().clone(), p.channels(), p.total_frames()))
+            .collect();
+
+        let effects_preset = if !graph.fx_chain.is_empty() {
+            Some(graph.fx_chain.to_preset(&self.fx_preset_name))
+        } else {
+            None
+        };
+
+        drop(graph); // release lock before I/O
+
+        let cue_list = if !self.cue_engine.cue_list().is_empty() {
+            Some(self.cue_engine.cue_list().clone())
+        } else {
+            None
+        };
+
+        let original = self.original_file_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+
+        let stems_refs: Vec<(StemType, &[f32], u16, u64)> = stems_data.iter()
+            .map(|(t, d, c, f)| (*t, d.as_slice(), *c, *f))
+            .collect();
+
+        match session::save_session(
+            &dir,
+            &self.file_name,
+            &original,
+            self.sample_rate,
+            &stems_refs,
+            effects_preset.as_ref(),
+            cue_list.as_ref(),
+        ) {
+            Ok(()) => {
+                self.session_path = Some(dir.clone());
+                self.message_log.push(format!("Session saved to {}", dir.display()), false);
+            }
+            Err(e) => {
+                self.message_log.push(format!("Save failed: {e}"), true);
+            }
+        }
+    }
+
+    fn open_session(&mut self, dir: &std::path::Path) {
+        match session::load_session(dir) {
+            Ok(loaded) => {
+                let target_rate = self.sample_rate;
+                let mut stems = Vec::new();
+                for (stem_type, decoded) in loaded.stems {
+                    let decoded = if decoded.sample_rate != target_rate {
+                        decode::resample(decoded, target_rate)
+                    } else {
+                        decoded
+                    };
+                    let color_idx = stems.len();
+                    let overview = WaveformOverview::from_interleaved(
+                        &decoded.data,
+                        decoded.channels,
+                        OVERVIEW_SAMPLES_PER_PEAK,
+                        TRACK_COLORS[color_idx % TRACK_COLORS.len()],
+                        format!("{:?}", stem_type),
+                    );
+                    stems.push((stem_type, decoded, overview));
+                }
+
+                // Load into engine
+                {
+                    let mut eng = self.engine.lock().unwrap();
+                    eng.transport_mut().stop();
+
+                    let mut players = Vec::new();
+                    let mut max_frames: u64 = 0;
+                    let mut overviews = Vec::new();
+                    for (stem_type, decoded, overview) in stems {
+                        let player = StemPlayer::new(stem_type, decoded.data, decoded.channels);
+                        max_frames = max_frames.max(player.total_frames());
+                        players.push(player);
+                        overviews.push(overview);
+                    }
+                    eng.graph().lock().unwrap().load_stems(players);
+                    eng.transport().set_length(max_frames);
+                    self.waveform_overviews = overviews;
+                }
+
+                // Load effects
+                {
+                    let fx_ga = self.engine.lock().unwrap().graph().clone();
+                    if let Some(preset) = &loaded.effects_preset {
+                        if let Ok(mut g) = fx_ga.try_lock() {
+                            g.fx_chain.load_from_preset(preset, &self.fx_registry);
+                            self.fx_preset_name = preset.name.clone();
+                            self.fx_snapshot_dirty = true;
+                        }
+                    }
+                }
+
+                // Load cues
+                if let Some(cues) = loaded.cue_list {
+                    self.cue_engine.set_cue_list(cues);
+                }
+
+                self.file_name = loaded.manifest.name;
+                self.session_path = Some(dir.to_path_buf());
+                self.original_file_path = Some(std::path::PathBuf::from(&loaded.manifest.original_file));
+
+                // Reset practice state
+                self.comparator = None;
+                self.reference_notes.clear();
+                self.scorer = SessionScorer::new();
+                self.played_notes.clear();
+                self.scroll_offset_frames = 0.0;
+
+                self.message_log.push(format!(
+                    "Session opened: {} ({} stems)",
+                    self.file_name,
+                    self.waveform_overviews.len(),
+                ), false);
+            }
+            Err(e) => {
+                self.message_log.push(format!("Open session failed: {e}"), true);
+            }
         }
     }
 
