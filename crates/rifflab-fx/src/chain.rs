@@ -1,4 +1,5 @@
 use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId};
+use rifflab_core::preset::{EffectPreset, EffectState, ParamValue};
 
 /// An ordered chain of audio effects.
 /// Implements both AudioProcessor and EffectDescriptor so it can be plugged
@@ -40,6 +41,56 @@ impl EffectChain {
 
     pub fn effects_mut(&mut self) -> &mut [Box<dyn EffectDescriptor>] {
         &mut self.effects
+    }
+
+    /// Snapshot the current chain state as a preset.
+    pub fn to_preset(&self, name: &str) -> EffectPreset {
+        EffectPreset {
+            name: name.to_string(),
+            effects: self.effects.iter().map(|e| {
+                let descs = e.param_descriptors();
+                EffectState {
+                    effect_type: e.effect_type_id().to_string(),
+                    active: !e.is_bypassed(),
+                    params: descs.iter().map(|d| ParamValue {
+                        name: d.name.clone(),
+                        id: d.id,
+                        value: e.get_param(d.id),
+                        min: d.min,
+                        max: d.max,
+                    }).collect(),
+                }
+            }).collect(),
+        }
+    }
+
+    /// Replace the chain contents from a preset using the registry to create effects.
+    pub fn load_from_preset(
+        &mut self,
+        preset: &EffectPreset,
+        registry: &crate::registry::EffectRegistry,
+    ) {
+        self.effects.clear();
+        for state in &preset.effects {
+            if let Some(mut effect) = registry.create_effect(&state.effect_type) {
+                // Apply saved params
+                for pv in &state.params {
+                    effect.set_param(pv.id, pv.value);
+                }
+                // Apply bypass
+                if !state.active {
+                    for desc in effect.param_descriptors() {
+                        if desc.name == "Bypass" {
+                            effect.set_param(desc.id, 1.0);
+                            break;
+                        }
+                    }
+                }
+                self.effects.push(effect);
+            } else {
+                log::warn!("Unknown effect type '{}' in preset, skipping", state.effect_type);
+            }
+        }
     }
 
     /// Move an effect from one position to another.

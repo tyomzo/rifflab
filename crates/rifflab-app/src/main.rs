@@ -609,6 +609,10 @@ struct RiffLabApp {
     fx_snapshot_time: std::time::Instant,
     /// Force refresh on next frame (after add/remove/reorder).
     fx_snapshot_dirty: bool,
+    /// Current preset file path (None = never saved).
+    fx_preset_path: Option<std::path::PathBuf>,
+    /// Current preset name (shown in UI).
+    fx_preset_name: String,
     /// Cue engine for timeline automation.
     cue_engine: CueEngine,
 }
@@ -695,6 +699,8 @@ impl RiffLabApp {
             fx_snapshot: Vec::new(),
             fx_snapshot_time: std::time::Instant::now(),
             fx_snapshot_dirty: true,
+            fx_preset_path: None,
+            fx_preset_name: "Untitled".to_string(),
             cue_engine: CueEngine::new(sample_rate),
         }
     }
@@ -2678,17 +2684,24 @@ impl RiffLabApp {
         let mut bypass_toggles: Vec<usize> = Vec::new();
         let mut reorder: Option<(usize, usize)> = None; // (from, to)
 
+        // Preset actions (collected for after header render)
+        let mut do_save = false;
+        let mut do_save_as = false;
+        let mut do_open = false;
+
         // Header
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Signal Chain")
+                egui::RichText::new(&self.fx_preset_name)
                     .strong()
                     .size(12.0)
                     .color(egui::Color32::from_rgb(200, 210, 220)),
             );
 
+            ui.separator();
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add_resp = ui.button("+ Add Effect");
+                let add_resp = ui.button("+ Add");
                 let popup_id = ui.make_persistent_id("fx_add_popup");
                 if add_resp.clicked() {
                     ui.memory_mut(|m| m.toggle_popup(popup_id));
@@ -2703,6 +2716,19 @@ impl RiffLabApp {
                         }
                     }
                 });
+
+                // Preset buttons (right-to-left continues)
+                if ui.small_button("Open").clicked() {
+                    do_open = true;
+                }
+                if self.fx_preset_path.is_some() {
+                    if ui.small_button("Save").clicked() {
+                        do_save = true;
+                    }
+                }
+                if ui.small_button("Save As").clicked() {
+                    do_save_as = true;
+                }
             });
         });
 
@@ -2909,6 +2935,60 @@ impl RiffLabApp {
                 // Mark snapshot dirty so it refreshes next frame
                 self.fx_snapshot_dirty = true;
             }
+        }
+
+        // Handle preset save/load (after mutations, outside graph lock)
+        if do_save {
+            if let Some(ref path) = self.fx_preset_path.clone() {
+                self.save_fx_preset(path, &graph_arc);
+            }
+        }
+        if do_save_as {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("RiffLab Preset", &["toml"])
+                .set_file_name(&format!("{}.toml", self.fx_preset_name))
+                .save_file()
+            {
+                self.fx_preset_path = Some(path.clone());
+                self.fx_preset_name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
+                self.save_fx_preset(&path, &graph_arc);
+            }
+        }
+        if do_open {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("RiffLab Preset", &["toml"])
+                .pick_file()
+            {
+                self.load_fx_preset(&path, &graph_arc);
+            }
+        }
+    }
+
+    fn save_fx_preset(&self, path: &std::path::Path, graph_arc: &Arc<Mutex<rifflab_audio::graph::AudioGraph>>) {
+        if let Ok(graph) = graph_arc.try_lock() {
+            let preset = graph.fx_chain.to_preset(&self.fx_preset_name);
+            match rifflab_fx::preset::save_preset(&preset, path) {
+                Ok(()) => log::info!("Preset saved to {}", path.display()),
+                Err(e) => log::error!("Failed to save preset: {e}"),
+            }
+        }
+    }
+
+    fn load_fx_preset(&mut self, path: &std::path::Path, graph_arc: &Arc<Mutex<rifflab_audio::graph::AudioGraph>>) {
+        match rifflab_fx::preset::load_preset(path) {
+            Ok(preset) => {
+                if let Ok(mut graph) = graph_arc.try_lock() {
+                    graph.fx_chain.load_from_preset(&preset, &self.fx_registry);
+                    self.fx_preset_name = preset.name.clone();
+                    self.fx_preset_path = Some(path.to_path_buf());
+                    self.fx_snapshot_dirty = true;
+                    log::info!("Preset loaded: {} ({} effects)", preset.name, preset.effects.len());
+                }
+            }
+            Err(e) => log::error!("Failed to load preset: {e}"),
         }
     }
 
