@@ -671,8 +671,12 @@ struct RiffLabApp {
     spectrograms: Vec<SpectrogramDisplay>,
     /// Cached spectrogram texture.
     spectrogram_texture: Option<egui::TextureHandle>,
-    /// Cache key: (scroll_bits, zoom_bits, width, height, volumes_hash).
+    /// Cache key for the currently displayed texture.
     spectrogram_cache_key: (u64, u64, u32, u32, u64),
+    /// Pending spectrogram render from background thread.
+    spectrogram_pending: Option<std::sync::mpsc::Receiver<(egui::ColorImage, (u64, u64, u32, u32, u64))>>,
+    /// Key of the render currently in flight (to avoid duplicate dispatches).
+    spectrogram_pending_key: (u64, u64, u32, u32, u64),
     /// Which view mode is active in the arrangement area.
     arrangement_view: ArrangementView,
     /// Cue engine for timeline automation.
@@ -765,6 +769,8 @@ impl RiffLabApp {
             spectrograms: Vec::new(),
             spectrogram_texture: None,
             spectrogram_cache_key: (0, 0, 0, 0, 0),
+            spectrogram_pending: None,
+            spectrogram_pending_key: (0, 0, 0, 0, 0),
             arrangement_view: ArrangementView::Waveform,
             cue_engine: CueEngine::new(sample_rate),
         }
@@ -2940,13 +2946,21 @@ impl RiffLabApp {
         let height = height_px as usize;
         if width < 10 || height < 10 { return; }
 
-        // Get track volumes from sidebar snapshot for opacity control
+        // Check for completed background render
+        if let Some(ref rx) = self.spectrogram_pending {
+            if let Ok((image, key)) = rx.try_recv() {
+                self.spectrogram_texture = Some(ctx.load_texture("spectrogram", image, egui::TextureOptions::LINEAR));
+                self.spectrogram_cache_key = key;
+                self.spectrogram_pending = None;
+            }
+        }
+
+        // Track volumes for opacity
         let track_volumes: Vec<f32> = self.sidebar_snapshot
             .as_ref()
             .map(|(_, _, _, vols, _, _)| vols.clone())
             .unwrap_or_default();
 
-        // Hash volumes into cache key so texture regenerates when volumes change
         let vol_hash: u64 = track_volumes.iter()
             .enumerate()
             .fold(0u64, |h, (i, v)| h.wrapping_add((v.to_bits() as u64).wrapping_mul(i as u64 + 1)));
@@ -2959,61 +2973,97 @@ impl RiffLabApp {
             vol_hash,
         );
 
-        if self.spectrogram_cache_key != cache_key || self.spectrogram_texture.is_none() {
-            let mut pixels = vec![0u8; width * height * 4];
-
-            let freq_min = 20.0f64;
-            let freq_max = (self.sample_rate as f64) / 2.0;
-            let log_min = freq_min.ln();
-            let log_max = freq_max.ln();
-
-            for (spec_idx, spec) in self.spectrograms.iter().enumerate() {
-                if spec.data.num_columns == 0 { continue; }
-
-                // Track volume controls spectrogram opacity
-                let track_vol = track_volumes.get(spec_idx).copied().unwrap_or(1.0);
-                if track_vol <= 0.0 { continue; }
-                let opacity = 0.65 * track_vol.min(1.0); // 0–0.65 based on volume
-
-                let base_r = spec.color.r() as f32;
-                let base_g = spec.color.g() as f32;
-                let base_b = spec.color.b() as f32;
-
-                for px in 0..width {
-                    let frame = self.scroll_offset_frames + px as f64 * self.frames_per_pixel;
-                    let col = (frame / spec.data.hop_size as f64) as usize;
-                    if col >= spec.data.num_columns { continue; }
-
-                    for py in 0..height {
-                        let frac = (height - 1 - py) as f64 / height as f64;
-                        let freq = (log_min + frac * (log_max - log_min)).exp();
-                        let bin = (freq * spec.data.fft_size as f64 / self.sample_rate as f64) as usize;
-                        if bin >= spec.data.num_bins { continue; }
-
-                        let mag_u8 = spec.data.magnitudes[col * spec.data.num_bins + bin];
-                        if mag_u8 == 0 { continue; }
-
-                        let alpha = (mag_u8 as f32 / 255.0) * opacity;
-
-                        let idx = (py * width + px) * 4;
-                        let inv = 1.0 - alpha;
-                        pixels[idx]     = (pixels[idx]     as f32 * inv + base_r * alpha) as u8;
-                        pixels[idx + 1] = (pixels[idx + 1] as f32 * inv + base_g * alpha) as u8;
-                        pixels[idx + 2] = (pixels[idx + 2] as f32 * inv + base_b * alpha) as u8;
-                        pixels[idx + 3] = (pixels[idx + 3] as f32 * inv + 255.0 * alpha).min(255.0) as u8;
-                    }
-                }
+        // Dispatch background render if cache is stale and no render in flight
+        if self.spectrogram_cache_key != cache_key
+            && self.spectrogram_pending_key != cache_key
+            && self.spectrogram_pending.is_none()
+        {
+            // Collect render params (clone the data refs we need)
+            struct SpecRenderInfo {
+                magnitudes: Vec<u8>,
+                num_bins: usize,
+                num_columns: usize,
+                hop_size: usize,
+                fft_size: usize,
+                color: [u8; 3],
+                volume: f32,
             }
 
-            let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
-            self.spectrogram_texture = Some(ctx.load_texture("spectrogram", image, egui::TextureOptions::LINEAR));
-            self.spectrogram_cache_key = cache_key;
+            let specs: Vec<SpecRenderInfo> = self.spectrograms.iter().enumerate().map(|(i, s)| {
+                SpecRenderInfo {
+                    magnitudes: s.data.magnitudes.clone(),
+                    num_bins: s.data.num_bins,
+                    num_columns: s.data.num_columns,
+                    hop_size: s.data.hop_size,
+                    fft_size: s.data.fft_size,
+                    color: [s.color.r(), s.color.g(), s.color.b()],
+                    volume: track_volumes.get(i).copied().unwrap_or(1.0),
+                }
+            }).collect();
+
+            let scroll = self.scroll_offset_frames;
+            let fpp = self.frames_per_pixel;
+            let sr = self.sample_rate;
+            let key = cache_key;
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.spectrogram_pending = Some(rx);
+            self.spectrogram_pending_key = key;
+
+            std::thread::spawn(move || {
+                let mut pixels = vec![0u8; width * height * 4];
+
+                let freq_min = 20.0f64;
+                let freq_max = (sr as f64) / 2.0;
+                let log_min = freq_min.ln();
+                let log_max = freq_max.ln();
+
+                for spec in &specs {
+                    if spec.num_columns == 0 || spec.volume <= 0.0 { continue; }
+                    let opacity = 0.65 * spec.volume.min(1.0);
+                    let base_r = spec.color[0] as f32;
+                    let base_g = spec.color[1] as f32;
+                    let base_b = spec.color[2] as f32;
+
+                    for px in 0..width {
+                        let frame = scroll + px as f64 * fpp;
+                        let col = (frame / spec.hop_size as f64) as usize;
+                        if col >= spec.num_columns { continue; }
+
+                        for py in 0..height {
+                            let frac = (height - 1 - py) as f64 / height as f64;
+                            let freq = (log_min + frac * (log_max - log_min)).exp();
+                            let bin = (freq * spec.fft_size as f64 / sr as f64) as usize;
+                            if bin >= spec.num_bins { continue; }
+
+                            let mag_u8 = spec.magnitudes[col * spec.num_bins + bin];
+                            if mag_u8 == 0 { continue; }
+
+                            let alpha = (mag_u8 as f32 / 255.0) * opacity;
+                            let idx = (py * width + px) * 4;
+                            let inv = 1.0 - alpha;
+                            pixels[idx]     = (pixels[idx]     as f32 * inv + base_r * alpha) as u8;
+                            pixels[idx + 1] = (pixels[idx + 1] as f32 * inv + base_g * alpha) as u8;
+                            pixels[idx + 2] = (pixels[idx + 2] as f32 * inv + base_b * alpha) as u8;
+                            pixels[idx + 3] = (pixels[idx + 3] as f32 * inv + 255.0 * alpha).min(255.0) as u8;
+                        }
+                    }
+                }
+
+                let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+                let _ = tx.send((image, key));
+            });
         }
 
+        // Draw the last available texture (may be stale for 1-2 frames during re-render)
         if let Some(tex) = &self.spectrogram_texture {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width_px, height_px), egui::Sense::hover());
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+        } else {
+            // No texture yet — allocate space with dark background
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width_px, height_px), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 20, 24));
         }
     }
 
