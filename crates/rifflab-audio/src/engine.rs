@@ -94,7 +94,9 @@ impl AudioEngine {
             &self.input_device_name,
         )?;
 
-        let sample_rate = self.config.sample_rate.as_u32();
+        // Use actual backend sample rate (hardware may differ from config)
+        let sample_rate = backend.actual_sample_rate()
+            .unwrap_or_else(|| self.config.sample_rate.as_u32());
 
         // Start the analysis thread — it owns pitch_tx and receives mono audio
         let pitch_tx = {

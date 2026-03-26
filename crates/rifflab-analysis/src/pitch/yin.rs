@@ -26,7 +26,7 @@ impl YinDetector {
             buffer: vec![0.0; buf_size],
             write_pos: 0,
             sample_rate,
-            threshold: 0.30,
+            threshold: 0.20,
             min_freq: 30.0,
             max_freq: 2000.0,
             diff: vec![0.0; max_period],
