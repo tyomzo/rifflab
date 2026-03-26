@@ -509,7 +509,7 @@ pub fn draw_node_editor(
                 );
                 if canvas_rect.intersects(params_rect) {
                     let node_id = node.id;
-                    ui.allocate_new_ui(params_rect, |ui| {
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(params_rect), |ui| {
                         ui.set_clip_rect(canvas_rect);
                         let param_width = NODE_WIDTH - 24.0;
                         for (desc, val) in &params {

@@ -289,7 +289,7 @@ pub fn draw_preset_graph(
             let binding_label = if is_learning { "[press key...]".to_string() }
                 else { node.midi_binding.as_ref().map(|b| b.label()).unwrap_or_else(|| "Learn MIDI".into()) };
 
-            ui.allocate_new_ui(buttons_rect, |ui| {
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(buttons_rect), |ui| {
                 ui.set_clip_rect(rect);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
@@ -347,6 +347,7 @@ pub fn draw_preset_graph(
     }
 
     // Node dragging (using statics for simplicity — single-threaded UI)
+    #[allow(static_mut_refs)]
     unsafe {
         if let Some((id, offset)) = drag_start {
             DRAGGING_NODE = Some((id, offset));
