@@ -4,8 +4,8 @@ use crate::node_editor::FxGraph;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-const PRESET_NODE_WIDTH: f32 = 140.0;
-const PRESET_NODE_HEIGHT: f32 = 60.0;
+const PRESET_NODE_WIDTH: f32 = 150.0;
+const PRESET_NODE_HEIGHT: f32 = 80.0;
 const PORT_RADIUS: f32 = 5.0;
 
 /// A MIDI binding.
@@ -240,6 +240,8 @@ pub fn draw_preset_graph(
     // Draw nodes
     let mut drag_start: Option<(u64, egui::Vec2)> = None;
     let mut wire_drag_start: Option<u64> = None;
+    let mut remove_node_id: Option<u64> = None;
+    let mut load_pipeline_for: Option<u64> = None;
     static mut DRAGGING_NODE: Option<(u64, egui::Vec2)> = None;
     static mut DRAGGING_WIRE: Option<u64> = None;
 
@@ -262,17 +264,10 @@ pub fn draw_preset_graph(
         painter.rect_filled(node_rect, 6.0, bg);
         painter.rect_stroke(node_rect, 6.0, egui::Stroke::new(if is_active { 2.0 } else { 1.0 }, border), egui::StrokeKind::Outside);
 
-        // Name
-        painter.text(egui::pos2(nx + PRESET_NODE_WIDTH / 2.0, ny + 14.0), egui::Align2::CENTER_CENTER,
-            &node.name, egui::FontId::proportional(12.0),
+        // Name (painted, used as drag handle)
+        painter.text(egui::pos2(nx + PRESET_NODE_WIDTH / 2.0, ny + 12.0), egui::Align2::CENTER_CENTER,
+            &node.name, egui::FontId::proportional(11.0),
             if is_active { egui::Color32::WHITE } else { egui::Color32::from_rgb(200, 205, 215) });
-
-        // MIDI binding label
-        let binding_label = if is_learning { "[press key...]".to_string() }
-            else { node.midi_binding.as_ref().map(|b| b.label()).unwrap_or_else(|| "[Learn]".into()) };
-        painter.text(egui::pos2(nx + PRESET_NODE_WIDTH / 2.0, ny + 34.0), egui::Align2::CENTER_CENTER,
-            &binding_label, egui::FontId::proportional(9.0),
-            if is_learning { egui::Color32::YELLOW } else { egui::Color32::from_rgb(130, 135, 150) });
 
         // Output port (right side)
         let out_pos = egui::pos2(nx + PRESET_NODE_WIDTH, ny + PRESET_NODE_HEIGHT / 2.0);
@@ -281,24 +276,65 @@ pub fn draw_preset_graph(
         let in_pos = egui::pos2(nx, ny + PRESET_NODE_HEIGHT / 2.0);
         painter.circle_filled(in_pos, PORT_RADIUS, egui::Color32::from_rgb(80, 150, 220));
 
-        // Interaction
-        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-            if node_rect.contains(pointer) && ui.input(|i| i.pointer.primary_pressed()) {
-                // Check if clicking the MIDI learn area (bottom half)
-                if pointer.y > ny + 26.0 {
-                    if is_learning {
-                        *learn_target = MidiLearnTarget::None;
-                    } else {
-                        *learn_target = MidiLearnTarget::PresetNode(node.id);
-                        log::info!("MIDI learn: waiting for key press on preset '{}'", node.name);
+        // Buttons inside the node (real egui widgets)
+        let buttons_rect = egui::Rect::from_min_size(
+            egui::pos2(nx + 4.0, ny + 24.0),
+            egui::vec2(PRESET_NODE_WIDTH - 8.0, PRESET_NODE_HEIGHT - 28.0),
+        );
+        if rect.intersects(buttons_rect) {
+            let node_id = node.id;
+            let node_name = node.name.clone();
+            let binding_label = if is_learning { "[press key...]".to_string() }
+                else { node.midi_binding.as_ref().map(|b| b.label()).unwrap_or_else(|| "Learn MIDI".into()) };
+
+            ui.allocate_ui_at_rect(buttons_rect, |ui| {
+                ui.set_clip_rect(rect);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    // MIDI learn button
+                    let learn_color = if is_learning { egui::Color32::YELLOW } else { egui::Color32::from_rgb(130, 140, 155) };
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new(&binding_label).size(9.0).color(learn_color)
+                    ).min_size(egui::vec2(60.0, 16.0))).clicked() {
+                        if is_learning {
+                            *learn_target = MidiLearnTarget::None;
+                        } else {
+                            *learn_target = MidiLearnTarget::PresetNode(node_id);
+                            log::info!("MIDI learn: waiting for key on '{}'", node_name);
+                        }
                     }
-                } else {
-                    // Top half: start dragging or activate
-                    drag_start = Some((node.id, pointer - egui::pos2(nx, ny)));
-                }
+                    // Delete button
+                    if ui.small_button(
+                        egui::RichText::new("\u{2716}").size(9.0).color(egui::Color32::from_rgb(150, 60, 60))
+                    ).clicked() {
+                        remove_node_id = Some(node_id);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    // Load pipeline from file
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Load").size(9.0)
+                    ).min_size(egui::vec2(40.0, 16.0))).clicked() {
+                        load_pipeline_for = Some(node_id);
+                    }
+                    // Edit pipeline
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Edit").size(9.0)
+                    ).min_size(egui::vec2(40.0, 16.0))).clicked() {
+                        action = PresetGraphAction::EditPreset(node_id);
+                    }
+                });
+            });
+        }
+
+        // Drag and wire interaction (only from the title bar area, y < ny + 24)
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let header_rect = egui::Rect::from_min_size(egui::pos2(nx, ny), egui::vec2(PRESET_NODE_WIDTH, 24.0));
+            if header_rect.contains(pointer) && ui.input(|i| i.pointer.primary_pressed()) {
+                drag_start = Some((node.id, pointer - egui::pos2(nx, ny)));
             }
-            if node_rect.contains(pointer) && pointer.y <= ny + 26.0 && ui.input(|i| i.pointer.primary_released()) {
-                // Quick click on top half = activate
+            if header_rect.contains(pointer) && ui.input(|i| i.pointer.primary_released()) {
                 action = PresetGraphAction::ActivatePreset(node.id);
             }
             // Output port drag (wire creation)
@@ -363,7 +399,32 @@ pub fn draw_preset_graph(
         }
     }
 
-    // Right-click context menu
+    // Handle deferred actions
+    if let Some(id) = remove_node_id {
+        graph.remove_node(id);
+    }
+    if let Some(id) = load_pipeline_for {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("RiffLab Graph", &["json"])
+            .pick_file()
+        {
+            match crate::node_editor::load_graph(&path) {
+                Ok(g) => {
+                    if let Some(node) = graph.find_node_mut(id) {
+                        node.pipeline = g;
+                        node.name = path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Loaded")
+                            .to_string();
+                    }
+                    action = PresetGraphAction::ActivatePreset(id);
+                }
+                Err(e) => log::error!("Load pipeline failed: {e}"),
+            }
+        }
+    }
+
+    // Right-click context menu (simplified — delete and edit moved to node buttons)
     response.context_menu(|ui| {
         let click_pos = ui.ctx().pointer_latest_pos()
             .map(|p| [p.x - rect.left() - pan.x, p.y - rect.top() - pan.y])
