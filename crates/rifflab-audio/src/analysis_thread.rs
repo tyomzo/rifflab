@@ -78,10 +78,10 @@ fn analysis_loop(
 ) {
     let mut current_rate = sample_rate.load(Ordering::Relaxed);
     let mut detector = YinDetector::new(current_rate);
-    // Hop size must be large enough to contain at least one full period of the lowest
-    // detectable frequency. For 30Hz at 44100Hz, period = 1470 samples.
-    // Use 2048 to ensure at least one full cycle per hop for bass instruments.
-    let hop_size = 2048;
+    // Larger hop = more stable pitch detection (more periods in the window).
+    // 4096 at 44100Hz = 93ms = ~11 updates/sec. Very stable for tuning,
+    // slight lag acceptable since tuner doesn't need real-time response.
+    let hop_size = 4096;
     let mut buf = vec![0.0f32; hop_size];
 
     while !stop.load(Ordering::Relaxed) {

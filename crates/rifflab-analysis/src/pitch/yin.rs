@@ -19,11 +19,11 @@ pub struct YinDetector {
 
 impl YinDetector {
     pub fn new(sample_rate: u32) -> Self {
-        // Buffer size = 3 * max_period for reliable low-frequency detection.
-        // At 30 Hz / 44100Hz: period = 1470 samples, buffer = 4410 samples.
-        // The extra period gives the autocorrelation more signal to work with.
+        // Buffer size = 4 * max_period for very stable low-frequency detection.
+        // At 30 Hz / 44100Hz: period = 1470, buffer = 5880 samples.
+        // More periods = better autocorrelation = fewer octave/harmonic errors.
         let max_period = (sample_rate as f32 / 30.0).ceil() as usize;
-        let buf_size = max_period * 3;
+        let buf_size = max_period * 4;
         Self {
             buffer: vec![0.0; buf_size],
             write_pos: 0,
