@@ -819,7 +819,11 @@ impl RiffLabApp {
             fx_graph_compiled_hash: 0,
             midi_connection: None,
             midi_rx: None,
-            midi_port_names: midi_input::list_midi_ports(),
+            midi_port_names: {
+                let ports = midi_input::list_midi_ports();
+                log::info!("MIDI ports found: {:?}", ports);
+                ports
+            },
             midi_selected_port: 0,
             preset_bank: preset_bank::PresetBank::new(),
             midi_panel_open: false,
