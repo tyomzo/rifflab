@@ -287,14 +287,19 @@ pub fn draw_preset_graph(
             if node_rect.contains(pointer) && ui.input(|i| i.pointer.primary_pressed()) {
                 // Check if clicking the MIDI learn area (bottom half)
                 if pointer.y > ny + 26.0 {
-                    *learn_target = if is_learning { MidiLearnTarget::None } else { MidiLearnTarget::PresetNode(node.id) };
+                    if is_learning {
+                        *learn_target = MidiLearnTarget::None;
+                    } else {
+                        *learn_target = MidiLearnTarget::PresetNode(node.id);
+                        log::info!("MIDI learn: waiting for key press on preset '{}'", node.name);
+                    }
                 } else {
                     // Top half: start dragging or activate
                     drag_start = Some((node.id, pointer - egui::pos2(nx, ny)));
                 }
             }
-            if node_rect.contains(pointer) && ui.input(|i| i.pointer.primary_released()) {
-                // Quick click = activate + edit
+            if node_rect.contains(pointer) && pointer.y <= ny + 26.0 && ui.input(|i| i.pointer.primary_released()) {
+                // Quick click on top half = activate
                 action = PresetGraphAction::ActivatePreset(node.id);
             }
             // Output port drag (wire creation)

@@ -1262,6 +1262,7 @@ impl eframe::App for RiffLabApp {
             let mut bank_activate: Option<usize> = None;
             if let Some(ref rx) = self.midi_rx {
                 while let Ok(event) = rx.try_recv() {
+                    log::debug!("[MIDI] event: {:?}, learn={:?}", event, self.midi_learn);
                     // MIDI Learn mode: capture binding
                     if self.midi_learn != preset_graph::MidiLearnTarget::None {
                         let binding = match &event {
