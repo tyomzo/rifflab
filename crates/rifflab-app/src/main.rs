@@ -2,7 +2,9 @@ mod config;
 mod decode;
 mod import;
 mod library;
+mod midi_input;
 mod node_editor;
+mod preset_bank;
 mod session;
 
 use anyhow::Result;
@@ -701,6 +703,15 @@ struct RiffLabApp {
     node_editor_state: node_editor::NodeEditorState,
     /// Hash of last compiled graph (to detect changes).
     fx_graph_compiled_hash: u64,
+    /// MIDI input connection.
+    midi_connection: Option<midi_input::MidiConnection>,
+    midi_rx: Option<std::sync::mpsc::Receiver<midi_input::MidiEvent>>,
+    midi_port_names: Vec<String>,
+    midi_selected_port: usize,
+    /// Preset bank (multiple presets loaded, one active).
+    preset_bank: preset_bank::PresetBank,
+    /// MIDI/Preset panel open.
+    midi_panel_open: bool,
 }
 
 impl RiffLabApp {
@@ -798,6 +809,12 @@ impl RiffLabApp {
             fx_graph: node_editor::FxGraph::new_default(),
             node_editor_state: node_editor::NodeEditorState::default(),
             fx_graph_compiled_hash: 0,
+            midi_connection: None,
+            midi_rx: None,
+            midi_port_names: midi_input::list_midi_ports(),
+            midi_selected_port: 0,
+            preset_bank: preset_bank::PresetBank::new(),
+            midi_panel_open: false,
         }
     }
 
@@ -1227,6 +1244,25 @@ impl eframe::App for RiffLabApp {
             }
         }
 
+        // ─── Poll MIDI input ──────────────────────────────────────
+        {
+            let mut activate_idx: Option<usize> = None;
+            if let Some(ref rx) = self.midi_rx {
+                while let Ok(event) = rx.try_recv() {
+                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = event {
+                        if value > 0 {
+                            if let Some(idx) = self.preset_bank.find_by_cc(cc) {
+                                activate_idx = Some(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(idx) = activate_idx {
+                self.activate_preset(idx);
+            }
+        }
+
         // Drain pitch frames, run comparison, update score, track played notes
         while let Ok(pitch) = self.pitch_rx.pop() {
             self.current_pitch = pitch.clone();
@@ -1513,6 +1549,10 @@ impl eframe::App for RiffLabApp {
 
                     // Right-aligned controls
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // MIDI / Preset Bank button
+                        if ui.small_button("\u{1F3B9} MIDI").clicked() {
+                            self.midi_panel_open = !self.midi_panel_open;
+                        }
                         // Settings gear button
                         if ui.small_button("\u{2699} Audio").clicked() {
                             self.audio_settings.refresh_devices();
@@ -2632,6 +2672,7 @@ impl eframe::App for RiffLabApp {
         // ─── Audio Settings Window ───────────────────────────────
         self.draw_audio_settings(ctx);
         self.draw_tuner_settings(ctx);
+        self.draw_midi_panel(ctx);
         self.draw_message_log(ctx);
 
         // Request continuous repaint for smooth animation
@@ -4171,6 +4212,167 @@ impl RiffLabApp {
                 self.message_log.push(format!("Open session failed: {e}"), true);
             }
         }
+    }
+
+    /// Activate a preset from the bank by index.
+    fn activate_preset(&mut self, index: usize) {
+        let slot_data = self.preset_bank.presets.get(index)
+            .map(|s| (s.graph.clone(), s.name.clone()));
+        if let Some((graph, name)) = slot_data {
+            self.fx_graph = graph;
+            self.fx_graph.load_params_to_cache(&mut self.node_editor_state.param_cache);
+            self.fx_graph_compiled_hash = 0;
+            self.compile_graph_if_changed();
+            self.preset_bank.active_index = Some(index);
+            self.message_log.push(format!("Preset: {}", name), false);
+            log::info!("Activated preset: {} (slot {})", name, index);
+        }
+    }
+
+    fn draw_midi_panel(&mut self, ctx: &egui::Context) {
+        let mut open = self.midi_panel_open;
+        egui::Window::new("MIDI & Preset Bank")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                let label_color = egui::Color32::from_rgb(180, 200, 220);
+
+                // MIDI port selection
+                ui.label(egui::RichText::new("MIDI Input").strong().color(label_color));
+                ui.horizontal(|ui| {
+                    let connected = self.midi_connection.is_some();
+                    let port_label = if self.midi_port_names.is_empty() {
+                        "No MIDI ports found".to_string()
+                    } else {
+                        self.midi_port_names.get(self.midi_selected_port)
+                            .cloned()
+                            .unwrap_or_else(|| "Select...".to_string())
+                    };
+
+                    egui::ComboBox::from_id_salt("midi_port")
+                        .selected_text(&port_label)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in self.midi_port_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.midi_selected_port, i, name);
+                            }
+                        });
+
+                    if ui.small_button("Refresh").clicked() {
+                        self.midi_port_names = midi_input::list_midi_ports();
+                    }
+
+                    if connected {
+                        let name = self.midi_connection.as_ref().map(|c| c.port_name.as_str()).unwrap_or("?");
+                        ui.colored_label(egui::Color32::from_rgb(80, 200, 120),
+                            format!("Connected: {}", name));
+                        if ui.small_button("Disconnect").clicked() {
+                            self.midi_connection = None;
+                            self.midi_rx = None;
+                        }
+                    } else {
+                        if ui.add_enabled(!self.midi_port_names.is_empty(),
+                            egui::Button::new("Connect")).clicked()
+                        {
+                            match midi_input::connect(self.midi_selected_port) {
+                                Ok((conn, rx)) => {
+                                    self.message_log.push(format!("MIDI connected: {}", conn.port_name), false);
+                                    self.midi_connection = Some(conn);
+                                    self.midi_rx = Some(rx);
+                                }
+                                Err(e) => {
+                                    self.message_log.push(format!("MIDI error: {e}"), true);
+                                }
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // Preset bank
+                ui.label(egui::RichText::new("Preset Bank").strong().color(label_color));
+                ui.add_space(4.0);
+
+                let mut remove_idx: Option<usize> = None;
+                let mut activate_idx: Option<usize> = None;
+
+                for i in 0..self.preset_bank.presets.len() {
+                    let is_active = self.preset_bank.active_index == Some(i);
+                    let slot = &self.preset_bank.presets[i];
+
+                    ui.horizontal(|ui| {
+                        // Active indicator
+                        let dot_color = if is_active {
+                            egui::Color32::from_rgb(80, 220, 120)
+                        } else {
+                            egui::Color32::from_rgb(60, 65, 75)
+                        };
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                        // Click name to activate
+                        let name_color = if is_active {
+                            egui::Color32::from_rgb(220, 230, 240)
+                        } else {
+                            egui::Color32::from_rgb(170, 175, 185)
+                        };
+                        if ui.add(
+                            egui::Label::new(egui::RichText::new(&slot.name).size(12.0).color(name_color))
+                                .sense(egui::Sense::click())
+                        ).clicked() {
+                            activate_idx = Some(i);
+                        }
+
+                        // CC number (editable)
+                        ui.label(egui::RichText::new(format!("CC#{}", slot.midi_cc)).size(10.0)
+                            .color(egui::Color32::from_rgb(130, 135, 145)));
+
+                        // Remove button
+                        if ui.small_button(
+                            egui::RichText::new("\u{2716}").size(9.0).color(egui::Color32::from_rgb(150, 60, 60))
+                        ).clicked() {
+                            remove_idx = Some(i);
+                        }
+                    });
+                }
+
+                if self.preset_bank.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 110, 120),
+                        "No presets loaded. Click '+ Add' to load graph presets.",
+                    );
+                }
+
+                ui.add_space(4.0);
+                if ui.button("+ Add Preset").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("RiffLab Graph", &["json"])
+                        .pick_file()
+                    {
+                        match self.preset_bank.add_from_file(&path) {
+                            Ok(idx) => {
+                                self.message_log.push(
+                                    format!("Added preset: {}", self.preset_bank.presets[idx].name), false);
+                            }
+                            Err(e) => {
+                                self.message_log.push(format!("Failed to add preset: {e}"), true);
+                            }
+                        }
+                    }
+                }
+
+                // Apply deferred actions
+                if let Some(idx) = remove_idx {
+                    self.preset_bank.remove(idx);
+                }
+                if let Some(idx) = activate_idx {
+                    self.activate_preset(idx);
+                }
+            });
+        self.midi_panel_open = open;
     }
 
     fn draw_message_log(&mut self, ctx: &egui::Context) {

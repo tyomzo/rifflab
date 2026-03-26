@@ -37,6 +37,7 @@ env_logger = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 rifflab-cue = { workspace = true }
+midir = { workspace = true }
 rfd = "0.15"
 rubato = { workspace = true }
 audioadapter-buffers = "2"
