@@ -94,11 +94,9 @@ impl AudioEngine {
             &self.input_device_name,
         )?;
 
-        // Use actual backend sample rate (hardware may differ from config)
-        let sample_rate = backend.actual_sample_rate()
-            .unwrap_or_else(|| self.config.sample_rate.as_u32());
+        let sample_rate = self.config.sample_rate.as_u32();
 
-        // Start the analysis thread — it owns pitch_tx and receives mono audio
+        // Start the analysis thread
         let pitch_tx = {
             let (new_tx, _) = rifflab_core::rtrb::RingBuffer::new(1);
             std::mem::replace(&mut self.pitch_tx, new_tx)
@@ -182,10 +180,20 @@ impl AudioEngine {
         });
 
         backend.start(&self.config, callback)?;
+
+        // Update analysis thread with actual hardware sample rate
+        let actual_rate = backend.actual_sample_rate().unwrap_or(sample_rate);
+        if actual_rate != sample_rate {
+            log::info!("Actual sample rate {}Hz (config was {}Hz), updating analysis", actual_rate, sample_rate);
+            if let Some(ref at) = self.analysis_thread {
+                at.set_sample_rate(actual_rate);
+            }
+        }
+
         self.backend = Some(backend);
         self.running = true;
 
-        log::info!("Audio engine started");
+        log::info!("Audio engine started ({}Hz)", actual_rate);
         Ok(())
     }
 
