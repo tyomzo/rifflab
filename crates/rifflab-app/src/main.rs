@@ -5,6 +5,7 @@ mod library;
 mod midi_input;
 mod node_editor;
 mod preset_bank;
+mod preset_graph;
 mod session;
 
 use anyhow::Result;
@@ -292,9 +293,10 @@ struct SpectrogramDisplay {
 /// Which tab is active in the bottom drawer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
+    Presets,
+    Effects,
     PianoRoll,
     Accuracy,
-    Effects,
 }
 
 /// Which view is shown in the central arrangement area.
@@ -712,6 +714,12 @@ struct RiffLabApp {
     preset_bank: preset_bank::PresetBank,
     /// MIDI/Preset panel open.
     midi_panel_open: bool,
+    /// Preset navigation graph.
+    preset_nav: preset_graph::PresetGraph,
+    /// MIDI learn target.
+    midi_learn: preset_graph::MidiLearnTarget,
+    /// Which preset is being edited (its pipeline shown in the effect editor).
+    editing_preset_id: Option<u64>,
 }
 
 impl RiffLabApp {
@@ -815,6 +823,9 @@ impl RiffLabApp {
             midi_selected_port: 0,
             preset_bank: preset_bank::PresetBank::new(),
             midi_panel_open: false,
+            preset_nav: preset_graph::PresetGraph::default(),
+            midi_learn: preset_graph::MidiLearnTarget::None,
+            editing_preset_id: None,
         }
     }
 
@@ -1245,20 +1256,99 @@ impl eframe::App for RiffLabApp {
         }
 
         // ─── Poll MIDI input ──────────────────────────────────────
+        // ─── Poll MIDI: learn bindings or activate presets ─────
         {
-            let mut activate_idx: Option<usize> = None;
+            let mut nav_activate: Option<u64> = None;
+            let mut bank_activate: Option<usize> = None;
             if let Some(ref rx) = self.midi_rx {
                 while let Ok(event) = rx.try_recv() {
-                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = event {
-                        if value > 0 {
-                            if let Some(idx) = self.preset_bank.find_by_cc(cc) {
-                                activate_idx = Some(idx);
+                    // MIDI Learn mode: capture binding
+                    if self.midi_learn != preset_graph::MidiLearnTarget::None {
+                        let binding = match &event {
+                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 => {
+                                Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
+                            }
+                            midi_input::MidiEvent::NoteOn { channel, note, .. } => {
+                                Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
+                            }
+                            _ => None,
+                        };
+                        if let Some(b) = binding {
+                            match &self.midi_learn {
+                                preset_graph::MidiLearnTarget::PresetNode(id) => {
+                                    let id = *id;
+                                    if let Some(node) = self.preset_nav.find_node_mut(id) {
+                                        node.midi_binding = Some(b.clone());
+                                    }
+                                    self.message_log.push(format!("Bound {} to preset", b.label()), false);
+                                }
+                                preset_graph::MidiLearnTarget::GlobalNext => {
+                                    self.message_log.push(format!("Next bound to {}", b.label()), false);
+                                    self.preset_nav.midi_next = Some(b.clone());
+                                }
+                                preset_graph::MidiLearnTarget::GlobalPrev => {
+                                    self.message_log.push(format!("Prev bound to {}", b.label()), false);
+                                    self.preset_nav.midi_prev = Some(b.clone());
+                                }
+                                _ => {}
+                            }
+                            self.midi_learn = preset_graph::MidiLearnTarget::None;
+                        }
+                        continue;
+                    }
+
+                    // Normal mode: check bindings
+                    // 1. Direct preset binding
+                    if let Some(id) = self.preset_nav.find_by_midi(&event) {
+                        nav_activate = Some(id);
+                    }
+                    // 2. Next/Prev navigation
+                    else if let Some(ref next_bind) = self.preset_nav.midi_next {
+                        let matches = match &event {
+                            midi_input::MidiEvent::ControlChange { channel, cc, value } => *value > 0 && next_bind.matches_cc(*channel, *cc),
+                            midi_input::MidiEvent::NoteOn { channel, note, .. } => next_bind.matches_note(*channel, *note),
+                            _ => false,
+                        };
+                        if matches {
+                            if let Some(active) = self.preset_nav.active_id {
+                                if let Some(next_id) = self.preset_nav.next_from(active) {
+                                    nav_activate = Some(next_id);
+                                }
+                            }
+                        }
+                    }
+                    if nav_activate.is_none() {
+                        if let Some(ref prev_bind) = self.preset_nav.midi_prev {
+                            let matches = match &event {
+                                midi_input::MidiEvent::ControlChange { channel, cc, value } => *value > 0 && prev_bind.matches_cc(*channel, *cc),
+                                midi_input::MidiEvent::NoteOn { channel, note, .. } => prev_bind.matches_note(*channel, *note),
+                                _ => false,
+                            };
+                            if matches {
+                                if let Some(active) = self.preset_nav.active_id {
+                                    if let Some(prev_id) = self.preset_nav.prev_from(active) {
+                                        nav_activate = Some(prev_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 3. Legacy preset bank
+                    if nav_activate.is_none() {
+                        if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                            if *value > 0 {
+                                if let Some(idx) = self.preset_bank.find_by_cc(*cc) {
+                                    bank_activate = Some(idx);
+                                }
                             }
                         }
                     }
                 }
             }
-            if let Some(idx) = activate_idx {
+            if let Some(id) = nav_activate {
+                self.activate_nav_preset(id);
+            }
+            if let Some(idx) = bank_activate {
                 self.activate_preset(idx);
             }
         }
@@ -1725,9 +1815,10 @@ impl eframe::App for RiffLabApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let tabs = [
+                            (BottomTab::Presets, "Presets"),
+                            (BottomTab::Effects, "Effects"),
                             (BottomTab::PianoRoll, "Piano Roll"),
                             (BottomTab::Accuracy, "Accuracy"),
-                            (BottomTab::Effects, "Effects"),
                         ];
                         for (tab, label) in &tabs {
                             let active = self.active_tab == *tab;
@@ -1774,6 +1865,49 @@ impl eframe::App for RiffLabApp {
 
                     // Tab content
                     match self.active_tab {
+                        BottomTab::Presets => {
+                            let action = preset_graph::draw_preset_graph(
+                                ui, &mut self.preset_nav, &mut self.midi_learn,
+                            );
+                            match action {
+                                preset_graph::PresetGraphAction::ActivatePreset(id) => {
+                                    self.activate_nav_preset(id);
+                                }
+                                preset_graph::PresetGraphAction::EditPreset(id) => {
+                                    self.editing_preset_id = Some(id);
+                                    self.activate_nav_preset(id);
+                                    self.active_tab = BottomTab::Effects;
+                                }
+                                preset_graph::PresetGraphAction::Save => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Preset Graph", &["json"])
+                                        .set_file_name("presets.json")
+                                        .save_file()
+                                    {
+                                        if let Err(e) = preset_graph::save_preset_graph(&path, &self.preset_nav) {
+                                            self.message_log.push(format!("Save failed: {e}"), true);
+                                        } else {
+                                            self.message_log.push(format!("Presets saved to {}", path.display()), false);
+                                        }
+                                    }
+                                }
+                                preset_graph::PresetGraphAction::Load => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Preset Graph", &["json"])
+                                        .pick_file()
+                                    {
+                                        match preset_graph::load_preset_graph(&path) {
+                                            Ok(g) => {
+                                                self.preset_nav = g;
+                                                self.message_log.push(format!("Presets loaded from {}", path.display()), false);
+                                            }
+                                            Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                        }
+                                    }
+                                }
+                                preset_graph::PresetGraphAction::None => {}
+                            }
+                        }
                         BottomTab::PianoRoll => {
                             draw_piano_roll(
                                 ui,
@@ -1862,6 +1996,13 @@ impl eframe::App for RiffLabApp {
                                     self.compile_graph_if_changed();
                                 }
                                 node_editor::GraphAction::None => {}
+                            }
+                            // Save current pipeline back to the editing preset node
+                            if let Some(edit_id) = self.editing_preset_id {
+                                if let Some(node) = self.preset_nav.find_node_mut(edit_id) {
+                                    node.pipeline = self.fx_graph.clone();
+                                    node.pipeline.save_params_from_cache(&self.node_editor_state.param_cache);
+                                }
                             }
                         }
                     }
@@ -4211,6 +4352,20 @@ impl RiffLabApp {
             Err(e) => {
                 self.message_log.push(format!("Open session failed: {e}"), true);
             }
+        }
+    }
+
+    /// Activate a preset from the navigation graph.
+    fn activate_nav_preset(&mut self, id: u64) {
+        let pipeline = self.preset_nav.find_node(id).map(|n| (n.pipeline.clone(), n.name.clone()));
+        if let Some((graph, name)) = pipeline {
+            self.fx_graph = graph;
+            self.fx_graph.load_params_to_cache(&mut self.node_editor_state.param_cache);
+            self.fx_graph_compiled_hash = 0;
+            self.compile_graph_if_changed();
+            self.preset_nav.active_id = Some(id);
+            self.editing_preset_id = Some(id);
+            self.message_log.push(format!("Preset: {}", name), false);
         }
     }
 
