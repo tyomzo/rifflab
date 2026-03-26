@@ -1276,6 +1276,9 @@ impl eframe::App for RiffLabApp {
                             midi_input::MidiEvent::NoteOn { channel, note, .. } => {
                                 Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
                             }
+                            midi_input::MidiEvent::ProgramChange { channel, program } => {
+                                Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
+                            }
                             _ => None,
                         };
                         if let Some(b) = binding {
@@ -1309,12 +1312,7 @@ impl eframe::App for RiffLabApp {
                     }
                     // 2. Next/Prev navigation
                     else if let Some(ref next_bind) = self.preset_nav.midi_next {
-                        let matches = match &event {
-                            midi_input::MidiEvent::ControlChange { channel, cc, value } => *value > 0 && next_bind.matches_cc(*channel, *cc),
-                            midi_input::MidiEvent::NoteOn { channel, note, .. } => next_bind.matches_note(*channel, *note),
-                            _ => false,
-                        };
-                        if matches {
+                        if next_bind.matches_event(&event) {
                             if let Some(active) = self.preset_nav.active_id {
                                 if let Some(next_id) = self.preset_nav.next_from(active) {
                                     nav_activate = Some(next_id);
@@ -1324,12 +1322,7 @@ impl eframe::App for RiffLabApp {
                     }
                     if nav_activate.is_none() {
                         if let Some(ref prev_bind) = self.preset_nav.midi_prev {
-                            let matches = match &event {
-                                midi_input::MidiEvent::ControlChange { channel, cc, value } => *value > 0 && prev_bind.matches_cc(*channel, *cc),
-                                midi_input::MidiEvent::NoteOn { channel, note, .. } => prev_bind.matches_note(*channel, *note),
-                                _ => false,
-                            };
-                            if matches {
+                            if prev_bind.matches_event(&event) {
                                 if let Some(active) = self.preset_nav.active_id {
                                     if let Some(prev_id) = self.preset_nav.prev_from(active) {
                                         nav_activate = Some(prev_id);

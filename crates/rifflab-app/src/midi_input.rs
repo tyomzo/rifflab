@@ -8,6 +8,7 @@ pub enum MidiEvent {
     ControlChange { channel: u8, cc: u8, value: u8 },
     NoteOn { channel: u8, note: u8, velocity: u8 },
     NoteOff { channel: u8, note: u8 },
+    ProgramChange { channel: u8, program: u8 },
 }
 
 /// List available MIDI input port names.
@@ -51,38 +52,30 @@ pub fn connect(port_index: usize) -> Result<(MidiConnection, mpsc::Receiver<Midi
         port,
         "rifflab-input",
         move |_timestamp, message, _| {
-            if message.len() >= 3 {
+            if message.len() >= 2 {
                 let status = message[0] & 0xF0;
                 let channel = message[0] & 0x0F;
                 match status {
-                    0xB0 => {
-                        // Control Change
+                    0xB0 if message.len() >= 3 => {
                         let _ = tx.send(MidiEvent::ControlChange {
-                            channel,
-                            cc: message[1],
-                            value: message[2],
+                            channel, cc: message[1], value: message[2],
                         });
                     }
-                    0x90 => {
-                        // Note On (velocity 0 = note off)
+                    0x90 if message.len() >= 3 => {
                         if message[2] > 0 {
                             let _ = tx.send(MidiEvent::NoteOn {
-                                channel,
-                                note: message[1],
-                                velocity: message[2],
+                                channel, note: message[1], velocity: message[2],
                             });
                         } else {
-                            let _ = tx.send(MidiEvent::NoteOff {
-                                channel,
-                                note: message[1],
-                            });
+                            let _ = tx.send(MidiEvent::NoteOff { channel, note: message[1] });
                         }
                     }
-                    0x80 => {
-                        // Note Off
-                        let _ = tx.send(MidiEvent::NoteOff {
-                            channel,
-                            note: message[1],
+                    0x80 if message.len() >= 3 => {
+                        let _ = tx.send(MidiEvent::NoteOff { channel, note: message[1] });
+                    }
+                    0xC0 => {
+                        let _ = tx.send(MidiEvent::ProgramChange {
+                            channel, program: message[1],
                         });
                     }
                     _ => {}

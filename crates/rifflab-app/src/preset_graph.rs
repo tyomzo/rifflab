@@ -13,6 +13,7 @@ const PORT_RADIUS: f32 = 5.0;
 pub enum MidiBinding {
     ControlChange { channel: u8, cc: u8 },
     NoteOn { channel: u8, note: u8 },
+    ProgramChange { channel: u8, program: u8 },
 }
 
 impl MidiBinding {
@@ -20,15 +21,23 @@ impl MidiBinding {
         match self {
             Self::ControlChange { cc, .. } => format!("CC#{}", cc),
             Self::NoteOn { note, .. } => format!("Note {}", note),
+            Self::ProgramChange { program, .. } => format!("PC#{}", program),
         }
     }
 
-    pub fn matches_cc(&self, channel: u8, cc: u8) -> bool {
-        matches!(self, Self::ControlChange { channel: ch, cc: c } if *ch == channel && *c == cc)
-    }
-
-    pub fn matches_note(&self, channel: u8, note: u8) -> bool {
-        matches!(self, Self::NoteOn { channel: ch, note: n } if *ch == channel && *n == note)
+    pub fn matches_event(&self, event: &crate::midi_input::MidiEvent) -> bool {
+        match (self, event) {
+            (Self::ControlChange { channel: ch, cc: c }, crate::midi_input::MidiEvent::ControlChange { channel, cc, value }) => {
+                *value > 0 && ch == channel && c == cc
+            }
+            (Self::NoteOn { channel: ch, note: n }, crate::midi_input::MidiEvent::NoteOn { channel, note, .. }) => {
+                ch == channel && n == note
+            }
+            (Self::ProgramChange { channel: ch, program: p }, crate::midi_input::MidiEvent::ProgramChange { channel, program }) => {
+                ch == channel && p == program
+            }
+            _ => false,
+        }
     }
 }
 
@@ -130,18 +139,8 @@ impl PresetGraph {
     pub fn find_by_midi(&self, event: &crate::midi_input::MidiEvent) -> Option<u64> {
         for node in &self.nodes {
             if let Some(ref binding) = node.midi_binding {
-                match event {
-                    crate::midi_input::MidiEvent::ControlChange { channel, cc, value } => {
-                        if *value > 0 && binding.matches_cc(*channel, *cc) {
-                            return Some(node.id);
-                        }
-                    }
-                    crate::midi_input::MidiEvent::NoteOn { channel, note, .. } => {
-                        if binding.matches_note(*channel, *note) {
-                            return Some(node.id);
-                        }
-                    }
-                    _ => {}
+                if binding.matches_event(event) {
+                    return Some(node.id);
                 }
             }
         }
