@@ -15,6 +15,7 @@ pub struct AlsaBackend {
 }
 
 /// Wrapper to make cpal::Stream Send.
+#[allow(dead_code)]
 struct SendStream(cpal::Stream);
 unsafe impl Send for SendStream {}
 

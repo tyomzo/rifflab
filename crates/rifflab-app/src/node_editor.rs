@@ -1,7 +1,7 @@
 //! Node-graph effects editor: draggable effect nodes connected by cables.
 
 use eframe::egui;
-use rifflab_core::audio::{EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
+use rifflab_core::audio::{ParamDescriptor, ParamId, ParamKind};
 use serde::{Deserialize, Serialize};
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
@@ -148,6 +148,7 @@ impl FxGraph {
         self.cables.push(Cable { from, to });
     }
 
+        #[allow(dead_code)]
     pub fn remove_cables_to(&mut self, port: PortId) {
         self.cables.retain(|c| c.to != port);
     }
@@ -195,6 +196,7 @@ pub struct NodeEditorState {
     /// Currently selected port (for delete key).
     pub selected_port: Option<PortId>,
     /// Canvas is being panned.
+        #[allow(dead_code)]
     pub panning: bool,
     /// Local parameter value cache — holds slider values between frames
     /// so they don't jump back when snapshots are stale or missing.
@@ -507,7 +509,7 @@ pub fn draw_node_editor(
                 );
                 if canvas_rect.intersects(params_rect) {
                     let node_id = node.id;
-                    ui.allocate_ui_at_rect(params_rect, |ui| {
+                    ui.allocate_new_ui(params_rect, |ui| {
                         ui.set_clip_rect(canvas_rect);
                         let param_width = NODE_WIDTH - 24.0;
                         for (desc, val) in &params {
@@ -708,7 +710,7 @@ pub fn draw_node_editor(
         ui.separator();
 
         if ui.button("Crossover Split").clicked() {
-            let id = graph.add_node(
+            let _id = graph.add_node(
                 NodeKind::CrossoverSplit { low_mid_hz: 250.0, mid_high_hz: 2500.0 },
                 "Crossover".into(),
                 click_pos,
@@ -833,7 +835,7 @@ impl FxGraph {
             };
 
             // Collect effects before the split
-            let pre_split: Vec<String> = chain[..split_idx].iter()
+            let _pre_split: Vec<String> = chain[..split_idx].iter()
                 .filter_map(|id| match &self.find_node(*id)?.kind {
                     NodeKind::Effect { type_id } => Some(type_id.clone()),
                     _ => None,
@@ -841,7 +843,7 @@ impl FxGraph {
                 .collect();
 
             // Trace each band output from the split node
-            let band_labels = ["Low", "Mid", "High"];
+            let _band_labels = ["Low", "Mid", "High"];
             let mut band_chains: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
             let mut gains = [0.0f32; 3];
 

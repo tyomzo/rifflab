@@ -304,7 +304,7 @@ impl AudioProcessor for Multiband {
 
         // Process each band
         let sr = self.sample_rate;
-        let bands: [(&mut [f32], BandMode, f32, f32); 3] = [
+        let _bands: [(&mut [f32], BandMode, f32, f32); 3] = [
             (&mut self.buf_low[..len], self.band_mode[0], self.band_amount[0], self.band_gain_db[0]),
             (&mut self.buf_mid[..len], self.band_mode[1], self.band_amount[1], self.band_gain_db[1]),
             (&mut self.buf_high[..len], self.band_mode[2], self.band_amount[2], self.band_gain_db[2]),

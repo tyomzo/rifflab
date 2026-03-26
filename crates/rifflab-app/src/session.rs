@@ -153,6 +153,7 @@ pub struct LoadedSession {
     pub effects_preset: Option<EffectPreset>,
     pub cue_list: Option<rifflab_cue::CueList>,
     pub fx_graph: Option<crate::node_editor::FxGraph>,
+    #[allow(dead_code)]
     pub session_dir: PathBuf,
 }
 

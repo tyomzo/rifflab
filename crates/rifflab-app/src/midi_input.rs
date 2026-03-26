@@ -4,6 +4,7 @@ use std::sync::mpsc;
 
 /// A MIDI event received from an external controller.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum MidiEvent {
     ControlChange { channel: u8, cc: u8, value: u8 },
     NoteOn { channel: u8, note: u8, velocity: u8 },

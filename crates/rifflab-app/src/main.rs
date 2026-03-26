@@ -15,7 +15,7 @@ use rifflab_audio::backend::{self, DeviceInfo};
 use rifflab_audio::engine::AudioEngine;
 use rifflab_audio::graph::node::StemPlayer;
 use rifflab_core::analysis::{NoteEvent, PitchFrame};
-use rifflab_core::audio::{EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
+use rifflab_core::audio::{ParamDescriptor, ParamId, ParamKind};
 use rifflab_core::metering::MeterData;
 use rifflab_core::practice::AccuracyBucket;
 use rifflab_core::song::StemType;
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // 2. Init library (creates ~/.local/share/rifflab/ tree)
-    let library = match Library::init() {
+    let _library = match Library::init() {
         Ok(lib) => {
             log::info!("Library root: {}", lib.root.display());
             Some(lib)
@@ -276,6 +276,7 @@ struct LoopDragState {
 // ─── Bottom Drawer Types ─────────────────────────────────────────────────────
 
 /// Cached snapshot of multiband router state.
+#[allow(dead_code)]
 struct MultibandSnapshot {
     crossover_low_mid: f32,
     crossover_mid_high: f32,
@@ -284,6 +285,7 @@ struct MultibandSnapshot {
 }
 
 /// Pre-computed spectrogram for one audio source, with display metadata.
+#[allow(dead_code)]
 struct SpectrogramDisplay {
     data: rifflab_analysis::spectrogram::SpectrogramResult,
     color: egui::Color32,
@@ -309,6 +311,7 @@ enum ArrangementView {
 /// A played note recorded during practice, for piano roll display.
 #[derive(Debug, Clone)]
 /// Cached snapshot of a single effect's state for the UI.
+#[allow(dead_code)]
 struct FxSnapCached {
     name: String,
     type_id: String,
@@ -663,19 +666,19 @@ struct RiffLabApp {
     sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32)>,
     /// Effect registry for creating new effects.
     fx_registry: EffectRegistry,
-    /// Whether the "Add Effect" dropdown is open.
+    #[allow(dead_code)]
     fx_add_open: bool,
-    /// Cached effects snapshot to avoid locking every frame.
+    #[allow(dead_code)]
     fx_snapshot: Vec<FxSnapCached>,
-    /// Cached multiband snapshot.
+    #[allow(dead_code)]
     fx_mb_snapshot: Option<MultibandSnapshot>,
-    /// Whether multiband mode is active in UI.
+    #[allow(dead_code)]
     fx_multiband_mode: bool,
     /// When the effects snapshot was last refreshed.
     fx_snapshot_time: std::time::Instant,
     /// Force refresh on next frame (after add/remove/reorder).
     fx_snapshot_dirty: bool,
-    /// Current preset file path (None = never saved).
+    #[allow(dead_code)]
     fx_preset_path: Option<std::path::PathBuf>,
     /// Current preset name (shown in UI).
     fx_preset_name: String,
@@ -3346,7 +3349,7 @@ impl RiffLabApp {
 
         // Extract the ordered node IDs of effect nodes from the route
         let effect_node_ids: Vec<u64> = match &route {
-            node_editor::CompiledRoute::SingleChain(type_ids) => {
+            node_editor::CompiledRoute::SingleChain(_type_ids) => {
                 // Find effect nodes in cable-traversal order by matching type_ids
                 let mut ids = Vec::new();
                 let input_node = self.fx_graph.nodes.iter().find(|n| matches!(n.kind, node_editor::NodeKind::Input));
@@ -3511,6 +3514,7 @@ impl RiffLabApp {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn draw_multiband_rack(
         &mut self,
         ui: &mut egui::Ui,
@@ -3715,6 +3719,7 @@ impl RiffLabApp {
         });
     }
 
+    #[allow(dead_code)]
     fn draw_effects_rack(&mut self, ui: &mut egui::Ui) {
         let graph_arc = self.engine.lock().unwrap().graph().clone();
 
@@ -4071,7 +4076,7 @@ impl RiffLabApp {
                 }
 
                 // Multiband mutations
-                if let Some(ref mb) = graph.fx_multiband.as_mut() {
+                if let Some(_mb) = graph.fx_multiband.as_mut() {
                     // handled below
                 }
                 if let Some((band, type_id)) = &mb_add {
@@ -4160,6 +4165,7 @@ impl RiffLabApp {
         }
     }
 
+    #[allow(dead_code)]
     fn save_fx_preset(&self, path: &std::path::Path, graph_arc: &Arc<Mutex<rifflab_audio::graph::AudioGraph>>) {
         if let Ok(graph) = graph_arc.try_lock() {
             let preset = graph.fx_chain.to_preset(&self.fx_preset_name);
@@ -4170,6 +4176,7 @@ impl RiffLabApp {
         }
     }
 
+    #[allow(dead_code)]
     fn load_fx_preset(&mut self, path: &std::path::Path, graph_arc: &Arc<Mutex<rifflab_audio::graph::AudioGraph>>) {
         match rifflab_fx::preset::load_preset(path) {
             Ok(preset) => {

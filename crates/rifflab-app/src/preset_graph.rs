@@ -242,7 +242,9 @@ pub fn draw_preset_graph(
     let mut wire_drag_start: Option<u64> = None;
     let mut remove_node_id: Option<u64> = None;
     let mut load_pipeline_for: Option<u64> = None;
+    #[allow(static_mut_refs)]
     static mut DRAGGING_NODE: Option<(u64, egui::Vec2)> = None;
+    #[allow(static_mut_refs)]
     static mut DRAGGING_WIRE: Option<u64> = None;
 
     for node in &graph.nodes {
@@ -287,7 +289,7 @@ pub fn draw_preset_graph(
             let binding_label = if is_learning { "[press key...]".to_string() }
                 else { node.midi_binding.as_ref().map(|b| b.label()).unwrap_or_else(|| "Learn MIDI".into()) };
 
-            ui.allocate_ui_at_rect(buttons_rect, |ui| {
+            ui.allocate_new_ui(buttons_rect, |ui| {
                 ui.set_clip_rect(rect);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
@@ -445,7 +447,7 @@ pub fn draw_preset_graph(
                 if nr.contains(pointer) {
                     ui.separator();
                     if ui.button(format!("Delete '{}'", node.name)).clicked() {
-                        let id = node.id;
+                        let _id = node.id;
                         // Deferred — can't modify while iterating
                         // Will handle outside
                         ui.close_menu();

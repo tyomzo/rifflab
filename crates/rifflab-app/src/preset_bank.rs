@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[derive(Clone)]
 pub struct PresetSlot {
     pub name: String,
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub graph: FxGraph,
     /// MIDI CC number that activates this preset (default: 80, 81, 82...).
@@ -75,6 +76,7 @@ impl PresetBank {
         self.presets.is_empty()
     }
 
+        #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.presets.len()
     }

@@ -40,6 +40,7 @@ pub struct ImportResult {
 /// 6. Try beat tracking (skipped in Phase 1).
 /// 7. Run offline note transcription (pure Rust: YIN + onset detection).
 /// 8. Return ImportResult with all data needed to load into the engine.
+#[allow(dead_code)]
 pub fn import_song(
     path: &Path,
     library: &Library,
@@ -128,12 +129,14 @@ pub fn import_song(
 ///
 /// Downmixes to mono before running YIN pitch detection + onset detection.
 /// This is CPU-intensive — run in a background thread for large files.
+#[allow(dead_code)]
 pub fn run_transcription(data: &[f32], channels: u16, sample_rate: u32) -> Vec<NoteEvent> {
     let mono = downmix_to_mono(data, channels);
     rifflab_analysis::transcribe::transcribe_notes(&mono, sample_rate)
 }
 
 /// Downmix interleaved multi-channel audio to mono by averaging channels.
+#[allow(dead_code)]
 fn downmix_to_mono(data: &[f32], channels: u16) -> Vec<f32> {
     let ch = channels.max(1) as usize;
     if ch == 1 {
@@ -153,6 +156,7 @@ fn downmix_to_mono(data: &[f32], channels: u16) -> Vec<f32> {
 
 /// Song metadata persisted alongside the audio in the library.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 struct SongMetadata {
     original_file: String,
     original_name: String,

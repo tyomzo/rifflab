@@ -2,7 +2,7 @@ use crate::chain::EffectChain;
 use crate::effects::multiband::LR4Crossover;
 use crate::registry::EffectRegistry;
 use rifflab_core::audio::AudioProcessor;
-use rifflab_core::preset::{EffectPreset, EffectState, ParamValue};
+use rifflab_core::preset::{EffectPreset, EffectState};
 use serde::{Deserialize, Serialize};
 
 const MAX_BUF: usize = 4096;
