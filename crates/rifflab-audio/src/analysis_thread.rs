@@ -78,7 +78,10 @@ fn analysis_loop(
 ) {
     let mut current_rate = sample_rate.load(Ordering::Relaxed);
     let mut detector = YinDetector::new(current_rate);
-    let hop_size = 1024;
+    // Hop size must be large enough to contain at least one full period of the lowest
+    // detectable frequency. For 30Hz at 44100Hz, period = 1470 samples.
+    // Use 2048 to ensure at least one full cycle per hop for bass instruments.
+    let hop_size = 2048;
     let mut buf = vec![0.0f32; hop_size];
 
     while !stop.load(Ordering::Relaxed) {
