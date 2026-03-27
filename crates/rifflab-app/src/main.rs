@@ -725,6 +725,10 @@ struct RiffLabApp {
     editing_preset_id: Option<u64>,
     /// Whether we are currently recording input.
     is_recording: bool,
+    /// Per-track FxGraph (for editing in the node editor). Index = track index.
+    stem_graphs: Vec<Option<node_editor::FxGraph>>,
+    /// Which track's FX is being edited (None = live input, Some(idx) = track).
+    editing_track_fx: Option<usize>,
 }
 
 impl RiffLabApp {
@@ -836,6 +840,8 @@ impl RiffLabApp {
             midi_learn: preset_graph::MidiLearnTarget::None,
             editing_preset_id: None,
             is_recording: false,
+            stem_graphs: Vec::new(),
+            editing_track_fx: None,
         }
     }
 
@@ -1965,6 +1971,28 @@ impl eframe::App for RiffLabApp {
                             });
                         }
                         BottomTab::Effects => {
+                            // Show which context is being edited
+                            if let Some(track_idx) = self.editing_track_fx {
+                                ui.horizontal(|ui| {
+                                    let track_name = self.waveform_overviews.get(track_idx)
+                                        .map(|o| o.name.as_str()).unwrap_or("Track");
+                                    ui.colored_label(egui::Color32::from_rgb(100, 200, 140),
+                                        egui::RichText::new(format!("Editing: {} (Track {})", track_name, track_idx + 1)).size(11.0));
+                                    if ui.small_button("Done").clicked() {
+                                        self.save_track_fx_from_editor(track_idx);
+                                        self.editing_track_fx = None;
+                                    }
+                                    if ui.small_button("Back to Live").clicked() {
+                                        self.save_track_fx_from_editor(track_idx);
+                                        self.editing_track_fx = None;
+                                        // Restore live input graph
+                                        self.fx_graph_compiled_hash = 0;
+                                        self.compile_graph_if_changed();
+                                    }
+                                });
+                                ui.separator();
+                            }
+
                             // Compile graph FIRST so chain matches nodes
                             self.compile_graph_if_changed();
                             let effects_list = self.fx_registry.list_effects();
@@ -2038,6 +2066,13 @@ impl eframe::App for RiffLabApp {
                                 if let Some(node) = self.preset_nav.find_node_mut(edit_id) {
                                     node.pipeline = self.fx_graph.clone();
                                     node.pipeline.save_params_from_cache(&self.node_editor_state.param_cache);
+                                }
+                            }
+                            // Also save to track FX if editing a track
+                            if let Some(track_idx) = self.editing_track_fx {
+                                if !changes.is_empty() {
+                                    // Recompile track FX from the current graph
+                                    self.save_track_fx_from_editor(track_idx);
                                 }
                             }
                         }
@@ -2185,11 +2220,29 @@ impl eframe::App for RiffLabApp {
                             if track_has_fx {
                                 ui.colored_label(egui::Color32::from_rgb(80, 200, 120),
                                     egui::RichText::new("FX").size(9.0));
+                                let is_editing = self.editing_track_fx == Some(i);
+                                let edit_label = if is_editing { "Editing" } else { "Edit" };
+                                if ui.small_button(edit_label).clicked() {
+                                    if is_editing {
+                                        // Stop editing: save graph back and recompile
+                                        self.save_track_fx_from_editor(i);
+                                        self.editing_track_fx = None;
+                                    } else {
+                                        // Start editing: load graph into editor
+                                        self.start_editing_track_fx(i);
+                                    }
+                                }
                                 if ui.small_button("Clear").clicked() {
                                     if let Ok(mut g) = graph_arc.try_lock() {
                                         if let Some(fx) = g.stem_fx.get_mut(i) {
                                             *fx = None;
                                         }
+                                    }
+                                    if let Some(sg) = self.stem_graphs.get_mut(i) {
+                                        *sg = None;
+                                    }
+                                    if self.editing_track_fx == Some(i) {
+                                        self.editing_track_fx = None;
                                     }
                                 }
                             } else {
@@ -4424,6 +4477,70 @@ impl RiffLabApp {
         }
     }
 
+    /// Start editing a track's effects in the node editor.
+    fn start_editing_track_fx(&mut self, track_idx: usize) {
+        if let Some(Some(graph)) = self.stem_graphs.get(track_idx) {
+            self.fx_graph = graph.clone();
+            self.fx_graph.load_params_to_cache(&mut self.node_editor_state.param_cache);
+            self.fx_graph_compiled_hash = 0;
+            self.editing_track_fx = Some(track_idx);
+            self.active_tab = BottomTab::Effects;
+            self.message_log.push(format!("Editing FX for track {}", track_idx + 1), false);
+        }
+    }
+
+    /// Save the current node editor state back to the track's FX.
+    fn save_track_fx_from_editor(&mut self, track_idx: usize) {
+        // Save the current graph back
+        self.fx_graph.save_params_from_cache(&self.node_editor_state.param_cache);
+
+        while self.stem_graphs.len() <= track_idx {
+            self.stem_graphs.push(None);
+        }
+        self.stem_graphs[track_idx] = Some(self.fx_graph.clone());
+
+        // Recompile to EffectChain
+        let route = self.fx_graph.compile();
+        let type_ids = match route {
+            node_editor::CompiledRoute::SingleChain(ids) => ids,
+            _ => Vec::new(),
+        };
+
+        let mut chain = rifflab_fx::chain::EffectChain::new();
+        let effect_nodes: Vec<u64> = {
+            let input = self.fx_graph.nodes.iter().find(|n| matches!(n.kind, node_editor::NodeKind::Input));
+            if let Some(inp) = input {
+                let start = node_editor::PortId { node_id: inp.id, index: 0, is_output: true };
+                self.fx_graph.trace_chain(start).into_iter()
+                    .filter(|id| self.fx_graph.find_node(*id).map_or(false, |n| matches!(n.kind, node_editor::NodeKind::Effect { .. })))
+                    .collect()
+            } else { Vec::new() }
+        };
+
+        for (i, type_id) in type_ids.iter().enumerate() {
+            if let Some(mut effect) = self.fx_registry.create_effect(type_id) {
+                if let Some(&node_id) = effect_nodes.get(i) {
+                    for (&(nid, pid), &val) in &self.node_editor_state.param_cache {
+                        if nid == node_id {
+                            effect.set_param(ParamId(pid), val);
+                        }
+                    }
+                }
+                chain.add(effect);
+            }
+        }
+
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+        if let Ok(mut g) = graph_arc.try_lock() {
+            while g.stem_fx.len() <= track_idx {
+                g.stem_fx.push(None);
+            }
+            g.stem_fx[track_idx] = Some(chain);
+        }
+
+        self.message_log.push(format!("Track {} FX updated", track_idx + 1), false);
+    }
+
     /// Load an effect graph preset onto a specific stem track.
     fn load_track_fx(&mut self, track_idx: usize, path: &std::path::Path) {
         match node_editor::load_graph(path) {
@@ -4461,6 +4578,12 @@ impl RiffLabApp {
                     }
                     g.stem_fx[track_idx] = Some(chain);
                 }
+
+                // Store the graph for editing
+                while self.stem_graphs.len() <= track_idx {
+                    self.stem_graphs.push(None);
+                }
+                self.stem_graphs[track_idx] = Some(graph);
 
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
                 self.message_log.push(format!("Track {}: loaded FX from '{}'", track_idx + 1, name), false);
