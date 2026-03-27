@@ -39,6 +39,12 @@ pub struct AudioGraph {
     mix_buffer: Vec<f32>,
     /// Input processing buffer.
     input_buffer: Vec<f32>,
+    /// Recording state: captures raw input (pre-effects) when armed.
+    pub recording: bool,
+    /// Recorded audio data (interleaved stereo f32). Grows during recording.
+    pub recorded_data: Vec<f32>,
+    /// Number of channels being recorded.
+    pub recorded_channels: u16,
 }
 
 impl AudioGraph {
@@ -59,6 +65,9 @@ impl AudioGraph {
             master_volume: 1.0,
             mix_buffer: vec![0.0; buf_size * 2], // stereo
             input_buffer: vec![0.0; buf_size * 2],
+            recording: false,
+            recorded_data: Vec::new(),
+            recorded_channels: 2,
         }
     }
 
@@ -108,6 +117,12 @@ impl AudioGraph {
 
                 player.fill_buffer(&mut self.mix_buffer[..stereo_frames], frames, volume, context);
             }
+        }
+
+        // Record raw input (pre-effects) when armed
+        if self.recording {
+            let input_len = stereo_frames.min(input.len());
+            self.recorded_data.extend_from_slice(&input[..input_len]);
         }
 
         // Live input monitoring — active when input_volume > 0 AND graph has a connected path

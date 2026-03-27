@@ -723,6 +723,8 @@ struct RiffLabApp {
     midi_learn: preset_graph::MidiLearnTarget,
     /// Which preset is being edited (its pipeline shown in the effect editor).
     editing_preset_id: Option<u64>,
+    /// Whether we are currently recording input.
+    is_recording: bool,
 }
 
 impl RiffLabApp {
@@ -833,6 +835,7 @@ impl RiffLabApp {
             preset_nav: preset_graph::PresetGraph::default(),
             midi_learn: preset_graph::MidiLearnTarget::None,
             editing_preset_id: None,
+            is_recording: false,
         }
     }
 
@@ -1478,6 +1481,16 @@ impl eframe::App for RiffLabApp {
                         }
                     }
 
+                    // Load raw audio (no stem separation)
+                    if ui.small_button("Load Raw").on_hover_text("Load audio without stem separation").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aac", "m4a"])
+                            .pick_file()
+                        {
+                            self.load_raw_audio(&path);
+                        }
+                    }
+
                     // Open session
                     if ui.small_button("Open Session").on_hover_text("Open a saved session").clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -1488,6 +1501,8 @@ impl eframe::App for RiffLabApp {
                     ui.separator();
 
                     // Transport controls
+                    let mut do_stop_rec = false;
+                    let mut do_start_rec = false;
                     {
                         let mut eng = self.engine.lock().unwrap();
 
@@ -1506,8 +1521,28 @@ impl eframe::App for RiffLabApp {
 
                         if ui.button("\u{23F9} Stop").clicked() {
                             eng.transport_mut().stop();
+                            if self.is_recording {
+                                do_stop_rec = true;
+                            }
                         }
-                    }
+
+                        // Record button
+                        let rec_label = if self.is_recording {
+                            egui::RichText::new("\u{23FA} Rec").color(egui::Color32::from_rgb(220, 50, 50))
+                        } else {
+                            egui::RichText::new("\u{23FA} Rec").color(egui::Color32::from_rgb(160, 160, 160))
+                        };
+                        if ui.button(rec_label).clicked() {
+                            if self.is_recording {
+                                do_stop_rec = true;
+                            } else {
+                                do_start_rec = true;
+                            }
+                        }
+                    } // eng dropped
+
+                    if do_stop_rec { self.stop_recording(); }
+                    if do_start_rec { self.start_recording(); }
 
                     ui.separator();
 
@@ -4358,6 +4393,135 @@ impl RiffLabApp {
                 self.message_log.push(format!("Open session failed: {e}"), true);
             }
         }
+    }
+
+    /// Load an audio file as a single track without stem separation.
+    fn load_raw_audio(&mut self, path: &std::path::Path) {
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown").to_string();
+        let target_rate = self.sample_rate;
+        let path_buf = path.to_path_buf();
+
+        self.message_log.push(format!("Loading raw: {}...", file_name), false);
+
+        // Decode on background thread
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = file_name.clone();
+        std::thread::spawn(move || {
+            match decode::decode_file(&path_buf) {
+                Ok(decoded) => {
+                    let decoded = decode::resample(decoded, target_rate);
+                    let _ = tx.send(Ok((name, decoded)));
+                }
+                Err(e) => { let _ = tx.send(Err(format!("{e}"))); }
+            }
+        });
+
+        // Poll in next frames via the existing save_receiver pattern
+        // For simplicity, block briefly (raw files are fast to decode)
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok((name, decoded))) => {
+                let track_idx = self.waveform_overviews.len();
+                let color = TRACK_COLORS[track_idx % TRACK_COLORS.len()];
+
+                let overview = WaveformOverview::from_interleaved(
+                    &decoded.data, decoded.channels, OVERVIEW_SAMPLES_PER_PEAK, color, name.clone(),
+                );
+                let mono = rifflab_analysis::spectrogram::downmix_to_mono(&decoded.data, decoded.channels);
+                let spec = rifflab_analysis::spectrogram::compute_spectrogram(&mono, decoded.sample_rate);
+
+                self.waveform_overviews.push(overview);
+                self.spectrograms.push(SpectrogramDisplay { data: spec, color, name: name.clone() });
+                self.spectrogram_texture = None;
+
+                let graph_arc = self.engine.lock().unwrap().graph().clone();
+                if let Ok(mut graph) = graph_arc.try_lock() {
+                    let player = StemPlayer::new(StemType::Other, decoded.data, decoded.channels);
+                    let total_frames = player.total_frames();
+                    graph.stem_players.push(player);
+                    graph.stem_volumes.push(1.0);
+                    graph.stem_mutes.push(false);
+                    graph.stem_solos.push(false);
+                    self.engine.lock().unwrap().transport().set_length(total_frames);
+                }
+                self.file_name = name;
+                self.sidebar_snapshot = None;
+                self.message_log.push(format!("Loaded: {} ({:.1}s)", self.file_name, decoded.frames as f64 / target_rate as f64), false);
+            }
+            Ok(Err(e)) => self.message_log.push(format!("Load failed: {e}"), true),
+            Err(_) => self.message_log.push("Load timed out".into(), true),
+        }
+    }
+
+    /// Start recording raw input audio.
+    fn start_recording(&mut self) {
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+        if let Ok(mut graph) = graph_arc.try_lock() {
+            graph.recorded_data.clear();
+            graph.recorded_channels = 2;
+            graph.recording = true;
+        }
+        self.is_recording = true;
+        self.message_log.push("Recording started".into(), false);
+        log::info!("Recording started");
+    }
+
+    /// Stop recording and add the recorded audio as a new stem track.
+    fn stop_recording(&mut self) {
+        self.is_recording = false;
+
+        let graph_arc = self.engine.lock().unwrap().graph().clone();
+        let (data, channels, sample_rate) = {
+            let Ok(mut graph) = graph_arc.try_lock() else { return };
+            graph.recording = false;
+            let data = std::mem::take(&mut graph.recorded_data);
+            let ch = graph.recorded_channels;
+            (data, ch, self.sample_rate)
+        };
+
+        if data.is_empty() {
+            self.message_log.push("Recording empty, discarded".into(), false);
+            return;
+        }
+
+        let frames = data.len() as u64 / channels as u64;
+        let duration = frames as f64 / sample_rate as f64;
+        self.message_log.push(format!("Recorded {:.1}s ({} frames)", duration, frames), false);
+        log::info!("Recording stopped: {:.1}s, {}ch, {}Hz", duration, channels, sample_rate);
+
+        // Add as a stem track
+        let track_idx = self.waveform_overviews.len();
+        let color = TRACK_COLORS[track_idx % TRACK_COLORS.len()];
+
+        let overview = WaveformOverview::from_interleaved(
+            &data, channels, OVERVIEW_SAMPLES_PER_PEAK, color, "Recording".to_string(),
+        );
+
+        // Compute spectrogram
+        let mono = rifflab_analysis::spectrogram::downmix_to_mono(&data, channels);
+        let spec = rifflab_analysis::spectrogram::compute_spectrogram(&mono, sample_rate);
+
+        self.waveform_overviews.push(overview);
+        self.spectrograms.push(SpectrogramDisplay { data: spec, color, name: "Recording".into() });
+        self.spectrogram_texture = None; // invalidate cache
+
+        // Add as stem player
+        {
+            let Ok(mut graph) = graph_arc.try_lock() else { return };
+            let player = StemPlayer::new(StemType::Other, data, channels);
+            let total_frames = player.total_frames();
+            graph.stem_players.push(player);
+            graph.stem_volumes.push(1.0);
+            graph.stem_mutes.push(false);
+            graph.stem_solos.push(false);
+            // Update transport length if this recording is longer
+            let eng = self.engine.lock().unwrap();
+            let current_len = eng.transport().position().frame;
+            if total_frames > current_len {
+                eng.transport().set_length(total_frames);
+            }
+        }
+
+        self.sidebar_snapshot = None; // force refresh
     }
 
     /// Activate a preset from the navigation graph.
