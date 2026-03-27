@@ -6,8 +6,9 @@ pub struct Overdrive {
     tone: f32,          // 0.0–1.0 (low-pass filter cutoff)
     mix: f32,           // 0.0–1.0 (dry/wet)
     shaper: WaveShaperType,
-    /// Simple one-pole low-pass state for tone control.
-    lp_state: f32,
+    /// Per-channel one-pole low-pass state for tone control.
+    lp_state_l: f32,
+    lp_state_r: f32,
     bypassed: bool,
 }
 
@@ -25,7 +26,8 @@ impl Overdrive {
             tone: 0.5,
             mix: 1.0,
             shaper: WaveShaperType::Tanh,
-            lp_state: 0.0,
+            lp_state_l: 0.0,
+            lp_state_r: 0.0,
             bypassed: false,
         }
     }
@@ -56,15 +58,24 @@ impl AudioProcessor for Overdrive {
         let gain = 1.0 + self.drive * 30.0; // Drive range: 1x to 31x
         let tone_coeff = self.tone.clamp(0.01, 0.99);
 
-        for sample in buffer.iter_mut() {
-            let dry = *sample;
-            let driven = self.shape(*sample * gain);
+        // Process interleaved stereo in frame pairs
+        let frames = buffer.len() / 2;
+        for frame in 0..frames {
+            let li = frame * 2;
+            let ri = frame * 2 + 1;
 
-            // One-pole low-pass for tone control
-            self.lp_state += tone_coeff * (driven - self.lp_state);
-            let wet = self.lp_state;
+            let dry_l = buffer[li];
+            let dry_r = buffer[ri];
 
-            *sample = dry * (1.0 - self.mix) + wet * self.mix;
+            let driven_l = self.shape(dry_l * gain);
+            let driven_r = self.shape(dry_r * gain);
+
+            // Per-channel one-pole low-pass for tone control
+            self.lp_state_l += tone_coeff * (driven_l - self.lp_state_l);
+            self.lp_state_r += tone_coeff * (driven_r - self.lp_state_r);
+
+            buffer[li] = dry_l * (1.0 - self.mix) + self.lp_state_l * self.mix;
+            buffer[ri] = dry_r * (1.0 - self.mix) + self.lp_state_r * self.mix;
         }
     }
 
@@ -86,7 +97,8 @@ impl AudioProcessor for Overdrive {
     }
 
     fn reset(&mut self) {
-        self.lp_state = 0.0;
+        self.lp_state_l = 0.0;
+        self.lp_state_r = 0.0;
     }
 
     fn name(&self) -> &str {

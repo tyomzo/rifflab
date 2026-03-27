@@ -1,9 +1,12 @@
 use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
 /// Simple Schroeder reverb with 4 comb filters and 2 allpass filters.
+/// Separate filter state per channel for correct stereo processing.
 pub struct Reverb {
-    comb_filters: [CombFilter; 4],
-    allpass_filters: [AllpassFilter; 2],
+    comb_l: [CombFilter; 4],
+    comb_r: [CombFilter; 4],
+    allpass_l: [AllpassFilter; 2],
+    allpass_r: [AllpassFilter; 2],
     room_size: f32,
     damping: f32,
     wet: f32,
@@ -75,16 +78,28 @@ impl AllpassFilter {
 impl Reverb {
     pub fn new(sample_rate: u32) -> Self {
         let scale = sample_rate as f32 / 44100.0;
+        // Slightly offset R channel delay lengths for stereo width
+        let stereo_spread = 23;
         Self {
-            comb_filters: [
+            comb_l: [
                 CombFilter::new((1116.0 * scale) as usize),
                 CombFilter::new((1188.0 * scale) as usize),
                 CombFilter::new((1277.0 * scale) as usize),
                 CombFilter::new((1356.0 * scale) as usize),
             ],
-            allpass_filters: [
+            comb_r: [
+                CombFilter::new(((1116 + stereo_spread) as f32 * scale) as usize),
+                CombFilter::new(((1188 + stereo_spread) as f32 * scale) as usize),
+                CombFilter::new(((1277 + stereo_spread) as f32 * scale) as usize),
+                CombFilter::new(((1356 + stereo_spread) as f32 * scale) as usize),
+            ],
+            allpass_l: [
                 AllpassFilter::new((556.0 * scale) as usize),
                 AllpassFilter::new((441.0 * scale) as usize),
+            ],
+            allpass_r: [
+                AllpassFilter::new(((556 + stereo_spread) as f32 * scale) as usize),
+                AllpassFilter::new(((441 + stereo_spread) as f32 * scale) as usize),
             ],
             room_size: 0.5,
             damping: 0.3,
@@ -96,7 +111,7 @@ impl Reverb {
 
     fn update_params(&mut self) {
         let feedback = 0.28 + self.room_size * 0.7;
-        for comb in &mut self.comb_filters {
+        for comb in self.comb_l.iter_mut().chain(self.comb_r.iter_mut()) {
             comb.feedback = feedback;
             comb.damp = self.damping;
         }
@@ -107,20 +122,35 @@ impl AudioProcessor for Reverb {
     fn process(&mut self, buffer: &mut [f32], _sample_rate: u32) {
         self.update_params();
 
-        for sample in buffer.iter_mut() {
-            let input = *sample;
-            let mut comb_sum = 0.0;
+        // Process interleaved stereo in frame pairs
+        let frames = buffer.len() / 2;
+        for frame in 0..frames {
+            let li = frame * 2;
+            let ri = frame * 2 + 1;
 
-            for comb in &mut self.comb_filters {
-                comb_sum += comb.process(input);
+            let in_l = buffer[li];
+            let in_r = buffer[ri];
+
+            let mut comb_sum_l = 0.0;
+            let mut comb_sum_r = 0.0;
+            for comb in &mut self.comb_l {
+                comb_sum_l += comb.process(in_l);
+            }
+            for comb in &mut self.comb_r {
+                comb_sum_r += comb.process(in_r);
             }
 
-            let mut output = comb_sum;
-            for ap in &mut self.allpass_filters {
-                output = ap.process(output);
+            let mut out_l = comb_sum_l;
+            let mut out_r = comb_sum_r;
+            for ap in &mut self.allpass_l {
+                out_l = ap.process(out_l);
+            }
+            for ap in &mut self.allpass_r {
+                out_r = ap.process(out_r);
             }
 
-            *sample = input * self.dry + output * self.wet;
+            buffer[li] = in_l * self.dry + out_l * self.wet;
+            buffer[ri] = in_r * self.dry + out_r * self.wet;
         }
     }
 
@@ -135,10 +165,10 @@ impl AudioProcessor for Reverb {
     }
 
     fn reset(&mut self) {
-        for comb in &mut self.comb_filters {
+        for comb in self.comb_l.iter_mut().chain(self.comb_r.iter_mut()) {
             comb.reset();
         }
-        for ap in &mut self.allpass_filters {
+        for ap in self.allpass_l.iter_mut().chain(self.allpass_r.iter_mut()) {
             ap.reset();
         }
     }

@@ -80,11 +80,22 @@ impl Biquad {
         self.a1 = (-2.0 * cos_w0) / a0;
         self.a2 = (1.0 - alpha / a) / a0;
     }
+
+    /// Copy coefficients from another biquad (but keep own state).
+    fn copy_coefficients_from(&mut self, other: &Biquad) {
+        self.b0 = other.b0;
+        self.b1 = other.b1;
+        self.b2 = other.b2;
+        self.a1 = other.a1;
+        self.a2 = other.a2;
+    }
 }
 
 /// 4-band parametric EQ: low shelf, 2x peaking, high shelf.
+/// Separate biquad state per channel for correct stereo processing.
 pub struct ParametricEq {
-    bands: [Biquad; 4],
+    bands_l: [Biquad; 4],
+    bands_r: [Biquad; 4],
     /// Band parameters: [freq, gain_db, q] per band.
     params: [(f64, f64, f64); 4],
     sample_rate: f64,
@@ -96,7 +107,8 @@ impl ParametricEq {
     pub fn new(sample_rate: u32) -> Self {
         let sr = sample_rate as f64;
         Self {
-            bands: [Biquad::new(), Biquad::new(), Biquad::new(), Biquad::new()],
+            bands_l: [Biquad::new(), Biquad::new(), Biquad::new(), Biquad::new()],
+            bands_r: [Biquad::new(), Biquad::new(), Biquad::new(), Biquad::new()],
             params: [
                 (100.0, 0.0, 0.707),   // Low shelf
                 (500.0, 0.0, 1.0),     // Peaking mid-low
@@ -114,16 +126,21 @@ impl ParametricEq {
             return;
         }
         let (f, g, _q) = self.params[0];
-        self.bands[0].set_low_shelf(f, g, self.sample_rate);
+        self.bands_l[0].set_low_shelf(f, g, self.sample_rate);
 
         let (f, g, q) = self.params[1];
-        self.bands[1].set_peaking(f, g, q, self.sample_rate);
+        self.bands_l[1].set_peaking(f, g, q, self.sample_rate);
 
         let (f, g, q) = self.params[2];
-        self.bands[2].set_peaking(f, g, q, self.sample_rate);
+        self.bands_l[2].set_peaking(f, g, q, self.sample_rate);
 
         let (f, g, _q) = self.params[3];
-        self.bands[3].set_high_shelf(f, g, self.sample_rate);
+        self.bands_l[3].set_high_shelf(f, g, self.sample_rate);
+
+        // Copy coefficients to R channel (same EQ curve, independent state)
+        for i in 0..4 {
+            self.bands_r[i].copy_coefficients_from(&self.bands_l[i]);
+        }
 
         self.dirty = false;
     }
@@ -137,12 +154,24 @@ impl AudioProcessor for ParametricEq {
         }
         self.update_coefficients();
 
-        for sample in buffer.iter_mut() {
-            let mut s = *sample as f64;
-            for band in &mut self.bands {
-                s = band.process_sample(s);
+        // Process interleaved stereo in frame pairs
+        let frames = buffer.len() / 2;
+        for frame in 0..frames {
+            let li = frame * 2;
+            let ri = frame * 2 + 1;
+
+            let mut l = buffer[li] as f64;
+            let mut r = buffer[ri] as f64;
+
+            for band in &mut self.bands_l {
+                l = band.process_sample(l);
             }
-            *sample = s as f32;
+            for band in &mut self.bands_r {
+                r = band.process_sample(r);
+            }
+
+            buffer[li] = l as f32;
+            buffer[ri] = r as f32;
         }
     }
 
@@ -162,7 +191,10 @@ impl AudioProcessor for ParametricEq {
     }
 
     fn reset(&mut self) {
-        for band in &mut self.bands {
+        for band in &mut self.bands_l {
+            band.reset();
+        }
+        for band in &mut self.bands_r {
             band.reset();
         }
     }

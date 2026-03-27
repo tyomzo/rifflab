@@ -80,6 +80,9 @@ impl AudioBackend for AlsaBackend {
     ) -> Result<(), BackendError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
 
+        let requested_rate = config.sample_rate.as_u32();
+        let desired = config.buffer_size.as_usize().max(64);
+
         // On PipeWire, set default source/sink before cpal opens them.
         if !self.output_device_name.is_empty() {
             set_pw_default("sink", &self.output_device_name);
@@ -101,21 +104,24 @@ impl AudioBackend for AlsaBackend {
         let output_supported = output_device
             .default_output_config()
             .map_err(|e| BackendError::Alsa(format!("Output config error: {e}")))?;
+        let out_channels = output_supported.channels() as usize;
 
-        // Try requested sample rate, fall back to device default
-        let requested_rate = config.sample_rate.as_u32();
+        // Try to use the requested rate. If the device doesn't support it,
+        // fall back to the device default. PipeWire's ALSA layer only exposes
+        // rates the hardware actually supports at the current graph rate.
         let out_sample_rate = {
             let requested_sr = cpal::SampleRate(requested_rate);
             let supported = output_device.supported_output_configs()
                 .map(|cfgs| cfgs.into_iter().any(|r| r.min_sample_rate() <= requested_sr && requested_sr <= r.max_sample_rate()))
                 .unwrap_or(false);
-            if supported { requested_rate } else {
+            if supported {
+                requested_rate
+            } else {
                 let fallback = output_supported.sample_rate().0;
-                log::warn!("Requested {}Hz not supported, using {}Hz", requested_rate, fallback);
+                log::warn!("Requested {}Hz not supported by device, using {}Hz", requested_rate, fallback);
                 fallback
             }
         };
-        let out_channels = output_supported.channels() as usize;
 
         self.sample_rate = Some(out_sample_rate);
         self.buffer_size = None;
@@ -126,10 +132,9 @@ impl AudioBackend for AlsaBackend {
         // Input ring buffer: input callback pushes, output callback reads
         let (mut input_tx, mut input_rx) = rifflab_core::rtrb::RingBuffer::<f32>::new(out_sample_rate as usize);
 
-        // Set PipeWire quantum to match desired buffer size, then use Fixed().
-        // This avoids both underruns (Fixed < quantum) and excess latency (Default picks ~5x quantum).
+        // Set PipeWire quantum to match desired buffer size.
+        // Don't force rate — let PipeWire handle rate conversion.
         let pw_quantum = query_pipewire_quantum();
-        let desired = config.buffer_size.as_usize().max(64);
         if pw_quantum > 0 {
             set_pipewire_quantum(desired);
         }
@@ -157,9 +162,31 @@ impl AudioBackend for AlsaBackend {
                     let stereo_samples = frames * 2;
                     buf_size_report.store(frames, Ordering::Relaxed);
 
-                    // Read input from ring buffer
-                    for s in &mut input_buf[..stereo_samples] {
-                        *s = input_rx.pop().unwrap_or(0.0);
+                    // Always drain the ring buffer to keep input/output streams in sync.
+                    // Read what's available, crossfade to silence for the rest.
+                    let available = input_rx.slots();
+                    let to_read = available.min(stereo_samples);
+                    for i in 0..to_read {
+                        input_buf[i] = input_rx.pop().unwrap_or(0.0);
+                    }
+                    if to_read < stereo_samples {
+                        // Underflow: crossfade last valid sample to zero over remaining frames
+                        let last_l = if to_read >= 2 { input_buf[to_read - 2] } else { 0.0 };
+                        let last_r = if to_read >= 1 { input_buf[to_read - 1] } else { 0.0 };
+                        let remaining = stereo_samples - to_read;
+                        let remaining_frames = remaining / 2;
+                        for f in 0..remaining_frames {
+                            let t = 1.0 - (f + 1) as f32 / remaining_frames as f32;
+                            input_buf[to_read + f * 2] = last_l * t;
+                            input_buf[to_read + f * 2 + 1] = last_r * t;
+                        }
+                    } else if available > stereo_samples * 3 {
+                        // Overflow: input is piling up — drain excess to keep streams in sync.
+                        // Keep one buffer ahead for jitter headroom.
+                        let excess = available - stereo_samples * 2;
+                        for _ in 0..excess {
+                            let _ = input_rx.pop();
+                        }
                     }
 
                     // Zero output
@@ -200,6 +227,7 @@ impl AudioBackend for AlsaBackend {
             if let Ok(input_supported) = input_device.default_input_config() {
                 let in_channels = input_supported.channels() as usize;
                 let mut input_config: cpal::StreamConfig = input_supported.into();
+                input_config.sample_rate = cpal::SampleRate(out_sample_rate);
                 input_config.buffer_size = cpal::BufferSize::Fixed(desired as u32);
 
                 log::info!("cpal input: {} ({}ch)", input_device.name().unwrap_or_default(), in_channels);
@@ -312,6 +340,8 @@ fn set_pipewire_quantum(quantum: usize) {
         .args(["-n", "settings", "0", "clock.force-quantum", &quantum.to_string()])
         .status();
 }
+
+
 
 fn extract_pw_value(line: &str) -> Option<usize> {
     line.split("value:'").nth(1)

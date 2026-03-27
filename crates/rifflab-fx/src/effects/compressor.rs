@@ -1,6 +1,6 @@
 use rifflab_core::audio::{AudioProcessor, EffectDescriptor, ParamDescriptor, ParamId, ParamKind};
 
-/// Dynamic range compressor.
+/// Dynamic range compressor with smoothed gain.
 pub struct Compressor {
     threshold: f32,     // dBFS
     ratio: f32,         // e.g., 4.0 = 4:1
@@ -8,6 +8,8 @@ pub struct Compressor {
     release_ms: f32,
     makeup_gain: f32,   // dB
     envelope: f32,
+    /// Smoothed gain value to avoid discontinuities at threshold crossing.
+    smooth_gain: f32,
     bypassed: bool,
 }
 
@@ -20,6 +22,7 @@ impl Compressor {
             release_ms: 50.0,
             makeup_gain: 0.0,
             envelope: 0.0,
+            smooth_gain: 1.0,
             bypassed: false,
         }
     }
@@ -37,9 +40,16 @@ impl AudioProcessor for Compressor {
         let release_coeff = (-1.0 / (self.release_ms * 0.001 * sample_rate as f32)).exp();
         let makeup_linear = 10.0f32.powf(self.makeup_gain / 20.0);
         let threshold_linear = 10.0f32.powf(self.threshold / 20.0);
+        // Gain smoothing: ~2ms time constant avoids discontinuities at threshold crossing
+        let gain_smooth = (-1.0 / (0.002 * sample_rate as f32)).exp();
 
-        for sample in buffer.iter_mut() {
-            let abs = sample.abs();
+        // Process interleaved stereo in frame pairs — single envelope from max(L, R),
+        // same gain applied to both channels.
+        let frames = buffer.len() / 2;
+        for frame in 0..frames {
+            let li = frame * 2;
+            let ri = frame * 2 + 1;
+            let abs = buffer[li].abs().max(buffer[ri].abs());
 
             // Envelope follower
             if abs > self.envelope {
@@ -49,7 +59,7 @@ impl AudioProcessor for Compressor {
             }
 
             // Gain computation
-            let gain = if self.envelope > threshold_linear {
+            let target_gain = if self.envelope > threshold_linear {
                 let over_db = 20.0 * (self.envelope / threshold_linear).log10();
                 let compressed_over = over_db / self.ratio;
                 let gain_reduction = over_db - compressed_over;
@@ -58,7 +68,11 @@ impl AudioProcessor for Compressor {
                 1.0
             };
 
-            *sample *= gain * makeup_linear;
+            // Smooth the gain to avoid clicks at threshold crossing
+            self.smooth_gain = gain_smooth * self.smooth_gain + (1.0 - gain_smooth) * target_gain;
+
+            buffer[li] *= self.smooth_gain * makeup_linear;
+            buffer[ri] *= self.smooth_gain * makeup_linear;
         }
     }
 
@@ -75,6 +89,7 @@ impl AudioProcessor for Compressor {
 
     fn reset(&mut self) {
         self.envelope = 0.0;
+        self.smooth_gain = 1.0;
     }
 
     fn name(&self) -> &str {

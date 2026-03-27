@@ -118,7 +118,21 @@ impl AudioEngine {
         let mut latency_measured = false;
         let latency_threshold = 0.05f32; // detect signal above this
 
+        // Pre-allocate fallback buffer for lock-failure frames (avoids silence→click)
+        let max_buf = self.config.buffer_size.as_usize().max(8192);
+        let mut last_output = vec![0.0f32; max_buf * 2];
+
         let callback: backend::AudioCallback = Box::new(move |input, output, frames| {
+            // Flush denormals to zero — prevents CPU stalls in IIR filters and feedback loops.
+            // Standard practice in all professional audio software.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let mut mxcsr: u32 = 0;
+                std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack, preserves_flags));
+                mxcsr |= 0x8040; // FTZ (bit 15) + DAZ (bit 6)
+                std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack, preserves_flags));
+            }
+
             // 1. Process commands (play/pause/seek) BEFORE reading position
             let is_playing = rt_handle.process_commands(&mut command_rx);
 
@@ -146,9 +160,15 @@ impl AudioEngine {
             }
 
             // 5. Process audio graph (stems + effects + mix + meter — no pitch detection)
+            let stereo = frames * 2;
             if let Ok(mut g) = graph.try_lock() {
                 let meter = g.process(input, output, frames, &context);
                 let _ = meter_tx.push(meter);
+                // Save output for fallback on next lock failure
+                last_output[..stereo].copy_from_slice(&output[..stereo]);
+            } else {
+                // Replay last frame instead of silence — much less audible than a click
+                output[..stereo].copy_from_slice(&last_output[..stereo]);
             }
 
             // 6. Advance position AFTER processing for next buffer

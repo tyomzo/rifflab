@@ -105,6 +105,12 @@ impl PresetGraph {
         id
     }
 
+    /// Add a node with auto-positioned placement.
+    pub fn add_node_with_pipeline(&mut self, name: String, pipeline: FxGraph) -> u64 {
+        let x = 50.0 + self.nodes.len() as f32 * 180.0;
+        self.add_node(name, pipeline, [x, 50.0])
+    }
+
     pub fn remove_node(&mut self, id: u64) {
         self.wires.retain(|w| w.from_id != id && w.to_id != id);
         self.nodes.retain(|n| n.id != id);

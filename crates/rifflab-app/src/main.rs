@@ -563,18 +563,7 @@ impl AudioSettings {
         self.refresh_pipewire();
     }
 
-    /// Get sample rates supported by the currently selected output device.
-    /// Returns empty vec if "system default" is selected (meaning all common rates shown).
-    fn selected_output_sample_rates(&self) -> Vec<u32> {
-        if self.output_device.is_empty() {
-            return Vec::new(); // default device — show all options
-        }
-        self.output_devices
-            .iter()
-            .find(|d| d.name == self.output_device)
-            .map(|d| d.sample_rates.clone())
-            .unwrap_or_default()
-    }
+
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────────
@@ -729,6 +718,8 @@ struct RiffLabApp {
     stem_graphs: Vec<Option<node_editor::FxGraph>>,
     /// Which track's FX is being edited (None = live input, Some(idx) = track).
     editing_track_fx: Option<usize>,
+    /// Throttle: when track FX params changed, defer recompile to avoid locking graph every frame.
+    track_fx_dirty_since: Option<std::time::Instant>,
 }
 
 impl RiffLabApp {
@@ -842,6 +833,7 @@ impl RiffLabApp {
             is_recording: false,
             stem_graphs: Vec::new(),
             editing_track_fx: None,
+            track_fx_dirty_since: None,
         }
     }
 
@@ -1935,15 +1927,28 @@ impl eframe::App for RiffLabApp {
                                 }
                                 preset_graph::PresetGraphAction::Load => {
                                     if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("RiffLab Preset Graph", &["json"])
+                                        .add_filter("RiffLab Preset/Graph", &["json"])
                                         .pick_file()
                                     {
+                                        // Try as PresetGraph first, then as single FxGraph (create a preset node)
                                         match preset_graph::load_preset_graph(&path) {
                                             Ok(g) => {
                                                 self.preset_nav = g;
                                                 self.message_log.push(format!("Presets loaded from {}", path.display()), false);
                                             }
-                                            Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                            Err(_) => {
+                                                // Try as FxGraph — wrap in a new preset node
+                                                match node_editor::load_graph(&path) {
+                                                    Ok(graph) => {
+                                                        let name = path.file_stem()
+                                                            .map(|s| s.to_string_lossy().to_string())
+                                                            .unwrap_or_else(|| "Loaded".into());
+                                                        self.preset_nav.add_node_with_pipeline(name, graph);
+                                                        self.message_log.push(format!("Pipeline loaded as preset from {}", path.display()), false);
+                                                    }
+                                                    Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1981,10 +1986,12 @@ impl eframe::App for RiffLabApp {
                                     if ui.small_button("Done").clicked() {
                                         self.save_track_fx_from_editor(track_idx);
                                         self.editing_track_fx = None;
+                                        self.track_fx_dirty_since = None;
                                     }
                                     if ui.small_button("Back to Live").clicked() {
                                         self.save_track_fx_from_editor(track_idx);
                                         self.editing_track_fx = None;
+                                        self.track_fx_dirty_since = None;
                                         // Restore live input graph
                                         self.fx_graph_compiled_hash = 0;
                                         self.compile_graph_if_changed();
@@ -2068,16 +2075,23 @@ impl eframe::App for RiffLabApp {
                                     node.pipeline.save_params_from_cache(&self.node_editor_state.param_cache);
                                 }
                             }
-                            // Also save to track FX if editing a track
-                            if let Some(track_idx) = self.editing_track_fx {
-                                if !changes.is_empty() {
-                                    // Recompile track FX from the current graph
-                                    self.save_track_fx_from_editor(track_idx);
-                                }
+                            // Mark track FX dirty on param changes (throttled recompile)
+                            if self.editing_track_fx.is_some() && !changes.is_empty() {
+                                self.track_fx_dirty_since = Some(std::time::Instant::now());
                             }
                         }
                     }
                 });
+        }
+
+        // ─── Throttled track FX recompile (200ms after last change) ────────
+        if let Some(dirty_since) = self.track_fx_dirty_since {
+            if dirty_since.elapsed() >= std::time::Duration::from_millis(200) {
+                if let Some(track_idx) = self.editing_track_fx {
+                    self.save_track_fx_from_editor(track_idx);
+                }
+                self.track_fx_dirty_since = None;
+            }
         }
 
         // ─── Sidebar ─────────────────────────────────────────────
@@ -2227,6 +2241,7 @@ impl eframe::App for RiffLabApp {
                                         // Stop editing: save graph back and recompile
                                         self.save_track_fx_from_editor(i);
                                         self.editing_track_fx = None;
+                                        self.track_fx_dirty_since = None;
                                     } else {
                                         // Start editing: load graph into editor
                                         self.start_editing_track_fx(i);
@@ -3149,25 +3164,15 @@ impl RiffLabApp {
 
                     // ── Sample Rate ──
                     ui.label(egui::RichText::new("Sample Rate").strong().color(section_color));
-                    // Filter to rates supported by the selected output device
-                    let available_rates = self.audio_settings.selected_output_sample_rates();
+                    // On PipeWire, we control the rate via pw-metadata so all standard rates
+                    // are available regardless of what cpal reports (it only shows the active rate).
                     ui.horizontal(|ui| {
                         let rates = [44100u32, 48000, 96000];
                         for &rate in &rates {
-                            let supported = available_rates.is_empty()
-                                || available_rates.contains(&rate);
-                            let label = format!("{} Hz", rate);
-                            let mut btn = ui.add_enabled(
-                                supported,
-                                egui::SelectableLabel::new(
-                                    self.audio_settings.sample_rate == rate,
-                                    &label,
-                                ),
-                            );
-                            if !supported {
-                                btn = btn.on_disabled_hover_text("Not supported by selected device");
-                            }
-                            if btn.clicked() {
+                            if ui.selectable_label(
+                                self.audio_settings.sample_rate == rate,
+                                format!("{} Hz", rate),
+                            ).clicked() {
                                 self.audio_settings.sample_rate = rate;
                                 self.audio_settings.dirty = true;
                             }
@@ -3319,6 +3324,17 @@ impl RiffLabApp {
             Ok((meter_rx, pitch_rx)) => {
                 self.meter_rx = meter_rx;
                 self.pitch_rx = pitch_rx;
+                // Check actual hardware rate — may differ from requested
+                if let Some(backend) = eng.backend_ref() {
+                    if let Some(actual_rate) = backend.actual_sample_rate() {
+                        if actual_rate != self.sample_rate {
+                            log::warn!("Requested {}Hz, hardware using {}Hz", self.sample_rate, actual_rate);
+                            self.sample_rate = actual_rate;
+                            self.audio_settings.sample_rate = actual_rate;
+                            self.app_config.audio.sample_rate = actual_rate;
+                        }
+                    }
+                }
                 self.audio_settings.status_msg = format!(
                     "Audio restarted: {}Hz, {} samples",
                     self.sample_rate, self.buffer_size,

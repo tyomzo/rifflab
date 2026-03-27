@@ -49,6 +49,11 @@ pub struct AudioGraph {
     pub recorded_data: Vec<f32>,
     /// Number of channels being recorded.
     pub recorded_channels: u16,
+
+    // ─── Smoothed gain state (avoids clicks on volume/mute changes) ───
+    smooth_master: f32,
+    smooth_input: f32,
+    smooth_stem_gains: Vec<f32>, // effective gain per stem (volume * mute/solo)
 }
 
 impl AudioGraph {
@@ -74,6 +79,9 @@ impl AudioGraph {
             recording: false,
             recorded_data: Vec::new(),
             recorded_channels: 2,
+            smooth_master: 1.0,
+            smooth_input: 1.0,
+            smooth_stem_gains: Vec::new(),
         }
     }
 
@@ -85,6 +93,7 @@ impl AudioGraph {
         self.stem_mutes = vec![false; count];
         self.stem_solos = vec![false; count];
         self.stem_fx = (0..count).map(|_| None).collect();
+        self.smooth_stem_gains = vec![1.0; count];
     }
 
     /// Process one buffer. Reads from `input`, writes to `output`.
@@ -112,30 +121,61 @@ impl AudioGraph {
         if context.is_playing {
             let any_solo = self.stem_solos.iter().any(|&s| s);
 
+            // Ensure smooth_stem_gains has enough entries
+            while self.smooth_stem_gains.len() < self.stem_players.len() {
+                self.smooth_stem_gains.push(0.0);
+            }
+
             for (i, player) in self.stem_players.iter_mut().enumerate() {
                 let muted = self.stem_mutes.get(i).copied().unwrap_or(false);
                 let soloed = self.stem_solos.get(i).copied().unwrap_or(false);
                 let volume = self.stem_volumes.get(i).copied().unwrap_or(1.0);
 
-                if muted || (any_solo && !soloed) {
+                // Target gain: 0 if muted/not-soloed, otherwise volume
+                let target_gain = if muted || (any_solo && !soloed) {
+                    0.0
+                } else {
+                    volume
+                };
+
+                let prev_gain = self.smooth_stem_gains[i];
+
+                // If both previous and target are zero, just advance — no audio to process
+                if prev_gain == 0.0 && target_gain == 0.0 {
                     player.advance(frames);
                     continue;
                 }
 
                 // Check if this stem has per-track effects
-                if self.stem_fx.get(i).and_then(|f| f.as_ref()).map_or(false, |c| !c.is_empty()) {
-                    // Fill into scratch buffer, apply effects, then add to mix
+                let has_fx = self.stem_fx.get(i).and_then(|f| f.as_ref()).map_or(false, |c| !c.is_empty());
+
+                if has_fx {
+                    // Fill into scratch buffer at full volume (gain applied after FX)
                     for s in &mut self.stem_fx_buffer[..stereo_frames] { *s = 0.0; }
-                    player.fill_buffer(&mut self.stem_fx_buffer[..stereo_frames], frames, volume, context);
+                    player.fill_buffer(&mut self.stem_fx_buffer[..stereo_frames], frames, 1.0, context);
                     if let Some(Some(ref mut chain)) = self.stem_fx.get_mut(i) {
                         chain.process(&mut self.stem_fx_buffer[..stereo_frames], context.sample_rate);
                     }
-                    for j in 0..stereo_frames {
-                        self.mix_buffer[j] += self.stem_fx_buffer[j];
+                    // Apply ramped gain and add to mix
+                    for frame in 0..frames {
+                        let t = (frame + 1) as f32 / frames as f32;
+                        let gain = prev_gain + (target_gain - prev_gain) * t;
+                        self.mix_buffer[frame * 2] += self.stem_fx_buffer[frame * 2] * gain;
+                        self.mix_buffer[frame * 2 + 1] += self.stem_fx_buffer[frame * 2 + 1] * gain;
                     }
                 } else {
-                    player.fill_buffer(&mut self.mix_buffer[..stereo_frames], frames, volume, context);
+                    // Fill into scratch buffer at full volume, then ramp-add to mix
+                    for s in &mut self.stem_fx_buffer[..stereo_frames] { *s = 0.0; }
+                    player.fill_buffer(&mut self.stem_fx_buffer[..stereo_frames], frames, 1.0, context);
+                    for frame in 0..frames {
+                        let t = (frame + 1) as f32 / frames as f32;
+                        let gain = prev_gain + (target_gain - prev_gain) * t;
+                        self.mix_buffer[frame * 2] += self.stem_fx_buffer[frame * 2] * gain;
+                        self.mix_buffer[frame * 2 + 1] += self.stem_fx_buffer[frame * 2 + 1] * gain;
+                    }
                 }
+
+                self.smooth_stem_gains[i] = target_gain;
             }
         }
 
@@ -146,7 +186,9 @@ impl AudioGraph {
         }
 
         // Live input monitoring — active when input_volume > 0 AND graph has a connected path
-        if self.input_volume > 0.0 && self.fx_input_connected {
+        let target_input = if self.fx_input_connected { self.input_volume } else { 0.0 };
+
+        if self.smooth_input > 0.0 || target_input > 0.0 {
             self.input_buffer[..stereo_frames].copy_from_slice(&input[..stereo_frames.min(input.len())]);
 
             // Route through either multiband crossover or single chain
@@ -158,15 +200,27 @@ impl AudioGraph {
                 self.fx_chain.process(&mut self.input_buffer[..stereo_frames], context.sample_rate);
             }
 
-            for i in 0..stereo_frames {
-                self.mix_buffer[i] += self.input_buffer[i] * self.input_volume;
+            // Ramp input volume across the buffer
+            let prev_input = self.smooth_input;
+            for frame in 0..frames {
+                let t = (frame + 1) as f32 / frames as f32;
+                let gain = prev_input + (target_input - prev_input) * t;
+                self.mix_buffer[frame * 2] += self.input_buffer[frame * 2] * gain;
+                self.mix_buffer[frame * 2 + 1] += self.input_buffer[frame * 2 + 1] * gain;
             }
+            self.smooth_input = target_input;
         }
 
-        // Apply master volume and write to output
-        for i in 0..stereo_frames.min(output.len()) {
-            output[i] = self.mix_buffer[i] * self.master_volume;
+        // Apply master volume with ramp and write to output
+        let target_master = self.master_volume;
+        let prev_master = self.smooth_master;
+        for frame in 0..frames.min(output.len() / 2) {
+            let t = (frame + 1) as f32 / frames as f32;
+            let gain = prev_master + (target_master - prev_master) * t;
+            output[frame * 2] = self.mix_buffer[frame * 2] * gain;
+            output[frame * 2 + 1] = self.mix_buffer[frame * 2 + 1] * gain;
         }
+        self.smooth_master = target_master;
 
         // Compute metering on master output
         MeterData::from_interleaved(&output[..stereo_frames.min(output.len())])
