@@ -39,6 +39,10 @@ pub struct AudioGraph {
     mix_buffer: Vec<f32>,
     /// Input processing buffer.
     input_buffer: Vec<f32>,
+    /// Per-stem effect chains (same length as stem_players, None = no effects).
+    pub stem_fx: Vec<Option<EffectChain>>,
+    /// Scratch buffer for per-stem effect processing.
+    stem_fx_buffer: Vec<f32>,
     /// Recording state: captures raw input (pre-effects) when armed.
     pub recording: bool,
     /// Recorded audio data (interleaved stereo f32). Grows during recording.
@@ -63,6 +67,8 @@ impl AudioGraph {
             fx_input_connected: true, // default: connected (backward compat)
             input_volume: 1.0,
             master_volume: 1.0,
+            stem_fx: Vec::new(),
+            stem_fx_buffer: vec![0.0; buf_size * 2],
             mix_buffer: vec![0.0; buf_size * 2], // stereo
             input_buffer: vec![0.0; buf_size * 2],
             recording: false,
@@ -78,6 +84,7 @@ impl AudioGraph {
         self.stem_volumes = vec![1.0; count];
         self.stem_mutes = vec![false; count];
         self.stem_solos = vec![false; count];
+        self.stem_fx = (0..count).map(|_| None).collect();
     }
 
     /// Process one buffer. Reads from `input`, writes to `output`.
@@ -115,7 +122,20 @@ impl AudioGraph {
                     continue;
                 }
 
-                player.fill_buffer(&mut self.mix_buffer[..stereo_frames], frames, volume, context);
+                // Check if this stem has per-track effects
+                if self.stem_fx.get(i).and_then(|f| f.as_ref()).map_or(false, |c| !c.is_empty()) {
+                    // Fill into scratch buffer, apply effects, then add to mix
+                    for s in &mut self.stem_fx_buffer[..stereo_frames] { *s = 0.0; }
+                    player.fill_buffer(&mut self.stem_fx_buffer[..stereo_frames], frames, volume, context);
+                    if let Some(Some(ref mut chain)) = self.stem_fx.get_mut(i) {
+                        chain.process(&mut self.stem_fx_buffer[..stereo_frames], context.sample_rate);
+                    }
+                    for j in 0..stereo_frames {
+                        self.mix_buffer[j] += self.stem_fx_buffer[j];
+                    }
+                } else {
+                    player.fill_buffer(&mut self.mix_buffer[..stereo_frames], frames, volume, context);
+                }
             }
         }
 

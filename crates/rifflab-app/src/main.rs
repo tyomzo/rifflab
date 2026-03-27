@@ -662,8 +662,8 @@ struct RiffLabApp {
     /// Scrollable message log for status/errors.
     message_log: MessageLog,
     /// Cached sidebar state to avoid locking every frame.
-    /// (num_stems, solos, mutes, volumes, master_vol, input_vol)
-    sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32)>,
+    /// (num_stems, solos, mutes, volumes, master_vol, input_vol, has_fx)
+    sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32, Vec<bool>)>,
     /// Effect registry for creating new effects.
     fx_registry: EffectRegistry,
     #[allow(dead_code)]
@@ -2049,8 +2049,11 @@ impl eframe::App for RiffLabApp {
         // Snapshot graph state with try_lock — never block the audio thread.
         // If we can't get the lock this frame, use stale data from last frame.
         let graph_arc = self.engine.lock().unwrap().graph().clone();
-        let (num_stems, mut solos, mut mutes, mut volumes, mut master_vol, mut input_vol) = {
+        let (num_stems, mut solos, mut mutes, mut volumes, mut master_vol, mut input_vol, has_fx) = {
             if let Ok(graph) = graph_arc.try_lock() {
+                let hfx: Vec<bool> = graph.stem_fx.iter()
+                    .map(|f| f.as_ref().map_or(false, |c| !c.is_empty()))
+                    .collect();
                 let snap = (
                     graph.stem_players.len(),
                     graph.stem_solos.clone(),
@@ -2058,13 +2061,14 @@ impl eframe::App for RiffLabApp {
                     graph.stem_volumes.clone(),
                     graph.master_volume,
                     graph.input_volume,
+                    hfx,
                 );
-                self.sidebar_snapshot = Some((snap.0, snap.1.clone(), snap.2.clone(), snap.3.clone(), snap.4, snap.5));
+                self.sidebar_snapshot = Some((snap.0, snap.1.clone(), snap.2.clone(), snap.3.clone(), snap.4, snap.5, snap.6.clone()));
                 snap
             } else if let Some(ref snap) = self.sidebar_snapshot {
                 snap.clone()
             } else {
-                (0, Vec::new(), Vec::new(), Vec::new(), 1.0, 1.0)
+                (0, Vec::new(), Vec::new(), Vec::new(), 1.0, 1.0, Vec::new())
             }
         };
 
@@ -2171,6 +2175,31 @@ impl eframe::App for RiffLabApp {
                             if ui.add(slider).changed() {
                                 if let Some(v) = volumes.get_mut(i) {
                                     *v = vol;
+                                }
+                            }
+                        });
+
+                        // Per-track effects
+                        let track_has_fx = has_fx.get(i).copied().unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            if track_has_fx {
+                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120),
+                                    egui::RichText::new("FX").size(9.0));
+                                if ui.small_button("Clear").clicked() {
+                                    if let Ok(mut g) = graph_arc.try_lock() {
+                                        if let Some(fx) = g.stem_fx.get_mut(i) {
+                                            *fx = None;
+                                        }
+                                    }
+                                }
+                            } else {
+                                if ui.small_button("Load FX").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"])
+                                        .pick_file()
+                                    {
+                                        self.load_track_fx(i, &path);
+                                    }
                                 }
                             }
                         });
@@ -3268,12 +3297,12 @@ impl RiffLabApp {
         // Track volumes for opacity
         let track_volumes: Vec<f32> = self.sidebar_snapshot
             .as_ref()
-            .map(|(_, _, _, vols, _, _)| vols.clone())
+            .map(|(_, _, _, vols, _, _, _)| vols.clone())
             .unwrap_or_default();
 
         let vol_hash: u64 = track_volumes.iter()
             .enumerate()
-            .fold(0u64, |h, (i, v)| h.wrapping_add((v.to_bits() as u64).wrapping_mul(i as u64 + 1)));
+            .fold(0u64, |h: u64, (i, v): (usize, &f32)| h.wrapping_add((v.to_bits() as u64).wrapping_mul(i as u64 + 1)));
 
         let cache_key = (
             self.scroll_offset_frames.to_bits(),
@@ -4391,6 +4420,53 @@ impl RiffLabApp {
             }
             Err(e) => {
                 self.message_log.push(format!("Open session failed: {e}"), true);
+            }
+        }
+    }
+
+    /// Load an effect graph preset onto a specific stem track.
+    fn load_track_fx(&mut self, track_idx: usize, path: &std::path::Path) {
+        match node_editor::load_graph(path) {
+            Ok(graph) => {
+                // Compile the graph to get a chain of effect type IDs
+                let route = graph.compile();
+                let type_ids = match route {
+                    node_editor::CompiledRoute::SingleChain(ids) => ids,
+                    _ => Vec::new(),
+                };
+
+                let mut chain = rifflab_fx::chain::EffectChain::new();
+                for type_id in &type_ids {
+                    if let Some(mut effect) = self.fx_registry.create_effect(type_id) {
+                        // Apply saved params from graph nodes
+                        let effect_nodes: Vec<&node_editor::FxNode> = graph.nodes.iter()
+                            .filter(|n| matches!(n.kind, node_editor::NodeKind::Effect { .. }))
+                            .collect();
+                        // Match by position
+                        let chain_idx = chain.len();
+                        if let Some(node) = effect_nodes.get(chain_idx) {
+                            for &(pid, val) in &node.params {
+                                effect.set_param(ParamId(pid), val);
+                            }
+                        }
+                        chain.add(effect);
+                    }
+                }
+
+                let graph_arc = self.engine.lock().unwrap().graph().clone();
+                if let Ok(mut g) = graph_arc.try_lock() {
+                    // Ensure stem_fx is long enough
+                    while g.stem_fx.len() <= track_idx {
+                        g.stem_fx.push(None);
+                    }
+                    g.stem_fx[track_idx] = Some(chain);
+                }
+
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                self.message_log.push(format!("Track {}: loaded FX from '{}'", track_idx + 1, name), false);
+            }
+            Err(e) => {
+                self.message_log.push(format!("Load FX failed: {e}"), true);
             }
         }
     }
