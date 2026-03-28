@@ -16,6 +16,12 @@ pub struct TabViewState {
     pub selected_note: Option<uuid::Uuid>,
     /// Whether to show ASCII text view instead of graphical.
     pub ascii_mode: bool,
+    /// Fret input buffer (for two-digit frets: first digit stored, timeout 500ms).
+    pub fret_input: Option<(u8, std::time::Instant)>,
+    /// Undo stack: snapshots of notes before edits.
+    pub undo_stack: Vec<Vec<TabNote>>,
+    /// Redo stack.
+    pub redo_stack: Vec<Vec<TabNote>>,
 }
 
 impl Default for TabViewState {
@@ -25,6 +31,9 @@ impl Default for TabViewState {
             visible_seconds: 8.0,
             selected_note: None,
             ascii_mode: false,
+            fret_input: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -54,7 +63,7 @@ pub enum TabViewAction {
 /// Draw the scrolling tab view.
 pub fn draw_tab_view(
     ui: &mut egui::Ui,
-    tab: &TabDocument,
+    tab: &mut TabDocument,
     playback_secs: f64,
     is_playing: bool,
     state: &mut TabViewState,
@@ -274,12 +283,134 @@ pub fn draw_tab_view(
         );
     }
 
-    // Click to seek
+    // Click to select note or seek
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if content_rect.contains(pos) {
-                let t = x_to_time(pos.x);
-                action = TabViewAction::Seek(t.max(0.0));
+                // Check if click is near a note
+                let click_time = x_to_time(pos.x);
+                let click_string = {
+                    let mut closest = 0u8;
+                    let mut min_dist = f32::MAX;
+                    for s in 0..4u8 {
+                        let d = (pos.y - string_y(s)).abs();
+                        if d < min_dist { min_dist = d; closest = s; }
+                    }
+                    if min_dist < STRING_SPACING * 0.6 { Some(closest) } else { None }
+                };
+
+                let mut hit_note = None;
+                if let Some(click_s) = click_string {
+                    for note in tab.notes.iter() {
+                        if note.string == click_s && (note.time_secs - click_time).abs() < beat_duration * 0.3 {
+                            hit_note = Some(note.id);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(id) = hit_note {
+                    state.selected_note = Some(id);
+                } else {
+                    state.selected_note = None;
+                    action = TabViewAction::Seek(click_time.max(0.0));
+                }
+            }
+        }
+    }
+
+    // Keyboard editing (when a note is selected)
+    if state.selected_note.is_some() && response.hovered() {
+        let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
+        for event in &events {
+            match event {
+                egui::Event::Key { key: egui::Key::Delete, pressed: true, .. }
+                | egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    if let Some(sel_id) = state.selected_note {
+                        // Undo snapshot
+                        state.undo_stack.push(tab.notes.clone());
+                        state.redo_stack.clear();
+                        tab.notes.retain(|n| n.id != sel_id);
+                        state.selected_note = None;
+                    }
+                }
+                egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } => {
+                    // Tab/Shift+Tab: select next/previous note
+                    if let Some(sel_id) = state.selected_note {
+                        if let Some(idx) = tab.notes.iter().position(|n| n.id == sel_id) {
+                            let new_idx = if modifiers.shift {
+                                idx.saturating_sub(1)
+                            } else {
+                                (idx + 1).min(tab.notes.len().saturating_sub(1))
+                            };
+                            state.selected_note = Some(tab.notes[new_idx].id);
+                        }
+                    }
+                }
+                egui::Event::Text(text) => {
+                    // Type digit to change fret of selected note
+                    if let Some(digit) = text.chars().next().and_then(|c| c.to_digit(10)) {
+                        let digit = digit as u8;
+                        // Two-digit support: if previous digit was typed within 500ms, combine
+                        let fret = if let Some((prev_digit, when)) = state.fret_input.take() {
+                            if when.elapsed() < std::time::Duration::from_millis(500) {
+                                let combined = prev_digit * 10 + digit;
+                                if combined <= 24 { combined } else { digit }
+                            } else {
+                                state.fret_input = Some((digit, std::time::Instant::now()));
+                                return action; // Wait for possible second digit
+                            }
+                        } else {
+                            state.fret_input = Some((digit, std::time::Instant::now()));
+                            return action; // Wait for possible second digit
+                        };
+
+                        if let Some(sel_id) = state.selected_note {
+                            state.undo_stack.push(tab.notes.clone());
+                            state.redo_stack.clear();
+                            if let Some(note) = tab.notes.iter_mut().find(|n| n.id == sel_id) {
+                                note.fret = fret;
+                                note.source = rifflab_tab::model::NoteSource::UserEdit;
+                                note.confidence = 1.0;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply single-digit fret after timeout
+        if let Some((digit, when)) = state.fret_input {
+            if when.elapsed() >= std::time::Duration::from_millis(500) {
+                state.fret_input = None;
+                if let Some(sel_id) = state.selected_note {
+                    state.undo_stack.push(tab.notes.clone());
+                    state.redo_stack.clear();
+                    if let Some(note) = tab.notes.iter_mut().find(|n| n.id == sel_id) {
+                        note.fret = digit;
+                        note.source = rifflab_tab::model::NoteSource::UserEdit;
+                        note.confidence = 1.0;
+                    }
+                }
+            }
+        }
+
+        // Ctrl+Z undo, Ctrl+Shift+Z redo
+        let (undo, redo) = ui.input(|i| {
+            (i.modifiers.ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
+             i.modifiers.ctrl && i.key_pressed(egui::Key::Z) && i.modifiers.shift)
+        });
+        if undo {
+            if let Some(snapshot) = state.undo_stack.pop() {
+                state.redo_stack.push(tab.notes.clone());
+                tab.notes = snapshot;
+            }
+        }
+        if redo {
+            if let Some(snapshot) = state.redo_stack.pop() {
+                state.undo_stack.push(tab.notes.clone());
+                tab.notes = snapshot;
             }
         }
     }

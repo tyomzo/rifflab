@@ -2172,7 +2172,7 @@ impl eframe::App for RiffLabApp {
                             }
                         }
                         BottomTab::Tab => {
-                            if let Some(ref tab) = self.tab_document {
+                            if let Some(ref mut tab) = self.tab_document {
                                 let tab_is_playing = state == TransportState::Playing;
                                 let playback_secs = position_frame as f64 / self.sample_rate.max(1) as f64;
                                 let tab_action = tab_view::draw_tab_view(
