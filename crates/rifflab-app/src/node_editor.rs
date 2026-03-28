@@ -56,6 +56,9 @@ pub struct FxNode {
     /// Saved parameter values: Vec of (param_id, value). Loaded into param_cache on graph load.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<(u32, f32)>,
+    /// MIDI binding for selecting this node (for knob control).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_binding: Option<crate::preset_graph::MidiBinding>,
 }
 
 impl FxNode {
@@ -116,8 +119,8 @@ impl FxGraph {
     pub fn new_default() -> Self {
         Self {
             nodes: vec![
-                FxNode { id: 1, pos: [50.0, 100.0], kind: NodeKind::Input, label: "Input".into(), params: Vec::new() },
-                FxNode { id: 2, pos: [400.0, 100.0], kind: NodeKind::Output, label: "Output".into(), params: Vec::new() },
+                FxNode { id: 1, pos: [50.0, 100.0], kind: NodeKind::Input, label: "Input".into(), params: Vec::new(), midi_binding: None },
+                FxNode { id: 2, pos: [400.0, 100.0], kind: NodeKind::Output, label: "Output".into(), params: Vec::new(), midi_binding: None },
             ],
             cables: vec![
                 Cable {
@@ -133,7 +136,7 @@ impl FxGraph {
     pub fn add_node(&mut self, kind: NodeKind, label: String, pos: [f32; 2]) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.push(FxNode { id, pos, kind, label, params: Vec::new() });
+        self.nodes.push(FxNode { id, pos, kind, label, params: Vec::new(), midi_binding: None });
         id
     }
 
@@ -201,6 +204,8 @@ pub struct NodeEditorState {
     /// Local parameter value cache — holds slider values between frames
     /// so they don't jump back when snapshots are stale or missing.
     pub param_cache: std::collections::HashMap<(u64, u32), f32>, // (node_id, param_id) → value
+    /// Currently selected effect node (for MIDI knob binding).
+    pub selected_node: Option<u64>,
 }
 
 impl Default for NodeEditorState {
@@ -211,6 +216,7 @@ impl Default for NodeEditorState {
             selected_port: None,
             panning: false,
             param_cache: std::collections::HashMap::new(),
+            selected_node: None,
         }
     }
 }
@@ -404,6 +410,10 @@ pub fn draw_node_editor(
 
         // Node body
         painter.rect_filled(node_rect, 4.0, bg);
+        // Selection highlight
+        if state.selected_node == Some(node.id) {
+            painter.rect_stroke(node_rect.expand(2.0), 4.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255)), egui::StrokeKind::Outside);
+        }
         // Header bar
         let header_rect = egui::Rect::from_min_size(
             node_rect.min,
@@ -418,6 +428,16 @@ pub fn draw_node_editor(
             egui::FontId::proportional(11.0),
             egui::Color32::WHITE,
         );
+        // MIDI binding indicator (top-right of header)
+        if let Some(ref binding) = node.midi_binding {
+            painter.text(
+                header_rect.right_top() + egui::vec2(-4.0, 3.0),
+                egui::Align2::RIGHT_TOP,
+                binding.label(),
+                egui::FontId::proportional(8.0),
+                egui::Color32::from_rgb(200, 200, 100),
+            );
+        }
 
         // Border
         painter.rect_stroke(node_rect, 4.0, egui::Stroke::new(1.0, color.gamma_multiply(0.6)), egui::StrokeKind::Outside);
@@ -624,9 +644,13 @@ pub fn draw_node_editor(
         }
     }
 
-    // Handle node dragging
+    // Handle node dragging and selection
     if let Some((id, offset)) = node_drag_start {
         state.dragging_node = Some((id, offset));
+        // Select node on click (for MIDI knob binding)
+        if graph.find_node(id).map_or(false, |n| matches!(n.kind, NodeKind::Effect { .. })) {
+            state.selected_node = Some(id);
+        }
     }
     if let Some((id, offset)) = state.dragging_node {
         if ui.input(|i| i.pointer.primary_down()) {

@@ -8,6 +8,9 @@ mod preset_bank;
 mod preset_graph;
 mod session;
 
+/// Arturia MiniLab 3 default knob CC numbers (Arturia preset).
+const MINILAB3_KNOB_CCS: [u8; 8] = [74, 71, 76, 77, 93, 18, 19, 16];
+
 use anyhow::Result;
 use clap::Parser;
 use eframe::egui;
@@ -720,6 +723,12 @@ struct RiffLabApp {
     editing_track_fx: Option<usize>,
     /// Throttle: when track FX params changed, defer recompile to avoid locking graph every frame.
     track_fx_dirty_since: Option<std::time::Instant>,
+    /// Effect node MIDI learn: waiting for a MIDI event to bind to this node.
+    midi_learn_node: Option<u64>,
+    /// MIDI CC numbers for physical knobs. Starts with MiniLab 3 defaults, can be re-learned.
+    midi_knob_ccs: Vec<u8>,
+    /// When true, next incoming CCs teach knob slots sequentially.
+    midi_knob_learning: bool,
 }
 
 impl RiffLabApp {
@@ -783,7 +792,7 @@ impl RiffLabApp {
             loop_drag: LoopDragState::default(),
             drawer_open: true,
             drawer_height: DEFAULT_DRAWER_HEIGHT,
-            active_tab: BottomTab::PianoRoll,
+            active_tab: BottomTab::Presets,
             reference_notes,
             played_notes: Vec::new(),
             piano_roll_scroll_note: 48.0, // C3 at bottom
@@ -834,6 +843,9 @@ impl RiffLabApp {
             stem_graphs: Vec::new(),
             editing_track_fx: None,
             track_fx_dirty_since: None,
+            midi_learn_node: None,
+            midi_knob_ccs: MINILAB3_KNOB_CCS.to_vec(),
+            midi_knob_learning: false,
         }
     }
 
@@ -1268,9 +1280,9 @@ impl eframe::App for RiffLabApp {
         {
             let mut nav_activate: Option<u64> = None;
             let mut bank_activate: Option<usize> = None;
+            let mut knob_changes: Vec<node_editor::NodeParamChange> = Vec::new();
             if let Some(ref rx) = self.midi_rx {
                 while let Ok(event) = rx.try_recv() {
-                    log::debug!("[MIDI] event: {:?}, learn={:?}", event, self.midi_learn);
                     // MIDI Learn mode: capture binding
                     if self.midi_learn != preset_graph::MidiLearnTarget::None {
                         let binding = match &event {
@@ -1307,6 +1319,88 @@ impl eframe::App for RiffLabApp {
                             self.midi_learn = preset_graph::MidiLearnTarget::None;
                         }
                         continue;
+                    }
+
+                    // Knob learning: capture CC numbers sequentially
+                    if self.midi_knob_learning {
+                        if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
+                            if !self.midi_knob_ccs.contains(cc) {
+                                self.midi_knob_ccs.push(*cc);
+                                self.message_log.push(
+                                    format!("Knob {} → CC#{} (turn next or click Done)", self.midi_knob_ccs.len(), cc),
+                                    false,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Effect node MIDI learn: bind a MIDI key/CC to select a node
+                    if let Some(learn_id) = self.midi_learn_node {
+                        let binding = match &event {
+                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi_knob_ccs.contains(cc) => {
+                                Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
+                            }
+                            midi_input::MidiEvent::NoteOn { channel, note, .. } => {
+                                Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
+                            }
+                            midi_input::MidiEvent::ProgramChange { channel, program } => {
+                                Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
+                            }
+                            _ => None,
+                        };
+                        if let Some(b) = binding {
+                            if let Some(node) = self.fx_graph.find_node_mut(learn_id) {
+                                self.message_log.push(format!("{} → {}", node.label, b.label()), false);
+                                node.midi_binding = Some(b);
+                            }
+                            self.midi_learn_node = None;
+                        }
+                        continue;
+                    }
+
+                    // MIDI knobs → selected effect node params
+                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                        if let Some(knob_idx) = self.midi_knob_ccs.iter().position(|&c| c == *cc) {
+                            if let Some(sel_node_id) = self.node_editor_state.selected_node {
+                                if let Some(node) = self.fx_graph.find_node(sel_node_id) {
+                                    if let node_editor::NodeKind::Effect { type_id } = &node.kind {
+                                        if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                                            let descs = effect.param_descriptors();
+                                            if let Some(desc) = descs.get(knob_idx) {
+                                                let t = *value as f32 / 127.0;
+                                                let val = desc.min + t * (desc.max - desc.min);
+                                                self.node_editor_state.param_cache.insert((sel_node_id, desc.id.0), val);
+                                                knob_changes.push(node_editor::NodeParamChange {
+                                                    node_id: sel_node_id,
+                                                    param_id: rifflab_core::audio::ParamId(desc.id.0),
+                                                    value: val,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Check if MIDI event matches any effect node's binding → select that node
+                    {
+                        let mut matched_node: Option<(u64, String)> = None;
+                        for node in &self.fx_graph.nodes {
+                            if let Some(ref binding) = node.midi_binding {
+                                if binding.matches_event(&event) {
+                                    matched_node = Some((node.id, node.label.clone()));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((id, label)) = matched_node {
+                            self.node_editor_state.selected_node = Some(id);
+                            self.message_log.push(format!("Knobs → {}", label), false);
+                            continue;
+                        }
                     }
 
                     // Normal mode: check bindings
@@ -1352,6 +1446,9 @@ impl eframe::App for RiffLabApp {
             }
             if let Some(idx) = bank_activate {
                 self.activate_preset(idx);
+            }
+            if !knob_changes.is_empty() {
+                self.apply_node_param_changes(&knob_changes);
             }
         }
 
@@ -1999,6 +2096,59 @@ impl eframe::App for RiffLabApp {
                                 });
                                 ui.separator();
                             }
+
+                            // MIDI node selection + knob learning toolbar
+                            ui.horizontal(|ui| {
+                                // Knob learning mode
+                                if self.midi_knob_learning {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
+                                        egui::RichText::new(format!("Turn knobs in order... ({} learned)", self.midi_knob_ccs.len())).size(10.0));
+                                    if ui.small_button("Done").clicked() {
+                                        self.midi_knob_learning = false;
+                                        self.message_log.push(
+                                            format!("Learned {} knobs", self.midi_knob_ccs.len()), false);
+                                    }
+                                } else {
+                                    // Learn Knobs button
+                                    if ui.small_button("Learn Knobs").on_hover_text("Turn MIDI knobs 1-8 in order").clicked() {
+                                        self.midi_knob_ccs.clear();
+                                        self.midi_knob_learning = true;
+                                        self.message_log.push("Turn MIDI knobs in order...".into(), false);
+                                    }
+                                    ui.label(egui::RichText::new(
+                                        format!("{}k", self.midi_knob_ccs.len())
+                                    ).size(9.0).color(egui::Color32::from_rgb(100, 100, 100)));
+                                    ui.separator();
+
+                                    // Selected node info
+                                    if let Some(sel_id) = self.node_editor_state.selected_node {
+                                        if let Some(node) = self.fx_graph.find_node(sel_id) {
+                                            ui.label(egui::RichText::new(
+                                                format!("Knobs → {}", node.label)
+                                            ).size(10.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                            let binding_label = node.midi_binding.as_ref()
+                                                .map(|b| b.label())
+                                                .unwrap_or_else(|| "—".into());
+                                            ui.label(egui::RichText::new(
+                                                format!("[{}]", binding_label)
+                                            ).size(10.0).color(egui::Color32::from_rgb(180, 180, 180)));
+                                        }
+                                        // Learn MIDI for node selection
+                                        if self.midi_learn_node.is_some() {
+                                            ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
+                                                egui::RichText::new("Press a key...").size(10.0));
+                                            if ui.small_button("Cancel").clicked() {
+                                                self.midi_learn_node = None;
+                                            }
+                                        } else if ui.small_button("Learn Select").on_hover_text("Bind a MIDI key to select this node").clicked() {
+                                            self.midi_learn_node = Some(sel_id);
+                                        }
+                                    } else {
+                                        ui.label(egui::RichText::new("Click a node for knob control").size(10.0)
+                                            .color(egui::Color32::from_rgb(140, 140, 140)));
+                                    }
+                                }
+                            });
 
                             // Compile graph FIRST so chain matches nodes
                             self.compile_graph_if_changed();
