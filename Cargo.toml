@@ -9,6 +9,7 @@ members = [
     "crates/rifflab-practice",
     "crates/rifflab-ui",
     "crates/rifflab-cue",
+    "crates/rifflab-tab",
     "crates/rifflab-app",
 ]
 resolver = "2"

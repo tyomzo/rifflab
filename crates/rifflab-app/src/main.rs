@@ -10,6 +10,47 @@ mod session;
 
 /// Arturia MiniLab 3 default knob CC numbers (Arturia preset).
 const MINILAB3_KNOB_CCS: [u8; 8] = [74, 71, 76, 77, 93, 18, 19, 16];
+/// Arturia MiniLab 3 default fader CC numbers.
+const MINILAB3_FADER_CCS: [u8; 4] = [82, 83, 85, 17];
+
+/// Saved MIDI controller mapping (knob + fader CCs).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MidiMapping {
+    knob_ccs: Vec<u8>,
+    fader_ccs: Vec<u8>,
+}
+
+impl MidiMapping {
+    /// Directory for MIDI mapping files.
+    fn mappings_dir() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "rifflab")
+            .map(|dirs| dirs.config_dir().join("midi_mappings"))
+    }
+
+    /// Sanitize device name for use as filename.
+    fn device_filename(port_name: &str) -> String {
+        // Use the part before the port number (e.g., "Minilab3:Minilab3 MIDI 20:0" → "Minilab3")
+        let name = port_name.split(':').next().unwrap_or(port_name);
+        name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    }
+
+    fn save(port_name: &str, knobs: &[u8], faders: &[u8]) -> Result<(), String> {
+        let dir = Self::mappings_dir().ok_or("No config dir")?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{e}"))?;
+        let path = dir.join(format!("{}.json", Self::device_filename(port_name)));
+        let mapping = MidiMapping { knob_ccs: knobs.to_vec(), fader_ccs: faders.to_vec() };
+        let json = serde_json::to_string_pretty(&mapping).map_err(|e| format!("{e}"))?;
+        std::fs::write(&path, json).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn load(port_name: &str) -> Option<MidiMapping> {
+        let dir = Self::mappings_dir()?;
+        let path = dir.join(format!("{}.json", Self::device_filename(port_name)));
+        let json = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+}
 
 use anyhow::Result;
 use clap::Parser;
@@ -729,6 +770,12 @@ struct RiffLabApp {
     midi_knob_ccs: Vec<u8>,
     /// When true, next incoming CCs teach knob slots sequentially.
     midi_knob_learning: bool,
+    /// Last raw CC value per knob CC (for endless encoder delta computation).
+    midi_knob_last: std::collections::HashMap<u8, u8>,
+    /// MIDI CC numbers for physical faders. Maps to track volumes + master.
+    midi_fader_ccs: Vec<u8>,
+    /// When true, next incoming CCs teach fader slots sequentially.
+    midi_fader_learning: bool,
 }
 
 impl RiffLabApp {
@@ -846,6 +893,9 @@ impl RiffLabApp {
             midi_learn_node: None,
             midi_knob_ccs: MINILAB3_KNOB_CCS.to_vec(),
             midi_knob_learning: false,
+            midi_knob_last: std::collections::HashMap::new(),
+            midi_fader_ccs: MINILAB3_FADER_CCS.to_vec(),
+            midi_fader_learning: false,
         }
     }
 
@@ -1325,6 +1375,8 @@ impl eframe::App for RiffLabApp {
                     if self.midi_knob_learning {
                         if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
                             if !self.midi_knob_ccs.contains(cc) {
+                                // Remove from fader list if it was there
+                                self.midi_fader_ccs.retain(|&c| c != *cc);
                                 self.midi_knob_ccs.push(*cc);
                                 self.message_log.push(
                                     format!("Knob {} → CC#{} (turn next or click Done)", self.midi_knob_ccs.len(), cc),
@@ -1335,10 +1387,50 @@ impl eframe::App for RiffLabApp {
                         continue;
                     }
 
+                    // Fader learning: capture fader CC numbers sequentially
+                    if self.midi_fader_learning {
+                        if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
+                            if !self.midi_fader_ccs.contains(cc) {
+                                // Remove from knob list if it was there
+                                self.midi_knob_ccs.retain(|&c| c != *cc);
+                                self.midi_fader_ccs.push(*cc);
+                                self.message_log.push(
+                                    format!("Fader {} → CC#{} (move next or click Done)", self.midi_fader_ccs.len(), cc),
+                                    false,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Faders → track volumes + input + master (absolute, 0-127)
+                    // Layout: [track1, track2, ..., input, master]
+                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                        if let Some(fader_idx) = self.midi_fader_ccs.iter().position(|&c| c == *cc) {
+                            let graph_arc = self.engine.lock().unwrap().graph().clone();
+                            if let Ok(mut g) = graph_arc.try_lock() {
+                                let n = self.midi_fader_ccs.len();
+                                if n >= 1 && fader_idx == n - 1 {
+                                    // Last fader → master volume (0.0–1.0)
+                                    g.master_volume = *value as f32 / 127.0;
+                                } else if n >= 2 && fader_idx == n - 2 {
+                                    // Second-to-last → input volume (0.0–2.0, matching UI slider)
+                                    g.input_volume = *value as f32 / 127.0 * 2.0;
+                                } else {
+                                    // Rest → stem track volumes (0.0–1.0)
+                                    if fader_idx < g.stem_volumes.len() {
+                                        g.stem_volumes[fader_idx] = *value as f32 / 127.0;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     // Effect node MIDI learn: bind a MIDI key/CC to select a node
                     if let Some(learn_id) = self.midi_learn_node {
                         let binding = match &event {
-                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi_knob_ccs.contains(cc) => {
+                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi_knob_ccs.contains(cc) && !self.midi_fader_ccs.contains(cc) => {
                                 Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
                             }
                             midi_input::MidiEvent::NoteOn { channel, note, .. } => {
@@ -1359,23 +1451,41 @@ impl eframe::App for RiffLabApp {
                         continue;
                     }
 
-                    // MIDI knobs → selected effect node params
+                    // MIDI knobs → selected effect node params (endless encoder delta mode)
                     if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
                         if let Some(knob_idx) = self.midi_knob_ccs.iter().position(|&c| c == *cc) {
-                            if let Some(sel_node_id) = self.node_editor_state.selected_node {
-                                if let Some(node) = self.fx_graph.find_node(sel_node_id) {
-                                    if let node_editor::NodeKind::Effect { type_id } = &node.kind {
-                                        if let Some(effect) = self.fx_registry.create_effect(type_id) {
-                                            let descs = effect.param_descriptors();
-                                            if let Some(desc) = descs.get(knob_idx) {
-                                                let t = *value as f32 / 127.0;
-                                                let val = desc.min + t * (desc.max - desc.min);
-                                                self.node_editor_state.param_cache.insert((sel_node_id, desc.id.0), val);
-                                                knob_changes.push(node_editor::NodeParamChange {
-                                                    node_id: sel_node_id,
-                                                    param_id: rifflab_core::audio::ParamId(desc.id.0),
-                                                    value: val,
-                                                });
+                            // Compute delta from last raw CC value (endless encoder)
+                            let last = self.midi_knob_last.get(cc).copied();
+                            self.midi_knob_last.insert(*cc, *value);
+                            let delta = if let Some(prev) = last {
+                                let d = *value as i16 - prev as i16;
+                                // Handle wrap-around: if |delta| > 64, encoder wrapped
+                                if d > 64 { d - 128 } else if d < -64 { d + 128 } else { d }
+                            } else {
+                                0 // First touch: just record position, don't jump
+                            };
+                            if delta != 0 {
+                                if let Some(sel_node_id) = self.node_editor_state.selected_node {
+                                    if let Some(node) = self.fx_graph.find_node(sel_node_id) {
+                                        if let node_editor::NodeKind::Effect { type_id } = &node.kind {
+                                            if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                                                let descs = effect.param_descriptors();
+                                                if let Some(desc) = descs.get(knob_idx) {
+                                                    // Scale: full knob sweep (0-127) = full param range
+                                                    let range = desc.max - desc.min;
+                                                    let step = range / 127.0 * delta as f32;
+                                                    let current = self.node_editor_state.param_cache
+                                                        .get(&(sel_node_id, desc.id.0))
+                                                        .copied()
+                                                        .unwrap_or(desc.default);
+                                                    let val = (current + step).clamp(desc.min, desc.max);
+                                                    self.node_editor_state.param_cache.insert((sel_node_id, desc.id.0), val);
+                                                    knob_changes.push(node_editor::NodeParamChange {
+                                                        node_id: sel_node_id,
+                                                        param_id: rifflab_core::audio::ParamId(desc.id.0),
+                                                        value: val,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -2097,56 +2207,32 @@ impl eframe::App for RiffLabApp {
                                 ui.separator();
                             }
 
-                            // MIDI node selection + knob learning toolbar
+                            // MIDI node selection toolbar
                             ui.horizontal(|ui| {
-                                // Knob learning mode
-                                if self.midi_knob_learning {
-                                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
-                                        egui::RichText::new(format!("Turn knobs in order... ({} learned)", self.midi_knob_ccs.len())).size(10.0));
-                                    if ui.small_button("Done").clicked() {
-                                        self.midi_knob_learning = false;
-                                        self.message_log.push(
-                                            format!("Learned {} knobs", self.midi_knob_ccs.len()), false);
+                                if let Some(sel_id) = self.node_editor_state.selected_node {
+                                    if let Some(node) = self.fx_graph.find_node(sel_id) {
+                                        ui.label(egui::RichText::new(
+                                            format!("Knobs → {}", node.label)
+                                        ).size(10.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                        let binding_label = node.midi_binding.as_ref()
+                                            .map(|b| b.label())
+                                            .unwrap_or_else(|| "—".into());
+                                        ui.label(egui::RichText::new(
+                                            format!("[{}]", binding_label)
+                                        ).size(10.0).color(egui::Color32::from_rgb(180, 180, 180)));
+                                    }
+                                    if self.midi_learn_node.is_some() {
+                                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
+                                            egui::RichText::new("Press a key...").size(10.0));
+                                        if ui.small_button("Cancel").clicked() {
+                                            self.midi_learn_node = None;
+                                        }
+                                    } else if ui.small_button("Learn Select").on_hover_text("Bind a MIDI key to select this node").clicked() {
+                                        self.midi_learn_node = Some(sel_id);
                                     }
                                 } else {
-                                    // Learn Knobs button
-                                    if ui.small_button("Learn Knobs").on_hover_text("Turn MIDI knobs 1-8 in order").clicked() {
-                                        self.midi_knob_ccs.clear();
-                                        self.midi_knob_learning = true;
-                                        self.message_log.push("Turn MIDI knobs in order...".into(), false);
-                                    }
-                                    ui.label(egui::RichText::new(
-                                        format!("{}k", self.midi_knob_ccs.len())
-                                    ).size(9.0).color(egui::Color32::from_rgb(100, 100, 100)));
-                                    ui.separator();
-
-                                    // Selected node info
-                                    if let Some(sel_id) = self.node_editor_state.selected_node {
-                                        if let Some(node) = self.fx_graph.find_node(sel_id) {
-                                            ui.label(egui::RichText::new(
-                                                format!("Knobs → {}", node.label)
-                                            ).size(10.0).color(egui::Color32::from_rgb(100, 200, 255)));
-                                            let binding_label = node.midi_binding.as_ref()
-                                                .map(|b| b.label())
-                                                .unwrap_or_else(|| "—".into());
-                                            ui.label(egui::RichText::new(
-                                                format!("[{}]", binding_label)
-                                            ).size(10.0).color(egui::Color32::from_rgb(180, 180, 180)));
-                                        }
-                                        // Learn MIDI for node selection
-                                        if self.midi_learn_node.is_some() {
-                                            ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
-                                                egui::RichText::new("Press a key...").size(10.0));
-                                            if ui.small_button("Cancel").clicked() {
-                                                self.midi_learn_node = None;
-                                            }
-                                        } else if ui.small_button("Learn Select").on_hover_text("Bind a MIDI key to select this node").clicked() {
-                                            self.midi_learn_node = Some(sel_id);
-                                        }
-                                    } else {
-                                        ui.label(egui::RichText::new("Click a node for knob control").size(10.0)
-                                            .color(egui::Color32::from_rgb(140, 140, 140)));
-                                    }
+                                    ui.label(egui::RichText::new("Click a node for knob control").size(10.0)
+                                        .color(egui::Color32::from_rgb(140, 140, 140)));
                                 }
                             });
 
@@ -4966,7 +5052,15 @@ impl RiffLabApp {
                         {
                             match midi_input::connect(self.midi_selected_port) {
                                 Ok((conn, rx)) => {
-                                    self.message_log.push(format!("MIDI connected: {}", conn.port_name), false);
+                                    // Auto-load saved mapping for this device
+                                    if let Some(mapping) = MidiMapping::load(&conn.port_name) {
+                                        self.midi_knob_ccs = mapping.knob_ccs;
+                                        self.midi_fader_ccs = mapping.fader_ccs;
+                                        self.message_log.push(format!("MIDI connected: {} (mapping loaded)", conn.port_name), false);
+                                    } else {
+                                        self.message_log.push(format!("MIDI connected: {}", conn.port_name), false);
+                                    }
+                                    self.midi_knob_last.clear();
                                     self.midi_connection = Some(conn);
                                     self.midi_rx = Some(rx);
                                 }
@@ -4977,6 +5071,88 @@ impl RiffLabApp {
                         }
                     }
                 });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // MIDI Controller Mapping
+                ui.label(egui::RichText::new("Controller Mapping").strong().color(label_color));
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    if self.midi_knob_learning {
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
+                            format!("Turn knobs in order... ({} learned)", self.midi_knob_ccs.len()));
+                        if ui.small_button("Done").clicked() {
+                            self.midi_knob_learning = false;
+                            self.message_log.push(format!("Learned {} knobs", self.midi_knob_ccs.len()), false);
+                        }
+                    } else if self.midi_fader_learning {
+                        ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
+                            format!("Move faders in order... ({} learned, last=master)", self.midi_fader_ccs.len()));
+                        if ui.small_button("Done").clicked() {
+                            self.midi_fader_learning = false;
+                            self.message_log.push(format!("Learned {} faders", self.midi_fader_ccs.len()), false);
+                        }
+                    } else {
+                        if ui.button("Learn Knobs").on_hover_text("Turn MIDI knobs 1-8 in order → controls effect params").clicked() {
+                            self.midi_knob_ccs.clear();
+                            self.midi_knob_learning = true;
+                            self.message_log.push("Turn MIDI knobs in order...".into(), false);
+                        }
+                        if ui.button("Learn Faders").on_hover_text("Move faders in order → tracks + input + master volume").clicked() {
+                            self.midi_fader_ccs.clear();
+                            self.midi_fader_learning = true;
+                            self.message_log.push("Move faders in order (last=master, 2nd last=input)...".into(), false);
+                        }
+                    }
+                });
+
+                // Show current mappings
+                if !self.midi_knob_ccs.is_empty() || !self.midi_fader_ccs.is_empty() {
+                    ui.horizontal(|ui| {
+                        if !self.midi_knob_ccs.is_empty() {
+                            let ccs: Vec<String> = self.midi_knob_ccs.iter().map(|c| format!("{}", c)).collect();
+                            ui.label(egui::RichText::new(format!("Knobs: CC {}", ccs.join(", ")))
+                                .size(10.0).color(egui::Color32::from_rgb(140, 160, 140)));
+                        }
+                    });
+                    if !self.midi_fader_ccs.is_empty() {
+                        ui.horizontal(|ui| {
+                            let n = self.midi_fader_ccs.len();
+                            for (i, &cc) in self.midi_fader_ccs.iter().enumerate() {
+                                let role = if n >= 2 && i == n - 1 {
+                                    "Master".to_string()
+                                } else if n >= 3 && i == n - 2 {
+                                    "Input".to_string()
+                                } else {
+                                    format!("Track {}", i + 1)
+                                };
+                                ui.label(egui::RichText::new(format!("CC{}: {}", cc, role))
+                                    .size(10.0).color(egui::Color32::from_rgb(140, 160, 140)));
+                            }
+                        });
+                    }
+                    // Save mapping button
+                    if self.midi_connection.is_some() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Save Mapping").clicked() {
+                                if let Some(ref conn) = self.midi_connection {
+                                    match MidiMapping::save(&conn.port_name, &self.midi_knob_ccs, &self.midi_fader_ccs) {
+                                        Ok(()) => self.message_log.push(
+                                            format!("Mapping saved for {}", MidiMapping::device_filename(&conn.port_name)), false),
+                                        Err(e) => self.message_log.push(format!("Save failed: {e}"), true),
+                                    }
+                                }
+                            }
+                            if let Some(ref conn) = self.midi_connection {
+                                ui.label(egui::RichText::new(
+                                    format!("({})", MidiMapping::device_filename(&conn.port_name))
+                                ).size(9.0).color(egui::Color32::from_rgb(120, 120, 120)));
+                            }
+                        });
+                    }
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
