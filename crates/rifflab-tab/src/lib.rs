@@ -1,6 +1,7 @@
 pub mod model;
 pub mod io;
 pub mod ascii;
+pub mod ascii_llm;
 pub mod fret_map;
 pub mod audio;
 pub mod fusion;
