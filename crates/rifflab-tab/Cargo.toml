@@ -7,3 +7,5 @@ edition = "2021"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+rifflab-core = { path = "../rifflab-core" }
+rifflab-analysis = { path = "../rifflab-analysis" }

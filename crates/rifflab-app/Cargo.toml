@@ -21,6 +21,7 @@ rifflab-stems = { workspace = true }
 rifflab-analysis = { workspace = true }
 rifflab-practice = { workspace = true }
 rifflab-ui = { workspace = true }
+rifflab-tab = { path = "../rifflab-tab" }
 cpal = { version = "0.15", features = ["jack"] }
 eframe = "0.31"
 egui = "0.31"

@@ -3471,6 +3471,7 @@ dependencies = [
  "rifflab-ipc",
  "rifflab-practice",
  "rifflab-stems",
+ "rifflab-tab",
  "rifflab-ui",
  "rtrb",
  "rubato",
@@ -3568,6 +3569,8 @@ dependencies = [
 name = "rifflab-tab"
 version = "0.1.0"
 dependencies = [
+ "rifflab-analysis",
+ "rifflab-core",
  "serde",
  "serde_json",
  "uuid",

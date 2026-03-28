@@ -7,6 +7,7 @@ mod node_editor;
 mod preset_bank;
 mod preset_graph;
 mod session;
+mod tab_view;
 
 /// Arturia MiniLab 3 default knob CC numbers (Arturia preset).
 const MINILAB3_KNOB_CCS: [u8; 8] = [74, 71, 76, 77, 93, 18, 19, 16];
@@ -341,6 +342,7 @@ struct SpectrogramDisplay {
 enum BottomTab {
     Presets,
     Effects,
+    Tab,
     PianoRoll,
     Accuracy,
 }
@@ -766,6 +768,10 @@ struct RiffLabApp {
     track_fx_dirty_since: Option<std::time::Instant>,
     /// Effect node MIDI learn: waiting for a MIDI event to bind to this node.
     midi_learn_node: Option<u64>,
+    /// Tab document (loaded tab notation).
+    tab_document: Option<rifflab_tab::model::TabDocument>,
+    /// Tab view state (scroll, zoom, selection).
+    tab_view_state: tab_view::TabViewState,
     /// MIDI CC numbers for physical knobs. Starts with MiniLab 3 defaults, can be re-learned.
     midi_knob_ccs: Vec<u8>,
     /// When true, next incoming CCs teach knob slots sequentially.
@@ -891,6 +897,8 @@ impl RiffLabApp {
             editing_track_fx: None,
             track_fx_dirty_since: None,
             midi_learn_node: None,
+            tab_document: None,
+            tab_view_state: tab_view::TabViewState::default(),
             midi_knob_ccs: MINILAB3_KNOB_CCS.to_vec(),
             midi_knob_learning: false,
             midi_knob_last: std::collections::HashMap::new(),
@@ -2058,6 +2066,7 @@ impl eframe::App for RiffLabApp {
                         let tabs = [
                             (BottomTab::Presets, "Presets"),
                             (BottomTab::Effects, "Effects"),
+                            (BottomTab::Tab, "Tab"),
                             (BottomTab::PianoRoll, "Piano Roll"),
                             (BottomTab::Accuracy, "Accuracy"),
                         ];
@@ -2160,6 +2169,64 @@ impl eframe::App for RiffLabApp {
                                     }
                                 }
                                 preset_graph::PresetGraphAction::None => {}
+                            }
+                        }
+                        BottomTab::Tab => {
+                            if let Some(ref tab) = self.tab_document {
+                                let tab_is_playing = state == TransportState::Playing;
+                                let playback_secs = position_frame as f64 / self.sample_rate.max(1) as f64;
+                                let tab_action = tab_view::draw_tab_view(
+                                    ui, tab, playback_secs, tab_is_playing, &mut self.tab_view_state,
+                                );
+                                if let tab_view::TabViewAction::Seek(t) = tab_action {
+                                    let frame = (t * self.sample_rate as f64) as u64;
+                                    self.engine.lock().unwrap().transport_mut().seek(frame);
+                                }
+                            } else {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.label("No tab loaded");
+                                    ui.add_space(10.0);
+                                    if ui.button("Paste ASCII Tab").clicked() {
+                                        // Will be handled by a text input dialog
+                                        self.message_log.push("Paste tab text and press Enter".into(), false);
+                                    }
+                                    if ui.button("Load .rltab File").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("RiffLab Tab", &["rltab", "json"])
+                                            .pick_file()
+                                        {
+                                            match rifflab_tab::io::load_tab(&path) {
+                                                Ok(tab) => {
+                                                    self.message_log.push(format!("Tab loaded: {}", tab.title), false);
+                                                    self.tab_document = Some(tab);
+                                                }
+                                                Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                            }
+                                        }
+                                    }
+                                    if ui.button("Parse from Clipboard").clicked() {
+                                        let clipboard_text = ui.input(|i| {
+                                            i.events.iter().find_map(|e| {
+                                                if let egui::Event::Paste(text) = e { Some(text.clone()) } else { None }
+                                            })
+                                        });
+                                        if let Some(text) = clipboard_text {
+                                            let notes = rifflab_tab::ascii::parse_ascii_tab(&text);
+                                            if notes.is_empty() {
+                                                self.message_log.push("No notes found in clipboard".into(), true);
+                                            } else {
+                                                let mut tab = rifflab_tab::model::TabDocument::new("Pasted Tab");
+                                                tab.notes = notes;
+                                                tab.generate_measures();
+                                                self.message_log.push(format!("Parsed {} notes from clipboard", tab.notes.len()), false);
+                                                self.tab_document = Some(tab);
+                                            }
+                                        } else {
+                                            self.message_log.push("Ctrl+V to paste tab text first".into(), false);
+                                        }
+                                    }
+                                });
                             }
                         }
                         BottomTab::PianoRoll => {
