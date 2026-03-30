@@ -474,13 +474,13 @@ pub fn draw_preset_graph(
 
 // ─── Persistence ────────────────────────────────────────────────────────────
 
-pub fn save_preset_graph(path: &std::path::Path, graph: &PresetGraph) -> Result<(), Box<dyn std::error::Error>> {
+pub fn save_preset_graph(path: &std::path::Path, graph: &PresetGraph) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(graph)?;
     std::fs::write(path, json)?;
     Ok(())
 }
 
-pub fn load_preset_graph(path: &std::path::Path) -> Result<PresetGraph, Box<dyn std::error::Error>> {
+pub fn load_preset_graph(path: &std::path::Path) -> anyhow::Result<PresetGraph> {
     let json = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&json)?)
 }

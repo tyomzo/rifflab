@@ -109,20 +109,16 @@ impl MidiController {
     }
 
     /// Connect to the currently selected MIDI port.
-    pub fn connect(&mut self) -> Result<(), String> {
-        match midi_input::connect(self.selected_port) {
-            Ok((conn, rx)) => {
-                if let Some(mapping) = MidiMapping::load(&conn.port_name) {
-                    self.knob_ccs = mapping.knob_ccs;
-                    self.fader_ccs = mapping.fader_ccs;
-                }
-                self.knob_last.clear();
-                self.connection = Some(conn);
-                self.rx = Some(rx);
-                Ok(())
-            }
-            Err(e) => Err(e),
+    pub fn connect(&mut self) -> Result<(), midi_input::MidiError> {
+        let (conn, rx) = midi_input::connect(self.selected_port)?;
+        if let Some(mapping) = MidiMapping::load(&conn.port_name) {
+            self.knob_ccs = mapping.knob_ccs;
+            self.fader_ccs = mapping.fader_ccs;
         }
+        self.knob_last.clear();
+        self.connection = Some(conn);
+        self.rx = Some(rx);
+        Ok(())
     }
 
     /// Disconnect the current MIDI connection.

@@ -1,15 +1,16 @@
+use crate::error::TabError;
 use crate::model::TabDocument;
 use std::path::Path;
 
 /// Save a TabDocument as a `.rltab` JSON file.
-pub fn save_tab(tab: &TabDocument, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn save_tab(tab: &TabDocument, path: &Path) -> Result<(), TabError> {
     let json = serde_json::to_string_pretty(tab)?;
     std::fs::write(path, json)?;
     Ok(())
 }
 
 /// Load a TabDocument from a `.rltab` JSON file.
-pub fn load_tab(path: &Path) -> Result<TabDocument, Box<dyn std::error::Error>> {
+pub fn load_tab(path: &Path) -> Result<TabDocument, TabError> {
     let json = std::fs::read_to_string(path)?;
     let tab: TabDocument = serde_json::from_str(&json)?;
     Ok(tab)

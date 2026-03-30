@@ -96,7 +96,7 @@ fn estimate_notes(
 
         // Use median frequency (more robust than mean against octave errors)
         let mut freqs: Vec<f32> = valid.iter().map(|&(f, _)| f).collect();
-        freqs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        freqs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_freq = freqs[freqs.len() / 2];
         let avg_conf = valid.iter().map(|&(_, c)| c).sum::<f32>() / valid.len() as f32;
 

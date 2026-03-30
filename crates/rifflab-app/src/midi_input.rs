@@ -2,6 +2,17 @@
 
 use std::sync::mpsc;
 
+/// Errors from MIDI operations.
+#[derive(Debug, thiserror::Error)]
+pub enum MidiError {
+    #[error("MIDI init failed: {0}")]
+    Init(String),
+    #[error("MIDI port {index} out of range ({count} available)")]
+    PortOutOfRange { index: usize, count: usize },
+    #[error("MIDI connect failed: {0}")]
+    Connect(String),
+}
+
 /// A MIDI event received from an external controller.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -36,13 +47,13 @@ pub struct MidiConnection {
 
 /// Connect to a MIDI input port by index.
 /// Returns the connection and a receiver for MIDI events.
-pub fn connect(port_index: usize) -> Result<(MidiConnection, mpsc::Receiver<MidiEvent>), String> {
+pub fn connect(port_index: usize) -> Result<(MidiConnection, mpsc::Receiver<MidiEvent>), MidiError> {
     let midi_in = midir::MidiInput::new("rifflab-midi")
-        .map_err(|e| format!("MIDI init failed: {e}"))?;
+        .map_err(|e| MidiError::Init(e.to_string()))?;
 
     let ports = midi_in.ports();
     let port = ports.get(port_index)
-        .ok_or_else(|| format!("MIDI port index {} out of range ({})", port_index, ports.len()))?;
+        .ok_or(MidiError::PortOutOfRange { index: port_index, count: ports.len() })?;
 
     let port_name = midi_in.port_name(port)
         .unwrap_or_else(|_| format!("Port {}", port_index));
@@ -84,7 +95,7 @@ pub fn connect(port_index: usize) -> Result<(MidiConnection, mpsc::Receiver<Midi
             }
         },
         (),
-    ).map_err(|e| format!("MIDI connect failed: {e}"))?;
+    ).map_err(|e| MidiError::Connect(e.to_string()))?;
 
     log::info!("MIDI connected to: {}", port_name);
 

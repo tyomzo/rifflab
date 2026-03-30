@@ -129,11 +129,11 @@ fn strip_markdown(text: &str) -> String {
     out
 }
 
-fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, String> {
+fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, crate::error::TabError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -151,24 +151,24 @@ fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, String> {
         .header("content-type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| format!("HTTP error: {e}"))?;
+        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().unwrap_or_default();
-        return Err(format!("API error {}: {}", status, text));
+        return Err(crate::error::TabError::LlmApi(format!("API error {}: {}", status, text)));
     }
 
     let resp: serde_json::Value = response
         .json()
-        .map_err(|e| format!("JSON decode error: {e}"))?;
+        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
 
     // Extract text content from Claude's response
     let text_content = resp["content"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|block| block["text"].as_str())
-        .ok_or("No text content in response")?;
+        .ok_or_else(|| crate::error::TabError::LlmApi("No text content in response".into()))?;
 
     // Strip markdown code fences if present
     let json_str = text_content
@@ -181,8 +181,7 @@ fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, String> {
         .trim();
 
     // Parse as array of AsciiNote
-    let ascii_notes: Vec<AsciiNote> = serde_json::from_str(json_str)
-        .map_err(|e| format!("JSON parse error: {e}"))?;
+    let ascii_notes: Vec<AsciiNote> = serde_json::from_str(json_str)?;
 
     // Convert to TabNote
     let tab_notes = ascii_notes.into_iter().map(|an| {

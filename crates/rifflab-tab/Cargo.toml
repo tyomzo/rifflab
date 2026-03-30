@@ -10,4 +10,5 @@ uuid = { workspace = true }
 rifflab-core = { path = "../rifflab-core" }
 rifflab-analysis = { path = "../rifflab-analysis" }
 log = { workspace = true }
+thiserror = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }

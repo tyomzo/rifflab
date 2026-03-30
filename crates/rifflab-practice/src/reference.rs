@@ -1,16 +1,28 @@
 use rifflab_core::analysis::NoteEvent;
 use std::path::Path;
 
+/// Errors from reference loading.
+#[derive(Debug, thiserror::Error)]
+pub enum ReferenceError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("MIDI parse error: {0}")]
+    Midi(String),
+}
+
 /// Load a reference note sequence from a JSON file (M4 transcription output).
-pub fn load_from_json(path: &Path) -> Result<Vec<NoteEvent>, std::io::Error> {
+pub fn load_from_json(path: &Path) -> Result<Vec<NoteEvent>, ReferenceError> {
     let data = std::fs::read_to_string(path)?;
-    serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let notes = serde_json::from_str(&data)?;
+    Ok(notes)
 }
 
 /// Load a reference from a MIDI file.
-pub fn load_from_midi(path: &Path) -> Result<Vec<NoteEvent>, Box<dyn std::error::Error>> {
+pub fn load_from_midi(path: &Path) -> Result<Vec<NoteEvent>, ReferenceError> {
     let data = std::fs::read(path)?;
-    let smf = midly::Smf::parse(&data)?;
+    let smf = midly::Smf::parse(&data).map_err(|e| ReferenceError::Midi(e.to_string()))?;
 
     let mut notes = Vec::new();
     let ticks_per_beat = match smf.header.timing {
@@ -65,9 +77,6 @@ pub fn load_from_midi(path: &Path) -> Result<Vec<NoteEvent>, Box<dyn std::error:
         }
     }
 
-    notes.sort_by(|a, b| a.onset_seconds.partial_cmp(&b.onset_seconds).unwrap());
+    notes.sort_by(|a, b| a.onset_seconds.partial_cmp(&b.onset_seconds).unwrap_or(std::cmp::Ordering::Equal));
     Ok(notes)
 }
-
-// Re-export serde_json for reference loading
-use serde_json;

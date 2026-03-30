@@ -971,14 +971,14 @@ impl FxGraph {
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
 /// Save graph to JSON.
-pub fn save_graph(path: &std::path::Path, graph: &FxGraph) -> Result<(), Box<dyn std::error::Error>> {
+pub fn save_graph(path: &std::path::Path, graph: &FxGraph) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(graph)?;
     std::fs::write(path, json)?;
     Ok(())
 }
 
 /// Load graph from JSON.
-pub fn load_graph(path: &std::path::Path) -> Result<FxGraph, Box<dyn std::error::Error>> {
+pub fn load_graph(path: &std::path::Path) -> anyhow::Result<FxGraph> {
     let json = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&json)?)
 }
