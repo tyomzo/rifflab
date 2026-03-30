@@ -1178,38 +1178,50 @@ impl RiffLabApp {
     }
 }
 
-impl eframe::App for RiffLabApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ─── Load pending file (from CLI arg, first frame only) ──
+/// Per-frame snapshot of transport and audio state, passed from polling to UI drawing.
+struct FrameState {
+    state: TransportState,
+    position: rifflab_core::transport::SongPosition,
+    position_secs: f64,
+    position_frame: u64,
+    is_running: bool,
+    loop_enabled: bool,
+    loop_start: u64,
+    loop_end: u64,
+}
+
+// ─── Extracted update() sub-methods ─────────────────────────────────────────
+
+impl RiffLabApp {
+    /// Poll all background operations: file loading, session save/dialog, tab parsing.
+    fn poll_background(&mut self) {
         if let Some(path) = self.pending_file.take() {
             self.load_file(&path);
         }
-
-        // ─── Poll background file loading ────────────────────────
         self.poll_file_load();
-
-        // ─── Poll background save ────────────────────────────────
         if let Some((is_error, msg)) = self.session.poll_save() {
             self.message_log.push(msg, is_error);
         }
-
-        // ─── Poll async Save As dialog ───────────────────────────
         if let Some(result) = self.session.poll_dialog() {
             if let Some(dir) = result {
                 self.do_save_to_dir(dir);
             }
         }
+        let (logs, _) = self.tabs.poll();
+        for msg in logs {
+            self.message_log.push(msg, false);
+        }
+    }
 
-        // ─── Drain channels ──────────────────────────────────────
+    /// Drain meter data and read transport state. Returns per-frame state used by UI.
+    fn poll_audio_state(&mut self) -> FrameState {
         while let Ok(meter) = self.meter_rx.pop() {
-            // Smooth with exponential moving average
             self.metering.peak_l = self.metering.peak_l * 0.85 + meter.peak_l * 0.15;
             self.metering.peak_r = self.metering.peak_r * 0.85 + meter.peak_r * 0.15;
             self.metering.rms_l = self.metering.rms_l * 0.85 + meter.rms_l * 0.15;
             self.metering.rms_r = self.metering.rms_r * 0.85 + meter.rms_r * 0.15;
         }
 
-        // Read transport state
         let (state, position, _total_length, is_running, loop_enabled, loop_start, loop_end) = {
             let eng = self.engine.lock().unwrap();
             let transport = eng.transport();
@@ -1223,280 +1235,264 @@ impl eframe::App for RiffLabApp {
                 transport.loop_end(),
             )
         };
-        let position_secs = position.seconds();
-        let position_frame = position.frame;
 
-        // ─── Tick cue engine ─────────────────────────────────────
+        // Tick cue engine
         if state == TransportState::Playing {
-            let actions = self.cue_engine.tick(position_frame);
+            let actions = self.cue_engine.tick(position.frame);
             for action in actions {
                 match action {
                     DispatchedAction::SetLoop(region) => {
-                        let mut eng = self.engine.lock().unwrap();
-                        eng.transport_mut().set_loop(Some(region));
+                        self.engine.lock().unwrap().transport_mut().set_loop(Some(region));
                     }
                     DispatchedAction::ClearLoop => {
-                        let mut eng = self.engine.lock().unwrap();
-                        eng.transport_mut().set_loop(None);
+                        self.engine.lock().unwrap().transport_mut().set_loop(None);
                     }
                     DispatchedAction::SwitchPreset(name) => {
                         log::info!("Cue: switch preset to '{}'", name);
-                        // TODO: load preset by name and apply to fx_chain
                     }
                 }
             }
         }
 
-        // ─── Poll MIDI input ──────────────────────────────────────
-        // ─── Poll MIDI: learn bindings or activate presets ─────
-        {
-            let mut nav_activate: Option<u64> = None;
-            let mut bank_activate: Option<usize> = None;
-            let mut knob_changes: Vec<node_editor::NodeParamChange> = Vec::new();
-            if let Some(ref rx) = self.midi.rx {
-                while let Ok(event) = rx.try_recv() {
-                    // MIDI Learn mode: capture binding
-                    if self.midi.learn != preset_graph::MidiLearnTarget::None {
-                        let binding = match &event {
-                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 => {
-                                Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
+        FrameState {
+            state,
+            position_secs: position.seconds(),
+            position_frame: position.frame,
+            position,
+            is_running,
+            loop_enabled,
+            loop_start,
+            loop_end,
+        }
+    }
+
+    /// Process all pending MIDI events: learn modes, fader/knob mapping, preset switching.
+    fn handle_midi(&mut self) {
+        let mut nav_activate: Option<u64> = None;
+        let mut bank_activate: Option<usize> = None;
+        let mut knob_changes: Vec<node_editor::NodeParamChange> = Vec::new();
+        if let Some(ref rx) = self.midi.rx {
+            while let Ok(event) = rx.try_recv() {
+                // MIDI Learn mode: capture binding
+                if self.midi.learn != preset_graph::MidiLearnTarget::None {
+                    let binding = match &event {
+                        midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 => {
+                            Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
+                        }
+                        midi_input::MidiEvent::NoteOn { channel, note, .. } => {
+                            Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
+                        }
+                        midi_input::MidiEvent::ProgramChange { channel, program } => {
+                            Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
+                        }
+                        _ => None,
+                    };
+                    if let Some(b) = binding {
+                        match &self.midi.learn {
+                            preset_graph::MidiLearnTarget::PresetNode(id) => {
+                                let id = *id;
+                                if let Some(node) = self.preset_nav.find_node_mut(id) {
+                                    node.midi_binding = Some(b.clone());
+                                }
+                                self.message_log.push(format!("Bound {} to preset", b.label()), false);
                             }
-                            midi_input::MidiEvent::NoteOn { channel, note, .. } => {
-                                Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
+                            preset_graph::MidiLearnTarget::GlobalNext => {
+                                self.message_log.push(format!("Next bound to {}", b.label()), false);
+                                self.preset_nav.midi_next = Some(b.clone());
                             }
-                            midi_input::MidiEvent::ProgramChange { channel, program } => {
-                                Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
+                            preset_graph::MidiLearnTarget::GlobalPrev => {
+                                self.message_log.push(format!("Prev bound to {}", b.label()), false);
+                                self.preset_nav.midi_prev = Some(b.clone());
                             }
-                            _ => None,
+                            _ => {}
+                        }
+                        self.midi.learn = preset_graph::MidiLearnTarget::None;
+                    }
+                    continue;
+                }
+
+                // Knob learning
+                if self.midi.knob_learning {
+                    if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
+                        if !self.midi.knob_ccs.contains(cc) {
+                            self.midi.fader_ccs.retain(|&c| c != *cc);
+                            self.midi.knob_ccs.push(*cc);
+                            self.message_log.push(
+                                format!("Knob {} → CC#{} (turn next or click Done)", self.midi.knob_ccs.len(), cc),
+                                false,
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // Fader learning
+                if self.midi.fader_learning {
+                    if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
+                        if !self.midi.fader_ccs.contains(cc) {
+                            self.midi.knob_ccs.retain(|&c| c != *cc);
+                            self.midi.fader_ccs.push(*cc);
+                            self.message_log.push(
+                                format!("Fader {} → CC#{} (move next or click Done)", self.midi.fader_ccs.len(), cc),
+                                false,
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                // Faders → track volumes + input + master
+                if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                    if let Some(fader_idx) = self.midi.fader_ccs.iter().position(|&c| c == *cc) {
+                        let graph_arc = self.engine.lock().unwrap().graph().clone();
+                        if let Ok(mut g) = graph_arc.try_lock() {
+                            let n = self.midi.fader_ccs.len();
+                            if n >= 1 && fader_idx == n - 1 {
+                                g.master_volume = *value as f32 / 127.0;
+                            } else if n >= 2 && fader_idx == n - 2 {
+                                g.input_volume = *value as f32 / 127.0 * 2.0;
+                            } else if fader_idx < g.stem_volumes.len() {
+                                g.stem_volumes[fader_idx] = *value as f32 / 127.0;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // Effect node MIDI learn
+                if let Some(learn_id) = self.midi.learn_node {
+                    let binding = match &event {
+                        midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi.knob_ccs.contains(cc) && !self.midi.fader_ccs.contains(cc) => {
+                            Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
+                        }
+                        midi_input::MidiEvent::NoteOn { channel, note, .. } => {
+                            Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
+                        }
+                        midi_input::MidiEvent::ProgramChange { channel, program } => {
+                            Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
+                        }
+                        _ => None,
+                    };
+                    if let Some(b) = binding {
+                        if let Some(node) = self.fx_graph.find_node_mut(learn_id) {
+                            self.message_log.push(format!("{} → {}", node.label, b.label()), false);
+                            node.midi_binding = Some(b);
+                        }
+                        self.midi.learn_node = None;
+                    }
+                    continue;
+                }
+
+                // MIDI knobs → selected effect node params (endless encoder delta)
+                if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                    if let Some(knob_idx) = self.midi.knob_ccs.iter().position(|&c| c == *cc) {
+                        let last = self.midi.knob_last.get(cc).copied();
+                        self.midi.knob_last.insert(*cc, *value);
+                        let delta = if let Some(prev) = last {
+                            let d = *value as i16 - prev as i16;
+                            if d > 64 { d - 128 } else if d < -64 { d + 128 } else { d }
+                        } else {
+                            0
                         };
-                        if let Some(b) = binding {
-                            match &self.midi.learn {
-                                preset_graph::MidiLearnTarget::PresetNode(id) => {
-                                    let id = *id;
-                                    if let Some(node) = self.preset_nav.find_node_mut(id) {
-                                        node.midi_binding = Some(b.clone());
-                                    }
-                                    self.message_log.push(format!("Bound {} to preset", b.label()), false);
-                                }
-                                preset_graph::MidiLearnTarget::GlobalNext => {
-                                    self.message_log.push(format!("Next bound to {}", b.label()), false);
-                                    self.preset_nav.midi_next = Some(b.clone());
-                                }
-                                preset_graph::MidiLearnTarget::GlobalPrev => {
-                                    self.message_log.push(format!("Prev bound to {}", b.label()), false);
-                                    self.preset_nav.midi_prev = Some(b.clone());
-                                }
-                                _ => {}
-                            }
-                            self.midi.learn = preset_graph::MidiLearnTarget::None;
-                        }
-                        continue;
-                    }
-
-                    // Knob learning: capture CC numbers sequentially
-                    if self.midi.knob_learning {
-                        if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
-                            if !self.midi.knob_ccs.contains(cc) {
-                                // Remove from fader list if it was there
-                                self.midi.fader_ccs.retain(|&c| c != *cc);
-                                self.midi.knob_ccs.push(*cc);
-                                self.message_log.push(
-                                    format!("Knob {} → CC#{} (turn next or click Done)", self.midi.knob_ccs.len(), cc),
-                                    false,
-                                );
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Fader learning: capture fader CC numbers sequentially
-                    if self.midi.fader_learning {
-                        if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
-                            if !self.midi.fader_ccs.contains(cc) {
-                                // Remove from knob list if it was there
-                                self.midi.knob_ccs.retain(|&c| c != *cc);
-                                self.midi.fader_ccs.push(*cc);
-                                self.message_log.push(
-                                    format!("Fader {} → CC#{} (move next or click Done)", self.midi.fader_ccs.len(), cc),
-                                    false,
-                                );
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Faders → track volumes + input + master (absolute, 0-127)
-                    // Layout: [track1, track2, ..., input, master]
-                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
-                        if let Some(fader_idx) = self.midi.fader_ccs.iter().position(|&c| c == *cc) {
-                            let graph_arc = self.engine.lock().unwrap().graph().clone();
-                            if let Ok(mut g) = graph_arc.try_lock() {
-                                let n = self.midi.fader_ccs.len();
-                                if n >= 1 && fader_idx == n - 1 {
-                                    // Last fader → master volume (0.0–1.0)
-                                    g.master_volume = *value as f32 / 127.0;
-                                } else if n >= 2 && fader_idx == n - 2 {
-                                    // Second-to-last → input volume (0.0–2.0, matching UI slider)
-                                    g.input_volume = *value as f32 / 127.0 * 2.0;
-                                } else {
-                                    // Rest → stem track volumes (0.0–1.0)
-                                    if fader_idx < g.stem_volumes.len() {
-                                        g.stem_volumes[fader_idx] = *value as f32 / 127.0;
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
-
-                    // Effect node MIDI learn: bind a MIDI key/CC to select a node
-                    if let Some(learn_id) = self.midi.learn_node {
-                        let binding = match &event {
-                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi.knob_ccs.contains(cc) && !self.midi.fader_ccs.contains(cc) => {
-                                Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
-                            }
-                            midi_input::MidiEvent::NoteOn { channel, note, .. } => {
-                                Some(preset_graph::MidiBinding::NoteOn { channel: *channel, note: *note })
-                            }
-                            midi_input::MidiEvent::ProgramChange { channel, program } => {
-                                Some(preset_graph::MidiBinding::ProgramChange { channel: *channel, program: *program })
-                            }
-                            _ => None,
-                        };
-                        if let Some(b) = binding {
-                            if let Some(node) = self.fx_graph.find_node_mut(learn_id) {
-                                self.message_log.push(format!("{} → {}", node.label, b.label()), false);
-                                node.midi_binding = Some(b);
-                            }
-                            self.midi.learn_node = None;
-                        }
-                        continue;
-                    }
-
-                    // MIDI knobs → selected effect node params (endless encoder delta mode)
-                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
-                        if let Some(knob_idx) = self.midi.knob_ccs.iter().position(|&c| c == *cc) {
-                            // Compute delta from last raw CC value (endless encoder)
-                            let last = self.midi.knob_last.get(cc).copied();
-                            self.midi.knob_last.insert(*cc, *value);
-                            let delta = if let Some(prev) = last {
-                                let d = *value as i16 - prev as i16;
-                                // Handle wrap-around: if |delta| > 64, encoder wrapped
-                                if d > 64 { d - 128 } else if d < -64 { d + 128 } else { d }
-                            } else {
-                                0 // First touch: just record position, don't jump
-                            };
-                            if delta != 0 {
-                                if let Some(sel_node_id) = self.node_editor_state.selected_node {
-                                    if let Some(node) = self.fx_graph.find_node(sel_node_id) {
-                                        if let node_editor::NodeKind::Effect { type_id } = &node.kind {
-                                            if let Some(effect) = self.fx_registry.create_effect(type_id) {
-                                                let descs = effect.param_descriptors();
-                                                if let Some(desc) = descs.get(knob_idx) {
-                                                    // Scale: full knob sweep (0-127) = full param range
-                                                    let range = desc.max - desc.min;
-                                                    let step = range / 127.0 * delta as f32;
-                                                    let current = self.node_editor_state.param_cache
-                                                        .get(&(sel_node_id, desc.id.0))
-                                                        .copied()
-                                                        .unwrap_or(desc.default);
-                                                    let val = (current + step).clamp(desc.min, desc.max);
-                                                    self.node_editor_state.param_cache.insert((sel_node_id, desc.id.0), val);
-                                                    knob_changes.push(node_editor::NodeParamChange {
-                                                        node_id: sel_node_id,
-                                                        param_id: rifflab_core::audio::ParamId(desc.id.0),
-                                                        value: val,
-                                                    });
-                                                }
+                        if delta != 0 {
+                            if let Some(sel_node_id) = self.node_editor_state.selected_node {
+                                if let Some(node) = self.fx_graph.find_node(sel_node_id) {
+                                    if let node_editor::NodeKind::Effect { type_id } = &node.kind {
+                                        if let Some(effect) = self.fx_registry.create_effect(type_id) {
+                                            let descs = effect.param_descriptors();
+                                            if let Some(desc) = descs.get(knob_idx) {
+                                                let range = desc.max - desc.min;
+                                                let step = range / 127.0 * delta as f32;
+                                                let current = self.node_editor_state.param_cache
+                                                    .get(&(sel_node_id, desc.id.0))
+                                                    .copied()
+                                                    .unwrap_or(desc.default);
+                                                let val = (current + step).clamp(desc.min, desc.max);
+                                                self.node_editor_state.param_cache.insert((sel_node_id, desc.id.0), val);
+                                                knob_changes.push(node_editor::NodeParamChange {
+                                                    node_id: sel_node_id,
+                                                    param_id: rifflab_core::audio::ParamId(desc.id.0),
+                                                    value: val,
+                                                });
                                             }
                                         }
                                     }
                                 }
                             }
-                            continue;
                         }
+                        continue;
                     }
+                }
 
-                    // Check if MIDI event matches any effect node's binding → select that node
-                    {
-                        let mut matched_node: Option<(u64, String)> = None;
-                        for node in &self.fx_graph.nodes {
-                            if let Some(ref binding) = node.midi_binding {
-                                if binding.matches_event(&event) {
-                                    matched_node = Some((node.id, node.label.clone()));
-                                    break;
-                                }
+                // Check effect node bindings → select that node
+                {
+                    let mut matched_node: Option<(u64, String)> = None;
+                    for node in &self.fx_graph.nodes {
+                        if let Some(ref binding) = node.midi_binding {
+                            if binding.matches_event(&event) {
+                                matched_node = Some((node.id, node.label.clone()));
+                                break;
                             }
                         }
-                        if let Some((id, label)) = matched_node {
-                            self.node_editor_state.selected_node = Some(id);
-                            self.message_log.push(format!("Knobs → {}", label), false);
-                            continue;
+                    }
+                    if let Some((id, label)) = matched_node {
+                        self.node_editor_state.selected_node = Some(id);
+                        self.message_log.push(format!("Knobs → {}", label), false);
+                        continue;
+                    }
+                }
+
+                // Normal mode: check preset bindings
+                if let Some(id) = self.preset_nav.find_by_midi(&event) {
+                    nav_activate = Some(id);
+                } else if let Some(ref next_bind) = self.preset_nav.midi_next {
+                    if next_bind.matches_event(&event) {
+                        if let Some(active) = self.preset_nav.active_id {
+                            if let Some(next_id) = self.preset_nav.next_from(active) {
+                                nav_activate = Some(next_id);
+                            }
                         }
                     }
-
-                    // Normal mode: check bindings
-                    // 1. Direct preset binding
-                    if let Some(id) = self.preset_nav.find_by_midi(&event) {
-                        nav_activate = Some(id);
-                    }
-                    // 2. Next/Prev navigation
-                    else if let Some(ref next_bind) = self.preset_nav.midi_next {
-                        if next_bind.matches_event(&event) {
+                }
+                if nav_activate.is_none() {
+                    if let Some(ref prev_bind) = self.preset_nav.midi_prev {
+                        if prev_bind.matches_event(&event) {
                             if let Some(active) = self.preset_nav.active_id {
-                                if let Some(next_id) = self.preset_nav.next_from(active) {
-                                    nav_activate = Some(next_id);
-                                }
-                            }
-                        }
-                    }
-                    if nav_activate.is_none() {
-                        if let Some(ref prev_bind) = self.preset_nav.midi_prev {
-                            if prev_bind.matches_event(&event) {
-                                if let Some(active) = self.preset_nav.active_id {
-                                    if let Some(prev_id) = self.preset_nav.prev_from(active) {
-                                        nav_activate = Some(prev_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // 3. Legacy preset bank
-                    if nav_activate.is_none() {
-                        if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
-                            if *value > 0 {
-                                if let Some(idx) = self.preset_bank.find_by_cc(*cc) {
-                                    bank_activate = Some(idx);
+                                if let Some(prev_id) = self.preset_nav.prev_from(active) {
+                                    nav_activate = Some(prev_id);
                                 }
                             }
                         }
                     }
                 }
-            }
-            if let Some(id) = nav_activate {
-                self.activate_nav_preset(id);
-            }
-            if let Some(idx) = bank_activate {
-                self.activate_preset(idx);
-            }
-            if !knob_changes.is_empty() {
-                self.apply_node_param_changes(&knob_changes);
-            }
-        }
-
-        // Poll background tab parsing
-        {
-            let (logs, _got_doc) = self.tabs.poll();
-            for msg in logs {
-                self.message_log.push(msg, false);
+                if nav_activate.is_none() {
+                    if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
+                        if *value > 0 {
+                            if let Some(idx) = self.preset_bank.find_by_cc(*cc) {
+                                bank_activate = Some(idx);
+                            }
+                        }
+                    }
+                }
             }
         }
+        if let Some(id) = nav_activate {
+            self.activate_nav_preset(id);
+        }
+        if let Some(idx) = bank_activate {
+            self.activate_preset(idx);
+        }
+        if !knob_changes.is_empty() {
+            self.apply_node_param_changes(&knob_changes);
+        }
+    }
 
-        // Drain pitch frames, run comparison, update score, track played notes
+    /// Process pitch frames: update tuner, track played notes, run comparator.
+    fn handle_pitch(&mut self, position_secs: f64, position: &rifflab_core::transport::SongPosition) {
         while let Ok(pitch) = self.pitch_rx.pop() {
             self.tuner.current_pitch = pitch.clone();
 
-            // Tuner smoothing with configurable parameters
+            // Tuner smoothing
             if pitch.frequency_hz > 0.0 && pitch.confidence > self.tuner.min_confidence {
                 let new_note = pitch.midi_note;
                 if new_note == self.tuner.note {
@@ -1513,30 +1509,25 @@ impl eframe::App for RiffLabApp {
                     }
                 }
                 self.tuner.last_active = std::time::Instant::now();
-            } else {
-                if self.tuner.last_active.elapsed()
-                    > std::time::Duration::from_millis(self.tuner.timeout_ms as u64)
-                {
-                    self.tuner.note = 0;
-                    self.tuner.cents = 0.0;
-                    self.tuner.confidence = 0.0;
-                }
+            } else if self.tuner.last_active.elapsed()
+                > std::time::Duration::from_millis(self.tuner.timeout_ms as u64)
+            {
+                self.tuner.note = 0;
+                self.tuner.cents = 0.0;
+                self.tuner.confidence = 0.0;
             }
 
-            // Track played notes for piano roll display
+            // Track played notes for piano roll
             let is_silent = pitch.frequency_hz <= 0.0
                 || pitch.confidence < PITCH_CONFIDENCE_THRESHOLD;
-            let current_time = position_secs;
 
             if is_silent {
-                // Close any active note
                 self.tracking_was_silent = true;
                 self.tracking_midi_note = 0;
             } else {
                 let is_new_note =
                     self.tracking_was_silent || pitch.midi_note != self.tracking_midi_note;
                 if is_new_note {
-                    // Determine accuracy from comparison or raw cents
                     let accuracy = if pitch.cents_deviation.abs() <= 5.0 {
                         AccuracyBucket::Perfect
                     } else if pitch.cents_deviation.abs() <= 15.0 {
@@ -1548,21 +1539,19 @@ impl eframe::App for RiffLabApp {
                     };
                     self.played_notes.push(PlayedNote {
                         midi_note: pitch.midi_note,
-                        start_seconds: current_time,
-                        end_seconds: current_time,
+                        start_seconds: position_secs,
+                        end_seconds: position_secs,
                         accuracy,
                     });
                     self.tracking_midi_note = pitch.midi_note;
                     self.tracking_was_silent = false;
                 } else if let Some(last) = self.played_notes.last_mut() {
-                    // Extend the current note
-                    last.end_seconds = current_time;
+                    last.end_seconds = position_secs;
                 }
             }
 
             if let Some(ref mut comparator) = self.comparator {
-                let comparison = comparator.compare(&pitch, &position);
-                // Update the accuracy of the current played note from comparison data
+                let comparison = comparator.compare(&pitch, position);
                 if comparison.reference_note.is_some() {
                     if let Some(last) = self.played_notes.last_mut() {
                         if !comparison.note_correct {
@@ -1575,8 +1564,55 @@ impl eframe::App for RiffLabApp {
                 self.scorer.feed(comparison);
             }
         }
+    }
+}
 
-        // ─── Toolbar ─────────────────────────────────────────────
+impl eframe::App for RiffLabApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ─── Phase 1: Poll background operations ─────────────────
+        self.poll_background();
+
+        // ─── Phase 2: Read audio/transport state ─────────────────
+        let fs = self.poll_audio_state();
+
+        // ─── Phase 3: Handle input ───────────────────────────────
+        self.handle_midi();
+        self.handle_pitch(fs.position_secs, &fs.position);
+
+        // ─── Phase 4: Draw UI ────────────────────────────────────
+        self.draw_toolbar(ctx, &fs);
+        self.draw_status_bar(ctx, &fs);
+        self.draw_bottom_drawer(ctx, &fs);
+
+        // Throttled track FX recompile (200ms after last change)
+        if let Some(dirty_since) = self.track_fx_dirty_since {
+            if dirty_since.elapsed() >= std::time::Duration::from_millis(200) {
+                if let Some(track_idx) = self.editing_track_fx {
+                    self.save_track_fx_from_editor(track_idx);
+                }
+                self.track_fx_dirty_since = None;
+            }
+        }
+
+        self.draw_sidebar(ctx, &fs);
+        self.draw_arrangement(ctx, &fs);
+
+        self.draw_audio_settings(ctx);
+        self.draw_tuner_settings(ctx);
+        self.draw_midi_panel(ctx);
+        self.draw_message_log(ctx);
+
+        ctx.request_repaint();
+    }
+}
+
+// ─── Extracted UI panel methods ─────────────────────────────────────────────
+
+impl RiffLabApp {
+    fn draw_toolbar(&mut self, ctx: &egui::Context, fs: &FrameState) {
+        let state = fs.state;
+        let position_secs = fs.position_secs;
+
         egui::TopBottomPanel::top("toolbar")
             .exact_height(36.0)
             .show(ctx, |ui| {
@@ -1836,8 +1872,15 @@ impl eframe::App for RiffLabApp {
                     });
                 });
             });
+    }
 
-        // ─── Status bar ──────────────────────────────────────────
+    fn draw_status_bar(&mut self, ctx: &egui::Context, fs: &FrameState) {
+        let state = fs.state;
+        let is_running = fs.is_running;
+        let loop_enabled = fs.loop_enabled;
+        let loop_start = fs.loop_start;
+        let loop_end = fs.loop_end;
+
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(24.0)
             .show(ctx, |ui| {
@@ -1979,9 +2022,17 @@ impl eframe::App for RiffLabApp {
                     });
                 });
             });
+    }
 
-        // ─── Bottom Drawer (Piano Roll / Accuracy / Effects) ─────
-        if self.drawer_open {
+    fn draw_bottom_drawer(&mut self, ctx: &egui::Context, fs: &FrameState) {
+        let state = fs.state;
+        let position_secs = fs.position_secs;
+        let position_frame = fs.position_frame;
+
+        if !self.drawer_open {
+            return;
+        }
+        {
             egui::TopBottomPanel::bottom("bottom_drawer")
                 .resizable(true)
                 .min_height(MIN_DRAWER_HEIGHT)
@@ -2309,17 +2360,9 @@ impl eframe::App for RiffLabApp {
                     }
                 });
         }
+    }
 
-        // ─── Throttled track FX recompile (200ms after last change) ────────
-        if let Some(dirty_since) = self.track_fx_dirty_since {
-            if dirty_since.elapsed() >= std::time::Duration::from_millis(200) {
-                if let Some(track_idx) = self.editing_track_fx {
-                    self.save_track_fx_from_editor(track_idx);
-                }
-                self.track_fx_dirty_since = None;
-            }
-        }
-
+    fn draw_sidebar(&mut self, ctx: &egui::Context, _fs: &FrameState) {
         // ─── Sidebar ─────────────────────────────────────────────
         // Snapshot graph state with try_lock — never block the audio thread.
         // If we can't get the lock this frame, use stale data from last frame.
@@ -2615,7 +2658,15 @@ impl eframe::App for RiffLabApp {
             }
         }
 
-        // ─── Arrangement View (Central Panel) ────────────────────
+    }
+
+    fn draw_arrangement(&mut self, ctx: &egui::Context, fs: &FrameState) {
+        let state = fs.state;
+        let position_frame = fs.position_frame;
+        let loop_enabled = fs.loop_enabled;
+        let loop_start = fs.loop_start;
+        let loop_end = fs.loop_end;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_size();
 
@@ -3168,15 +3219,6 @@ impl eframe::App for RiffLabApp {
             // Extend the playhead line from the ruler across the whole arrangement
             let _ = ruler_rect; // used above for playhead triangle
         });
-
-        // ─── Audio Settings Window ───────────────────────────────
-        self.draw_audio_settings(ctx);
-        self.draw_tuner_settings(ctx);
-        self.draw_midi_panel(ctx);
-        self.draw_message_log(ctx);
-
-        // Request continuous repaint for smooth animation
-        ctx.request_repaint();
     }
 }
 
