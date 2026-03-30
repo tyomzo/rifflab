@@ -10,3 +10,4 @@ rifflab-ipc = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+symphonia = { version = "0.5", features = ["all"] }

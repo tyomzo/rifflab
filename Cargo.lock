@@ -3797,6 +3797,7 @@ dependencies = [
  "log",
  "rifflab-core",
  "rifflab-ipc",
+ "symphonia",
  "thiserror 2.0.18",
 ]
 

@@ -333,29 +333,7 @@ struct PlayedNote {
 
 // ─── Background File Loading ─────────────────────────────────────────────────
 
-/// A single stem track ready to load.
-struct StemTrack {
-    stem_type: StemType,
-    decoded: decode::DecodedAudio,
-    overview: WaveformOverview,
-    spectrogram: rifflab_analysis::spectrogram::SpectrogramResult,
-}
-
-/// Result of background file decoding + optional stem separation.
-struct LoadedFile {
-    file_name: String,
-    stems: Vec<StemTrack>,
-}
-
-/// Messages sent from the loading thread to the UI.
-enum LoadMsg {
-    /// Progress status text.
-    Status(String),
-    /// Loading finished successfully.
-    Done(LoadedFile),
-    /// Loading failed.
-    Error(String),
-}
+use rifflab_stems::loader::{self as stem_loader, LoadMsg};
 
 /// State of background file loading.
 enum FileLoadState {
@@ -853,225 +831,13 @@ impl RiffLabApp {
             .unwrap_or("Unknown")
             .to_string();
 
-        let target_rate = {
-            let eng = self.engine.lock().unwrap();
-            eng.transport().sample_rate()
-        };
-
-        let path_buf = path.to_path_buf();
-        let name_clone = file_name.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            let _ = tx.send(LoadMsg::Status(format!("Decoding {}...", name_clone)));
-
-            let decoded = match decode::decode_file(&path_buf) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = tx.send(LoadMsg::Error(format!("Decode failed: {e}")));
-                    return;
-                }
-            };
-
-            let src_rate = decoded.sample_rate;
-            let duration_secs = decoded.frames as f64 / decoded.sample_rate as f64;
-            let _ = tx.send(LoadMsg::Status(format!(
-                "Decoded: {:.1}s, {}ch, {}Hz",
-                duration_secs, decoded.channels, src_rate,
-            )));
-
-            // Try stem separation with demucs
-            let _ = tx.send(LoadMsg::Status("Separating stems with Demucs (GPU)...".into()));
-            let stem_dir = std::env::temp_dir().join(format!("rifflab_stems_{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&stem_dir);
-
-            // Find the run_demucs.py script relative to the binary
-            let worker_script = {
-                let exe = std::env::current_exe().unwrap_or_default();
-                let workspace_root = exe.parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.parent())
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                workspace_root.join("workers").join("run_demucs.py")
-            };
-
-            let demucs_out_dir = stem_dir.join("stems");
-
-            // Run demucs with streaming stdout to status bar
-            let demucs_success = {
-                use std::io::BufRead;
-                let mut child = match std::process::Command::new("python3")
-                    .arg(&worker_script)
-                    .arg(&path_buf)
-                    .arg(&demucs_out_dir)
-                    .arg("htdemucs_ft")
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(LoadMsg::Status(format!("Demucs spawn failed: {e}")));
-                        // Fall through to single-track loading
-                        let _ = tx.send(LoadMsg::Status("Loading as single track...".into()));
-                        let decoded_rs = if src_rate != target_rate {
-                            decode::resample(decoded, target_rate)
-                        } else {
-                            decoded
-                        };
-                        let overview = WaveformOverview::from_interleaved(
-                            &decoded_rs.data, decoded_rs.channels,
-                            OVERVIEW_SAMPLES_PER_PEAK, TRACK_COLORS[0], name_clone.clone(),
-                        );
-                        let _ = tx.send(LoadMsg::Done(LoadedFile {
-                            file_name: name_clone,
-                            stems: vec![StemTrack {
-                                stem_type: StemType::Other, decoded: decoded_rs, overview,
-                                spectrogram: rifflab_analysis::spectrogram::SpectrogramResult {
-                                    magnitudes: Vec::new(), num_bins: 0, num_columns: 0, hop_size: 512, fft_size: 2048,
-                                },
-                            }],
-                        }));
-                        return;
-                    }
-                };
-
-                // Stream stdout lines as status messages
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = std::io::BufReader::new(stdout);
-                    let tx2 = tx.clone();
-                    std::thread::spawn(move || {
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                if !line.trim().is_empty() {
-                                    let _ = tx2.send(LoadMsg::Status(format!("[demucs] {}", line.trim())));
-                                }
-                            }
-                        }
-                    });
-                }
-                // Stream stderr lines as error messages
-                if let Some(stderr) = child.stderr.take() {
-                    let reader = std::io::BufReader::new(stderr);
-                    let tx3 = tx.clone();
-                    std::thread::spawn(move || {
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                let trimmed = line.trim();
-                                if !trimmed.is_empty() && !trimmed.contains("UserWarning") {
-                                    let _ = tx3.send(LoadMsg::Status(format!("[demucs] {}", trimmed)));
-                                }
-                            }
-                        }
-                    });
-                }
-
-                match child.wait() {
-                    Ok(status) => status.success(),
-                    Err(e) => {
-                        let _ = tx.send(LoadMsg::Status(format!("Demucs wait failed: {e}")));
-                        false
-                    }
-                }
-            };
-
-            let stem_names = ["vocals", "drums", "bass", "other"];
-            let stem_types = [StemType::Vocals, StemType::Drums, StemType::Bass, StemType::Other];
-
-            let mut stems: Vec<StemTrack> = Vec::new();
-
-            if demucs_success && demucs_out_dir.exists() {
-                let _ = tx.send(LoadMsg::Status("Loading separated stems...".into()));
-
-                for (i, (stem_name, stem_type)) in stem_names.iter().zip(stem_types.iter()).enumerate() {
-                    let stem_path = demucs_out_dir.join(format!("{}.wav", stem_name));
-                    if stem_path.exists() {
-                        match decode::decode_file(&stem_path) {
-                            Ok(stem_decoded) => {
-                                let stem_decoded = if stem_decoded.sample_rate != target_rate {
-                                    decode::resample(stem_decoded, target_rate)
-                                } else {
-                                    stem_decoded
-                                };
-
-                                let color = TRACK_COLORS[i % TRACK_COLORS.len()];
-                                let overview = WaveformOverview::from_interleaved(
-                                    &stem_decoded.data,
-                                    stem_decoded.channels,
-                                    OVERVIEW_SAMPLES_PER_PEAK,
-                                    color,
-                                    stem_name.to_string(),
-                                );
-                                let mono = rifflab_analysis::spectrogram::downmix_to_mono(
-                                    &stem_decoded.data, stem_decoded.channels,
-                                );
-                                let spec = rifflab_analysis::spectrogram::compute_spectrogram(
-                                    &mono, stem_decoded.sample_rate,
-                                );
-                                stems.push(StemTrack {
-                                    stem_type: *stem_type,
-                                    decoded: stem_decoded,
-                                    overview,
-                                    spectrogram: spec,
-                                });
-                                let _ = tx.send(LoadMsg::Status(format!("Loaded stem: {}", stem_name)));
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to decode stem {}: {e}", stem_name);
-                            }
-                        }
-                    }
-                }
-
-                // Clean up temp files
-                let _ = std::fs::remove_dir_all(&stem_dir);
-            }
-
-            // If demucs failed or produced no stems, fall back to single track
-            if stems.is_empty() {
-                if !demucs_success {
-                    let _ = tx.send(LoadMsg::Status("Demucs failed, loading as single track...".into()));
-                } else {
-                    let _ = tx.send(LoadMsg::Status("No stems found, loading as single track...".into()));
-                }
-
-                let decoded = if src_rate != target_rate {
-                    decode::resample(decoded, target_rate)
-                } else {
-                    decoded
-                };
-                let overview = WaveformOverview::from_interleaved(
-                    &decoded.data,
-                    decoded.channels,
-                    OVERVIEW_SAMPLES_PER_PEAK,
-                    TRACK_COLORS[0],
-                    name_clone.clone(),
-                );
-                let mono = rifflab_analysis::spectrogram::downmix_to_mono(
-                    &decoded.data, decoded.channels,
-                );
-                let spec = rifflab_analysis::spectrogram::compute_spectrogram(
-                    &mono, decoded.sample_rate,
-                );
-                stems.push(StemTrack {
-                    stem_type: StemType::Other,
-                    decoded,
-                    overview,
-                    spectrogram: spec,
-                });
-            }
-
-            let _ = tx.send(LoadMsg::Done(LoadedFile {
-                file_name: name_clone,
-                stems,
-            }));
-        });
+        let rx = stem_loader::load_in_background(path);
 
         self.file_name = format!("Loading {}...", file_name);
         self.message_log.clear();
         self.message_log.push(format!("Opening {}...", file_name), false);
         self.session.original_file_path = Some(path.to_path_buf());
-        self.session.session_path = None; // new file = no saved session yet
+        self.session.session_path = None;
         self.file_load_state = FileLoadState::Loading {
             file_name,
             receiver: rx,
@@ -1092,52 +858,81 @@ impl RiffLabApp {
                             log::info!("[load] {msg}");
                             self.message_log.push(msg, false);
                         }
-                        Ok(LoadMsg::Done(loaded)) => {
-                            let num_stems = loaded.stems.len();
-                            let load_msg = {
-                                let mut eng = self.engine.lock().unwrap();
-                                eng.transport_mut().stop();
-
-                                let mut players = Vec::new();
-                                let mut max_frames: u64 = 0;
-                                for stem in &loaded.stems {
-                                    let player = StemPlayer::new(
-                                        stem.stem_type,
-                                        stem.decoded.data.clone(),
-                                        stem.decoded.channels,
-                                    );
-                                    max_frames = max_frames.max(player.total_frames());
-                                    players.push(player);
-                                }
-
-                                eng.graph().lock().unwrap().load_stems(players);
-                                eng.transport().set_length(max_frames);
-
-                                let first = &loaded.stems[0];
-                                format!(
-                                    "Loaded: {} ({} stems, {:.1}s, {}Hz)",
-                                    loaded.file_name,
-                                    num_stems,
-                                    max_frames as f64 / first.decoded.sample_rate as f64,
-                                    first.decoded.sample_rate,
-                                )
+                        Ok(LoadMsg::Done { file_name: loaded_name, stems }) => {
+                            let target_rate = {
+                                let eng = self.engine.lock().unwrap();
+                                eng.transport().sample_rate()
                             };
 
-                            self.file_name = loaded.file_name;
+                            let num_stems = stems.len();
+                            let mut players = Vec::new();
                             let mut overviews = Vec::new();
                             let mut specs = Vec::new();
-                            for (i, stem) in loaded.stems.into_iter().enumerate() {
+                            let mut max_frames: u64 = 0;
+                            let mut first_rate = target_rate;
+
+                            for (i, stem) in stems.into_iter().enumerate() {
+                                // Resample if needed
+                                let decoded = if stem.sample_rate != target_rate {
+                                    decode::resample(
+                                        decode::DecodedAudio {
+                                            data: stem.data,
+                                            sample_rate: stem.sample_rate,
+                                            channels: stem.channels,
+                                            frames: stem.frames,
+                                        },
+                                        target_rate,
+                                    )
+                                } else {
+                                    decode::DecodedAudio {
+                                        data: stem.data,
+                                        sample_rate: stem.sample_rate,
+                                        channels: stem.channels,
+                                        frames: stem.frames,
+                                    }
+                                };
+
+                                if i == 0 { first_rate = decoded.sample_rate; }
+
                                 let color = TRACK_COLORS[i % TRACK_COLORS.len()];
-                                specs.push(SpectrogramDisplay {
-                                    data: stem.spectrogram,
-                                    color,
-                                    name: stem.overview.name.clone(),
-                                });
-                                overviews.push(stem.overview);
+                                let overview = WaveformOverview::from_interleaved(
+                                    &decoded.data, decoded.channels,
+                                    OVERVIEW_SAMPLES_PER_PEAK, color, stem.name.clone(),
+                                );
+                                let mono = rifflab_analysis::spectrogram::downmix_to_mono(
+                                    &decoded.data, decoded.channels,
+                                );
+                                let spec = rifflab_analysis::spectrogram::compute_spectrogram(
+                                    &mono, decoded.sample_rate,
+                                );
+                                specs.push(SpectrogramDisplay { data: spec, color, name: stem.name });
+
+                                let player = StemPlayer::new(
+                                    stem.stem_type, decoded.data, decoded.channels,
+                                );
+                                max_frames = max_frames.max(player.total_frames());
+                                players.push(player);
+                                overviews.push(overview);
                             }
+
+                            {
+                                let mut eng = self.engine.lock().unwrap();
+                                eng.transport_mut().stop();
+                                eng.graph().lock().unwrap().load_stems(players);
+                                eng.transport().set_length(max_frames);
+                            }
+
+                            let load_msg = format!(
+                                "Loaded: {} ({} stems, {:.1}s, {}Hz)",
+                                loaded_name, num_stems,
+                                max_frames as f64 / first_rate as f64,
+                                first_rate,
+                            );
+
+                            self.file_name = loaded_name;
                             self.waveform_overviews = overviews;
                             self.spectrograms = specs;
-                            self.spectrogram_texture = None; // invalidate cache
+                            self.spectrogram_texture = None;
 
                             self.comparator = None;
                             self.reference_notes.clear();
