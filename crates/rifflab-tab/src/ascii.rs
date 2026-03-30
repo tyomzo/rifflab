@@ -1,25 +1,8 @@
 //! Rule-based ASCII bass tab parser (fallback for when LLM is unavailable).
 
 use crate::model::{NoteSource, TabNote, Technique, STANDARD_TUNING, DROP_D_TUNING};
+use crate::util::strip_markdown;
 use std::collections::HashMap;
-
-/// Strip markdown formatting (code fences, headers, bold) from tab text.
-fn strip_markdown(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") { continue; }
-        let line = if trimmed.starts_with('#') {
-            trimmed.trim_start_matches('#').trim()
-        } else {
-            trimmed
-        };
-        let line = line.replace("**", "").replace("__", "");
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
 
 /// Detect bass tuning from text content.
 /// Scans for keywords like "Drop D", "Tuning: DADG", "D standard", etc.
@@ -228,14 +211,10 @@ fn duplicate_last_group(notes: &mut Vec<TabNote>, total_times: u32, position: &m
             let mut dup = TabNote::new(note.string, note.fret, NoteSource::AsciiParse);
             dup.technique = note.technique;
             dup.time_secs = *position as f64;
-            all_notes_push_dup(notes, dup);
+            notes.push(dup);
         }
         *position += group.len() as u32;
     }
-}
-
-fn all_notes_push_dup(notes: &mut Vec<TabNote>, note: TabNote) {
-    notes.push(note);
 }
 
 /// A group of 4 tab lines (G, D, A, E from top to bottom).

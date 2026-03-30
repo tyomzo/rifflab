@@ -7,7 +7,7 @@ pub fn all_positions(midi_note: u8, tuning: &[u8; 4]) -> Vec<(u8, u8)> {
     for (string, &open) in tuning.iter().enumerate() {
         if midi_note >= open {
             let fret = midi_note - open;
-            if fret <= 24 {
+            if fret <= crate::constants::MAX_FRET {
                 positions.push((string as u8, fret));
             }
         }

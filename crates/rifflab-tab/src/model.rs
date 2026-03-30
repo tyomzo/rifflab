@@ -39,7 +39,7 @@ impl TabNote {
             beat: None,
             measure: None,
             technique: None,
-            confidence: 0.8,
+            confidence: crate::constants::DEFAULT_CONFIDENCE,
             source,
             section: None,
         }
@@ -103,7 +103,7 @@ impl TabDocument {
             title: title.into(),
             artist: None,
             tuning: STANDARD_TUNING,
-            tempo: TempoMap::constant(120.0),
+            tempo: TempoMap::constant(crate::constants::DEFAULT_BPM),
             time_signature: TimeSignature { beats_per_measure: 4, beat_unit: 4 },
             notes: Vec::new(),
             measures: Vec::new(),

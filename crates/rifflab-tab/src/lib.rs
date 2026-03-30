@@ -1,3 +1,4 @@
+pub mod constants;
 pub mod error;
 pub mod model;
 pub mod io;
@@ -7,3 +8,4 @@ pub mod fret_map;
 pub mod audio;
 pub mod fusion;
 pub mod render_ascii;
+pub mod util;

@@ -39,7 +39,7 @@ pub fn transcribe_audio(
     let mut prev_fret: Option<(u8, u8)> = None;
 
     for tn in &transcribed {
-        if tn.midi_note == 0 || tn.confidence < 0.3 {
+        if tn.midi_note == 0 || tn.confidence < crate::constants::MIN_CONFIDENCE {
             continue; // Skip silence/low-confidence
         }
 
@@ -86,7 +86,7 @@ fn estimate_notes(
 
         // Filter out silence frames and collect valid pitches
         let valid: Vec<(f32, f32)> = frames.iter()
-            .filter(|&&(_, freq, conf)| freq > 20.0 && conf > 0.3)
+            .filter(|&&(_, freq, conf)| freq > 20.0 && conf > crate::constants::MIN_CONFIDENCE)
             .map(|&(_, freq, conf)| (freq, conf))
             .collect();
 
@@ -124,7 +124,7 @@ fn freq_to_midi(freq: f32) -> u8 {
 /// Estimate BPM from onset times using autocorrelation.
 pub fn estimate_bpm(onsets: &[f64]) -> f64 {
     if onsets.len() < 4 {
-        return 120.0; // default
+        return crate::constants::DEFAULT_BPM;
     }
 
     // Compute inter-onset intervals
@@ -147,7 +147,7 @@ pub fn estimate_bpm(onsets: &[f64]) -> f64 {
         }
     }
 
-    120.0
+    crate::constants::DEFAULT_BPM
 }
 
 #[cfg(test)]

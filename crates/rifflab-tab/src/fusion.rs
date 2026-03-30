@@ -16,17 +16,19 @@ pub fn fuse(
     audio_notes: &[TabNote],
     tuning: &[u8; 4],
 ) -> Vec<TabNote> {
+    use crate::constants::{MIN_CONFIDENCE, CONFIDENCE_DAMPING};
+
     if ascii_notes.is_empty() {
         return audio_notes.iter().map(|n| {
             let mut n = n.clone();
-            n.confidence *= 0.7;
+            n.confidence *= CONFIDENCE_DAMPING;
             n
         }).collect();
     }
     if audio_notes.is_empty() {
         return ascii_notes.iter().map(|n| {
             let mut n = n.clone();
-            n.confidence = 0.3;
+            n.confidence = MIN_CONFIDENCE;
             n
         }).collect();
     }
@@ -92,7 +94,7 @@ pub fn fuse(
         if !audio_matched[i] {
             let mut n = note.clone();
             n.source = NoteSource::AudioTranscription;
-            n.confidence *= 0.7;
+            n.confidence *= CONFIDENCE_DAMPING;
             result.push(n);
         }
     }
@@ -102,7 +104,7 @@ pub fn fuse(
         if !ascii_matched[i] {
             let mut n = note.clone();
             n.source = NoteSource::AsciiParse;
-            n.confidence = 0.3;
+            n.confidence = MIN_CONFIDENCE;
             result.push(n);
         }
     }
@@ -121,7 +123,7 @@ fn dtw_align(seq_a: &[u8], seq_b: &[u8]) -> Vec<(usize, usize)> {
     }
 
     // Sakoe-Chiba band: window = 10% of max sequence length
-    let window = ((n.max(m) as f64 * 0.1).ceil() as usize).max(5);
+    let window = ((n.max(m) as f64 * 0.1).ceil() as usize).max(crate::constants::DTW_MIN_WINDOW);
 
     // Cost matrix (use f32 to save memory)
     let mut cost = vec![vec![f32::INFINITY; m + 1]; n + 1];

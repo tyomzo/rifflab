@@ -87,7 +87,11 @@ pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<S
     send("Sending tab to Claude for parsing...".into());
 
     // Truncate input to 50KB
-    let input = if cleaned.len() > 51200 { &cleaned[..51200] } else { &cleaned };
+    let input = if cleaned.len() > crate::constants::LLM_INPUT_TRUNCATE {
+        &cleaned[..crate::constants::LLM_INPUT_TRUNCATE]
+    } else {
+        &cleaned
+    };
 
     match call_claude(&api_key, input) {
         Ok(notes) if !notes.is_empty() => {
@@ -105,29 +109,7 @@ pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<S
     }
 }
 
-/// Strip markdown formatting to produce clean tab text.
-fn strip_markdown(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_code_block = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue; // skip the fence line itself
-        }
-        // Strip markdown headers (## → plain text)
-        let line = if trimmed.starts_with('#') {
-            trimmed.trim_start_matches('#').trim()
-        } else {
-            trimmed
-        };
-        // Strip bold/italic markers
-        let line = line.replace("**", "").replace("__", "");
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
+use crate::util::strip_markdown;
 
 fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, crate::error::TabError> {
     let client = reqwest::blocking::Client::builder()
@@ -189,7 +171,7 @@ fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, crate::err
         TabNote {
             id: Uuid::new_v4(),
             string: an.string.min(3),
-            fret: an.fret.min(24),
+            fret: an.fret.min(crate::constants::MAX_FRET),
             time_secs: 0.0,
             duration_secs: 0.0,
             beat: None,
