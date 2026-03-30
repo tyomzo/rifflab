@@ -723,6 +723,8 @@ struct RiffLabApp {
     original_file_path: Option<std::path::PathBuf>,
     /// Background save receiver.
     save_receiver: Option<std::sync::mpsc::Receiver<(bool, String)>>,
+    /// Pending folder dialog result (for non-blocking Save As).
+    save_dialog_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
     /// Pre-computed spectrograms (one per stem).
     spectrograms: Vec<SpectrogramDisplay>,
     /// Cached spectrogram texture.
@@ -760,6 +762,8 @@ struct RiffLabApp {
     editing_preset_id: Option<u64>,
     /// Whether we are currently recording input.
     is_recording: bool,
+    /// Counter for naming recorded takes.
+    recording_take: u32,
     /// Per-track FxGraph (for editing in the node editor). Index = track index.
     stem_graphs: Vec<Option<node_editor::FxGraph>>,
     /// Which track's FX is being edited (None = live input, Some(idx) = track).
@@ -772,6 +776,10 @@ struct RiffLabApp {
     tab_document: Option<rifflab_tab::model::TabDocument>,
     /// Tab view state (scroll, zoom, selection).
     tab_view_state: tab_view::TabViewState,
+    /// Pending tab parse result from background thread.
+    tab_parse_rx: Option<std::sync::mpsc::Receiver<rifflab_tab::model::TabDocument>>,
+    /// Log messages from background tab parsing.
+    tab_parse_log_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// MIDI CC numbers for physical knobs. Starts with MiniLab 3 defaults, can be re-learned.
     midi_knob_ccs: Vec<u8>,
     /// When true, next incoming CCs teach knob slots sequentially.
@@ -869,6 +877,7 @@ impl RiffLabApp {
             session_path: None,
             original_file_path: None,
             save_receiver: None,
+            save_dialog_rx: None,
             spectrograms: Vec::new(),
             spectrogram_texture: None,
             spectrogram_cache_key: (0, 0, 0, 0, 0),
@@ -893,12 +902,15 @@ impl RiffLabApp {
             midi_learn: preset_graph::MidiLearnTarget::None,
             editing_preset_id: None,
             is_recording: false,
+            recording_take: 0,
             stem_graphs: Vec::new(),
             editing_track_fx: None,
             track_fx_dirty_since: None,
             midi_learn_node: None,
             tab_document: None,
             tab_view_state: tab_view::TabViewState::default(),
+            tab_parse_rx: None,
+            tab_parse_log_rx: None,
             midi_knob_ccs: MINILAB3_KNOB_CCS.to_vec(),
             midi_knob_learning: false,
             midi_knob_last: std::collections::HashMap::new(),
@@ -1286,6 +1298,23 @@ impl eframe::App for RiffLabApp {
             }
         }
 
+        // ─── Poll async Save As dialog ───────────────────────────
+        if let Some(ref rx) = self.save_dialog_rx {
+            match rx.try_recv() {
+                Ok(Some(dir)) => {
+                    self.save_dialog_rx = None;
+                    self.do_save_to_dir(dir);
+                }
+                Ok(None) => {
+                    self.save_dialog_rx = None; // user cancelled
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.save_dialog_rx = None;
+                }
+                _ => {} // dialog still open
+            }
+        }
+
         // ─── Drain channels ──────────────────────────────────────
         while let Ok(meter) = self.meter_rx.pop() {
             // Smooth with exponential moving average
@@ -1570,6 +1599,21 @@ impl eframe::App for RiffLabApp {
             }
         }
 
+        // Poll background tab parsing
+        if let Some(ref rx) = self.tab_parse_log_rx {
+            while let Ok(msg) = rx.try_recv() {
+                self.message_log.push(msg, false);
+            }
+        }
+        if let Some(ref rx) = self.tab_parse_rx {
+            if let Ok(tab) = rx.try_recv() {
+                self.message_log.push(format!("Tab ready: {} ({} notes)", tab.title, tab.notes.len()), false);
+                self.tab_document = Some(tab);
+                self.tab_parse_rx = None;
+                self.tab_parse_log_rx = None;
+            }
+        }
+
         // Drain pitch frames, run comparison, update score, track played notes
         while let Ok(pitch) = self.pitch_rx.pop() {
             self.current_pitch = pitch.clone();
@@ -1679,16 +1723,22 @@ impl eframe::App for RiffLabApp {
 
                     // Save session
                     let has_stems = !self.waveform_overviews.is_empty();
-                    let is_saving = self.save_receiver.is_some();
+                    let is_busy = self.save_receiver.is_some() || self.save_dialog_rx.is_some();
                     if has_stems {
                         if self.session_path.is_some() {
-                            if ui.add_enabled(!is_saving, egui::Button::new("Save"))
+                            if ui.add_enabled(!is_busy, egui::Button::new("Save"))
                                 .on_hover_text("Save session (overwrite)").clicked() {
                                 self.save_current_session(false);
                             }
                         }
-                        let save_as_label = if is_saving { "Saving..." } else { "Save As" };
-                        if ui.add_enabled(!is_saving, egui::Button::new(save_as_label))
+                        let save_as_label = if self.save_receiver.is_some() {
+                            "Saving..."
+                        } else if self.save_dialog_rx.is_some() {
+                            "Picking folder..."
+                        } else {
+                            "Save As"
+                        };
+                        if ui.add_enabled(!is_busy, egui::Button::new(save_as_label))
                             .on_hover_text("Save session to new folder").clicked() {
                             self.save_current_session(true);
                         }
@@ -2177,53 +2227,72 @@ impl eframe::App for RiffLabApp {
                                 let playback_secs = position_frame as f64 / self.sample_rate.max(1) as f64;
                                 let tab_action = tab_view::draw_tab_view(
                                     ui, tab, playback_secs, tab_is_playing, &mut self.tab_view_state,
+                                    self.sample_rate, &mut self.scroll_offset_frames, &mut self.frames_per_pixel,
                                 );
                                 if let tab_view::TabViewAction::Seek(t) = tab_action {
                                     let frame = (t * self.sample_rate as f64) as u64;
                                     self.engine.lock().unwrap().transport_mut().seek(frame);
                                 }
+                            } else if self.tab_parse_rx.is_some() {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.spinner();
+                                    ui.label("Parsing tab...");
+                                });
                             } else {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(20.0);
                                     ui.label("No tab loaded");
                                     ui.add_space(10.0);
-                                    if ui.button("Paste ASCII Tab").clicked() {
-                                        // Will be handled by a text input dialog
-                                        self.message_log.push("Paste tab text and press Enter".into(), false);
-                                    }
-                                    if ui.button("Load .rltab File").clicked() {
+                                    if ui.button("Open Tab File").clicked() {
                                         if let Some(path) = rfd::FileDialog::new()
-                                            .add_filter("RiffLab Tab", &["rltab", "json"])
+                                            .add_filter("Tab files", &["rltab", "json", "txt", "md", "tab"])
                                             .pick_file()
                                         {
+                                            // Try as .rltab JSON first, then as ASCII tab text
                                             match rifflab_tab::io::load_tab(&path) {
                                                 Ok(tab) => {
                                                     self.message_log.push(format!("Tab loaded: {}", tab.title), false);
                                                     self.tab_document = Some(tab);
                                                 }
-                                                Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                                Err(_) => {
+                                                    // Parse as ASCII tab on background thread (LLM call may be slow)
+                                                    match std::fs::read_to_string(&path) {
+                                                        Ok(text) => {
+                                                            let title = path.file_stem()
+                                                                .map(|s| s.to_string_lossy().to_string())
+                                                                .unwrap_or_else(|| "Imported Tab".into());
+                                                            self.message_log.push(format!("Parsing tab: {}...", title), false);
+
+                                                            let (tab_tx, tab_rx) = std::sync::mpsc::channel();
+                                                            let (log_tx, log_rx) = std::sync::mpsc::channel();
+                                                            self.tab_parse_rx = Some(tab_rx);
+                                                            self.tab_parse_log_rx = Some(log_rx);
+
+                                                            std::thread::spawn(move || {
+                                                                let notes = rifflab_tab::ascii_llm::parse_ascii_tab_llm(&text, Some(&log_tx));
+                                                                if notes.is_empty() {
+                                                                    let _ = log_tx.send("No notes found in file".into());
+                                                                    return;
+                                                                }
+                                                                let mut tab = rifflab_tab::model::TabDocument::new(title);
+                                                                tab.tuning = rifflab_tab::ascii::detect_tuning(&text);
+                                                                if let Some(bpm) = rifflab_tab::ascii::detect_tempo(&text) {
+                                                                    tab.tempo = rifflab_tab::model::TempoMap::constant(bpm);
+                                                                }
+                                                                tab.notes = notes;
+                                                                tab.assign_timing();
+                                                                tab.generate_measures();
+                                                                let tuning_name = if tab.tuning == rifflab_tab::model::DROP_D_TUNING { "Drop D" } else { "Standard" };
+                                                                let _ = log_tx.send(format!("Parsed {} notes, {} tuning, {:.0} BPM",
+                                                                    tab.notes.len(), tuning_name, tab.tempo.initial_bpm));
+                                                                let _ = tab_tx.send(tab);
+                                                            });
+                                                        }
+                                                        Err(e) => self.message_log.push(format!("Read failed: {e}"), true),
+                                                    }
+                                                }
                                             }
-                                        }
-                                    }
-                                    if ui.button("Parse from Clipboard").clicked() {
-                                        let clipboard_text = ui.input(|i| {
-                                            i.events.iter().find_map(|e| {
-                                                if let egui::Event::Paste(text) = e { Some(text.clone()) } else { None }
-                                            })
-                                        });
-                                        if let Some(text) = clipboard_text {
-                                            let notes = rifflab_tab::ascii::parse_ascii_tab(&text);
-                                            if notes.is_empty() {
-                                                self.message_log.push("No notes found in clipboard".into(), true);
-                                            } else {
-                                                let mut tab = rifflab_tab::model::TabDocument::new("Pasted Tab");
-                                                tab.notes = notes;
-                                                tab.generate_measures();
-                                                self.message_log.push(format!("Parsed {} notes from clipboard", tab.notes.len()), false);
-                                                self.tab_document = Some(tab);
-                                            }
-                                        } else {
-                                            self.message_log.push("Ctrl+V to paste tab text first".into(), false);
                                         }
                                     }
                                 });
@@ -4629,19 +4698,34 @@ impl RiffLabApp {
     }
 
     fn save_current_session(&mut self, save_as: bool) {
-        let dir = if save_as || self.session_path.is_none() {
-            rfd::FileDialog::new()
-                .set_title("Save Session — choose folder")
-                .pick_folder()
+        if save_as || self.session_path.is_none() {
+            // Spawn folder picker as a subprocess (zenity) on a background thread.
+            // rfd's synchronous dialog blocks the Wayland event loop, preventing
+            // xdg-desktop-portal from showing the dialog.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = std::process::Command::new("zenity")
+                    .args(["--file-selection", "--directory", "--title=Save Session — choose folder"])
+                    .output();
+                let path = match result {
+                    Ok(out) if out.status.success() => {
+                        let s = String::from_utf8_lossy(&out.stdout);
+                        let s = s.trim();
+                        if s.is_empty() { None } else { Some(std::path::PathBuf::from(s)) }
+                    }
+                    _ => None,
+                };
+                let _ = tx.send(path);
+            });
+            self.save_dialog_rx = Some(rx);
         } else {
-            self.session_path.clone()
-        };
+            let dir = self.session_path.clone().unwrap();
+            self.do_save_to_dir(dir);
+        }
+    }
 
-        let dir = match dir {
-            Some(d) => d,
-            None => return,
-        };
-
+    /// Actually perform the session save to a chosen directory.
+    fn do_save_to_dir(&mut self, dir: std::path::PathBuf) {
         let graph_arc = self.engine.lock().unwrap().graph().clone();
         let graph = match graph_arc.try_lock() {
             Ok(g) => g,
@@ -4651,9 +4735,9 @@ impl RiffLabApp {
             }
         };
 
-        // Collect stem data (clone so we can release the lock before I/O)
-        let stems_data: Vec<(StemType, Vec<f32>, u16, u64)> = graph.stem_players.iter()
-            .map(|p| (p.stem_type, p.data().as_ref().clone(), p.channels(), p.total_frames()))
+        // Collect stem data (Arc clone is O(1) — no deep copy while holding the lock)
+        let stems_data: Vec<(StemType, Arc<Vec<f32>>, u16, u64)> = graph.stem_players.iter()
+            .map(|p| (p.stem_type, Arc::clone(p.data()), p.channels(), p.total_frames()))
             .collect();
 
         let effects_preset = if !graph.fx_chain.is_empty() {
@@ -4683,28 +4767,21 @@ impl RiffLabApp {
         self.message_log.push("Saving session...".into(), false);
 
         // Spawn background thread for I/O
-        let tx = {
-            let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
-            let tx_clone = tx.clone();
-            std::thread::spawn(move || {
-                let stems_refs: Vec<(StemType, &[f32], u16, u64)> = stems_data.iter()
-                    .map(|(t, d, c, f)| (*t, d.as_slice(), *c, *f))
-                    .collect();
-                match session::save_session(
-                    &dir, &file_name, &original, sample_rate,
-                    &stems_refs, effects_preset.as_ref(), cue_list.as_ref(),
-                    Some(&fx_graph),
-                ) {
-                    Ok(()) => { let _ = tx_clone.send((false, format!("Session saved to {}", dir.display()))); }
-                    Err(e) => { let _ = tx_clone.send((true, format!("Save failed: {e}"))); }
-                }
-            });
-            rx
-        };
-        // Poll save result on next frames
-        // Simple approach: check once per frame until we get a message
-        // Store the receiver temporarily
-        self.save_receiver = Some(tx);
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+        std::thread::spawn(move || {
+            let stems_refs: Vec<(StemType, &[f32], u16, u64)> = stems_data.iter()
+                .map(|(t, d, c, f)| (*t, d.as_slice(), *c, *f))
+                .collect();
+            match session::save_session(
+                &dir, &file_name, &original, sample_rate,
+                &stems_refs, effects_preset.as_ref(), cue_list.as_ref(),
+                Some(&fx_graph),
+            ) {
+                Ok(()) => { let _ = tx.send((false, format!("Session saved to {}", dir.display()))); }
+                Err(e) => { let _ = tx.send((true, format!("Save failed: {e}"))); }
+            }
+        });
+        self.save_receiver = Some(rx);
     }
 
     fn open_session(&mut self, dir: &std::path::Path) {
@@ -5003,7 +5080,9 @@ impl RiffLabApp {
 
         let frames = data.len() as u64 / channels as u64;
         let duration = frames as f64 / sample_rate as f64;
-        self.message_log.push(format!("Recorded {:.1}s ({} frames)", duration, frames), false);
+        self.recording_take += 1;
+        let take_name = format!("Rec {}", self.recording_take);
+        self.message_log.push(format!("{}: {:.1}s ({} frames)", take_name, duration, frames), false);
         log::info!("Recording stopped: {:.1}s, {}ch, {}Hz", duration, channels, sample_rate);
 
         // Add as a stem track
@@ -5011,7 +5090,7 @@ impl RiffLabApp {
         let color = TRACK_COLORS[track_idx % TRACK_COLORS.len()];
 
         let overview = WaveformOverview::from_interleaved(
-            &data, channels, OVERVIEW_SAMPLES_PER_PEAK, color, "Recording".to_string(),
+            &data, channels, OVERVIEW_SAMPLES_PER_PEAK, color, take_name.clone(),
         );
 
         // Compute spectrogram
@@ -5019,7 +5098,7 @@ impl RiffLabApp {
         let spec = rifflab_analysis::spectrogram::compute_spectrogram(&mono, sample_rate);
 
         self.waveform_overviews.push(overview);
-        self.spectrograms.push(SpectrogramDisplay { data: spec, color, name: "Recording".into() });
+        self.spectrograms.push(SpectrogramDisplay { data: spec, color, name: take_name });
         self.spectrogram_texture = None; // invalidate cache
 
         // Add as stem player

@@ -61,12 +61,18 @@ pub enum TabViewAction {
 }
 
 /// Draw the scrolling tab view.
+///
+/// `scroll_offset_frames` and `frames_per_pixel` come from the arrangement view
+/// so the tab stays in sync with the waveform.
 pub fn draw_tab_view(
     ui: &mut egui::Ui,
     tab: &mut TabDocument,
     playback_secs: f64,
     is_playing: bool,
     state: &mut TabViewState,
+    sample_rate: u32,
+    scroll_offset_frames: &mut f64,
+    frames_per_pixel: &mut f64,
 ) -> TabViewAction {
     let mut action = TabViewAction::None;
 
@@ -100,31 +106,36 @@ pub fn draw_tab_view(
         Vec2::new(rect.width() - LABEL_WIDTH, STRING_SPACING * 5.0),
     );
 
-    // Auto-scroll during playback
-    if is_playing {
-        state.scroll_offset = playback_secs - state.visible_seconds * PLAYHEAD_X_RATIO as f64;
-    }
+    // Derive time-domain scroll/zoom from arrangement's frame-domain state
+    let sr = sample_rate.max(1) as f64;
+    let scroll_offset_secs = *scroll_offset_frames / sr;
+    let secs_per_pixel = *frames_per_pixel / sr;
+    let visible_secs = content_rect.width() as f64 * secs_per_pixel;
 
-    // Mouse scroll for zoom/pan
+    // Mouse scroll: navigate; Shift+scroll: zoom (synced with arrangement)
     if response.hovered() {
         let scroll = ui.input(|i| i.raw_scroll_delta);
-        if ui.input(|i| i.modifiers.ctrl) {
-            // Ctrl+scroll = zoom
-            let zoom_factor = 1.0 + scroll.y as f64 * 0.01;
-            state.visible_seconds = (state.visible_seconds / zoom_factor).clamp(2.0, 30.0);
-        } else {
-            // Scroll = pan
-            state.scroll_offset -= scroll.x as f64 * 0.01 * state.visible_seconds;
+        let shift = ui.input(|i| i.modifiers.shift);
+        // Use whichever axis has the larger magnitude (Shift may swap Y→X)
+        let dy = if scroll.y.abs() >= scroll.x.abs() { scroll.y } else { scroll.x };
+        if shift && dy.abs() > 0.0 {
+            // Shift+scroll = zoom
+            let zoom_factor = 1.0 - dy as f64 * 0.003;
+            *frames_per_pixel = (*frames_per_pixel * zoom_factor).clamp(1.0, 10000.0);
+        } else if dy.abs() > 0.0 {
+            // Scroll = pan along track
+            *scroll_offset_frames -= dy as f64 * *frames_per_pixel * 3.0;
+            *scroll_offset_frames = scroll_offset_frames.max(0.0);
         }
     }
 
     let time_to_x = |t: f64| -> f32 {
-        let frac = (t - state.scroll_offset) / state.visible_seconds;
-        content_rect.left() + frac as f32 * content_rect.width()
+        let x = (t - scroll_offset_secs) / secs_per_pixel;
+        content_rect.left() + x as f32
     };
     let x_to_time = |x: f32| -> f64 {
-        let frac = (x - content_rect.left()) / content_rect.width();
-        state.scroll_offset + frac as f64 * state.visible_seconds
+        let px = (x - content_rect.left()) as f64;
+        scroll_offset_secs + px * secs_per_pixel
     };
     let string_y = |string: u8| -> f32 {
         // G=3 at top, E=0 at bottom
@@ -158,8 +169,8 @@ pub fn draw_tab_view(
     let beat_duration = 60.0 / tab.tempo.initial_bpm;
     let measure_duration = beat_duration * tab.time_signature.beats_per_measure as f64;
     {
-        let start_measure = (state.scroll_offset / measure_duration).floor() as i64;
-        let end_measure = ((state.scroll_offset + state.visible_seconds) / measure_duration).ceil() as i64;
+        let start_measure = (scroll_offset_secs / measure_duration).floor().max(0.0) as i64;
+        let end_measure = ((scroll_offset_secs + visible_secs) / measure_duration).ceil() as i64;
         for m in start_measure..=end_measure {
             let t = m as f64 * measure_duration;
             let x = time_to_x(t);

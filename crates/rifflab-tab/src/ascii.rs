@@ -1,24 +1,135 @@
 //! Rule-based ASCII bass tab parser (fallback for when LLM is unavailable).
 
-use crate::model::{NoteSource, TabNote, Technique};
+use crate::model::{NoteSource, TabNote, Technique, STANDARD_TUNING, DROP_D_TUNING};
 use std::collections::HashMap;
+
+/// Strip markdown formatting (code fences, headers, bold) from tab text.
+fn strip_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") { continue; }
+        let line = if trimmed.starts_with('#') {
+            trimmed.trim_start_matches('#').trim()
+        } else {
+            trimmed
+        };
+        let line = line.replace("**", "").replace("__", "");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Detect bass tuning from text content.
+/// Scans for keywords like "Drop D", "Tuning: DADG", "D standard", etc.
+/// Returns the appropriate tuning array.
+pub fn detect_tuning(text: &str) -> [u8; 4] {
+    let lower = text.to_lowercase();
+
+    // Drop D patterns
+    if lower.contains("drop d")
+        || lower.contains("drop-d")
+        || lower.contains("tuning: d")
+        || lower.contains("tuning: dadg")
+        || lower.contains("tuning:d")
+        || lower.contains("d-a-d-g")
+    {
+        return DROP_D_TUNING;
+    }
+
+    // Check string labels in tab lines — if lowest string is labeled "D" instead of "E"
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // If first line of a tab group starts with "D|" and there are 4 tab lines,
+        // the lowest string might be D (Drop D)
+        if trimmed.len() >= 2 {
+            let first = trimmed.as_bytes()[0];
+            let second = trimmed.as_bytes()[1];
+            if (first == b'D' || first == b'd') && (second == b'|' || second == b'-') {
+                // Check if this is the LAST (lowest) string in a 4-line group
+                // by looking at surrounding lines
+                // Simple heuristic: if we see D as a string label in a tab,
+                // and the text mentions "drop" anywhere, it's Drop D
+                if lower.contains("drop") {
+                    return DROP_D_TUNING;
+                }
+            }
+        }
+    }
+
+    STANDARD_TUNING
+}
+
+/// Detect tempo from text content.
+/// Scans for patterns like "120 BPM", "Tempo: 80", "~80 BPM".
+pub fn detect_tempo(text: &str) -> Option<f64> {
+    let lower = text.to_lowercase();
+    for line in lower.lines() {
+        let trimmed = line.trim();
+        // "120 BPM" or "~120 BPM" or "Tempo: 120"
+        if trimmed.contains("bpm") || trimmed.contains("tempo") {
+            for word in trimmed.split(|c: char| !c.is_ascii_digit() && c != '.') {
+                if let Ok(bpm) = word.parse::<f64>() {
+                    if (30.0..=300.0).contains(&bpm) {
+                        return Some(bpm);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Parse raw ASCII bass tab text into a sequence of TabNote events.
 /// Notes have string, fret, technique, and sequential position — but no timing.
+/// Handles repeat markers like "play 4 times", "x4", "repeat 6 times".
+/// Strips markdown formatting (```, ##, **) before parsing.
 pub fn parse_ascii_tab(text: &str) -> Vec<TabNote> {
-    let lines: Vec<&str> = text.lines().collect();
+    // Pre-process: strip markdown
+    let cleaned = strip_markdown(text);
+    let lines: Vec<&str> = cleaned.lines().collect();
     let mut all_notes = Vec::new();
     let mut position_counter = 0u32;
     let mut current_section: Option<String> = None;
+    let mut pending_repeat: u32 = 1;
 
     let mut i = 0;
     while i < lines.len() {
-        // Look for section labels (standalone text lines before tab groups)
         let trimmed = lines[i].trim();
+
+        // Check for repeat markers in non-tab lines
         if !trimmed.is_empty() && !is_tab_line(trimmed) && !trimmed.starts_with('|') {
-            // Could be a section label like "Intro", "Verse", etc.
+            // Check for repeat count before or after a tab group
+            if let Some(count) = parse_repeat_count(trimmed) {
+                if !all_notes.is_empty() && pending_repeat == 1 {
+                    // Repeat applies to the PREVIOUS tab group — find where it started
+                    // by looking for the last section boundary or start
+                    duplicate_last_group(&mut all_notes, count, &mut position_counter);
+                } else {
+                    // Repeat applies to the NEXT tab group
+                    pending_repeat = count;
+                }
+                i += 1;
+                continue;
+            }
+            // Section label — also check for embedded repeat like "Intro (x4):"
             if is_section_label(trimmed) {
-                current_section = Some(trimmed.trim_end_matches(':').to_string());
+                let label = trimmed.trim_end_matches(':').to_string();
+                // Check for repeat in label like "(x4)" or "(4x)"
+                if let Some(count) = parse_repeat_count(&label) {
+                    pending_repeat = count;
+                    // Strip the repeat part from section name
+                    let clean = label
+                        .replace(&format!("(x{})", count), "")
+                        .replace(&format!("({}x)", count), "")
+                        .replace(&format!("x{}", count), "")
+                        .replace(&format!("{}x", count), "")
+                        .trim().to_string();
+                    current_section = Some(if clean.is_empty() { label } else { clean });
+                } else {
+                    current_section = Some(label);
+                }
             }
             i += 1;
             continue;
@@ -27,14 +138,104 @@ pub fn parse_ascii_tab(text: &str) -> Vec<TabNote> {
         // Try to find a 4-line tab group starting at line i
         if let Some((group, consumed)) = find_tab_group(&lines, i) {
             let notes = parse_tab_group(&group, &mut position_counter, &mut current_section);
+
+            // Check if the line immediately after the tab group has a repeat marker
+            let after_idx = i + consumed;
+            let after_repeat = if after_idx < lines.len() {
+                parse_repeat_count(lines[after_idx].trim())
+            } else {
+                None
+            };
+
+            let repeat_count = if let Some(count) = after_repeat {
+                count
+            } else {
+                pending_repeat
+            };
+            pending_repeat = 1;
+
+            // Add the original notes
+            let group_start = all_notes.len();
             all_notes.extend(notes);
+
+            // Duplicate for repeats
+            if repeat_count > 1 {
+                let group_notes: Vec<TabNote> = all_notes[group_start..].to_vec();
+                for _ in 1..repeat_count {
+                    for note in &group_notes {
+                        let mut dup = TabNote::new(note.string, note.fret, NoteSource::AsciiParse);
+                        dup.technique = note.technique;
+                        dup.time_secs = position_counter as f64;
+                        dup.section = None; // Don't repeat section label
+                        all_notes.push(dup);
+                    }
+                    position_counter += group_notes.len() as u32;
+                }
+            }
+
             i += consumed;
+            if after_repeat.is_some() { i += 1; } // skip the repeat line too
         } else {
             i += 1;
         }
     }
 
     all_notes
+}
+
+/// Parse repeat count from text like "play 4 times", "x4", "4x", "repeat 6 times", "(3x)".
+fn parse_repeat_count(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+
+    // "play N times" or "repeat N times"
+    if lower.contains("time") {
+        for word in lower.split_whitespace() {
+            if let Ok(n) = word.parse::<u32>() {
+                if n >= 2 && n <= 32 { return Some(n); }
+            }
+        }
+    }
+
+    // Search for "xN" or "Nx" patterns anywhere in the text
+    // Handles: "x4", "(x4)", "Intro (x4):", "3x", "(3x)"
+    for token in lower.split(|c: char| !c.is_alphanumeric()) {
+        let token = token.trim();
+        if let Some(rest) = token.strip_prefix('x') {
+            if let Ok(n) = rest.parse::<u32>() {
+                if n >= 2 && n <= 32 { return Some(n); }
+            }
+        }
+        if let Some(rest) = token.strip_suffix('x') {
+            if let Ok(n) = rest.parse::<u32>() {
+                if n >= 2 && n <= 32 { return Some(n); }
+            }
+        }
+    }
+
+    None
+}
+
+/// Duplicate the last group of notes (from the last section start or a heuristic boundary).
+fn duplicate_last_group(notes: &mut Vec<TabNote>, total_times: u32, position: &mut u32) {
+    if notes.is_empty() || total_times <= 1 { return; }
+
+    // Find the start of the last "group" — look for the last section label or use all notes
+    let group_start = notes.iter().rposition(|n| n.section.is_some()).unwrap_or(0);
+    let group: Vec<TabNote> = notes[group_start..].to_vec();
+
+    for _ in 1..total_times {
+        for note in &group {
+            let mut dup = TabNote::new(note.string, note.fret, NoteSource::AsciiParse);
+            dup.technique = note.technique;
+            dup.time_secs = *position as f64;
+            all_notes_push_dup(notes, dup);
+        }
+        *position += group.len() as u32;
+    }
+}
+
+fn all_notes_push_dup(notes: &mut Vec<TabNote>, note: TabNote) {
+    notes.push(note);
 }
 
 /// A group of 4 tab lines (G, D, A, E from top to bottom).
@@ -333,5 +534,61 @@ D|--------------------------------|";
 
         let notes = parse_ascii_tab(tab);
         assert!(notes.len() >= 8, "Expected at least 8 notes from 46&2 riff, got {}", notes.len());
+    }
+
+    #[test]
+    fn parse_repeat_play_n_times() {
+        let tab = "\
+G|--5--|
+D|--0--|
+A|-----|
+E|-----|
+play 3 times";
+
+        let notes = parse_ascii_tab(tab);
+        // 2 notes per group × 3 repeats = 6
+        assert!(notes.len() >= 6, "Expected 6 notes (2 × 3 repeats), got {}", notes.len());
+    }
+
+    #[test]
+    fn parse_repeat_x4() {
+        let tab = "\
+Intro (x4):
+G|--5--|
+D|--0--|
+A|-----|
+E|-----|";
+
+        let notes = parse_ascii_tab(tab);
+        // "x4" in section label → 4 repeats of 2 notes = 8
+        assert!(notes.len() >= 8, "Expected 8 notes (2 × 4 repeats), got {}", notes.len());
+    }
+
+    #[test]
+    fn detect_drop_d_tuning() {
+        assert_eq!(detect_tuning("Tuning: Drop D\nG|--5--|"), DROP_D_TUNING);
+        assert_eq!(detect_tuning("drop d tuning"), DROP_D_TUNING);
+        assert_eq!(detect_tuning("Tuning: D-A-D-G"), DROP_D_TUNING);
+        assert_eq!(detect_tuning("Standard tuning"), STANDARD_TUNING);
+        assert_eq!(detect_tuning("G|--5--|"), STANDARD_TUNING);
+    }
+
+    #[test]
+    fn detect_tempo_from_text() {
+        assert_eq!(detect_tempo("Tempo: 80 BPM"), Some(80.0));
+        assert_eq!(detect_tempo("~120 BPM"), Some(120.0));
+        assert_eq!(detect_tempo("no tempo here"), None);
+    }
+
+    #[test]
+    fn parse_repeat_count_detection() {
+        assert_eq!(parse_repeat_count("play 4 times"), Some(4));
+        assert_eq!(parse_repeat_count("Play 6 Times"), Some(6));
+        assert_eq!(parse_repeat_count("repeat 3 times"), Some(3));
+        assert_eq!(parse_repeat_count("x4"), Some(4));
+        assert_eq!(parse_repeat_count("(3x)"), Some(3));
+        assert_eq!(parse_repeat_count("8x"), Some(8));
+        assert_eq!(parse_repeat_count("just text"), None);
+        assert_eq!(parse_repeat_count("x1"), None); // 1 doesn't count as repeat
     }
 }

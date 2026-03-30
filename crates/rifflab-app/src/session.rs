@@ -181,7 +181,7 @@ fn parse_stem_type(s: &str) -> StemType {
 
 /// Write interleaved f32 audio as a WAV file.
 fn write_wav(path: &Path, data: &[f32], channels: u16, sample_rate: u32) -> Result<()> {
-    use std::io::Write;
+    use std::io::{BufWriter, Write};
 
     let num_samples = data.len();
     let bytes_per_sample = 4u16; // f32
@@ -189,7 +189,7 @@ fn write_wav(path: &Path, data: &[f32], channels: u16, sample_rate: u32) -> Resu
     let byte_rate = sample_rate * block_align as u32;
     let data_size = (num_samples * 4) as u32;
 
-    let mut file = std::fs::File::create(path)?;
+    let mut file = BufWriter::new(std::fs::File::create(path)?);
 
     // RIFF header
     file.write_all(b"RIFF")?;

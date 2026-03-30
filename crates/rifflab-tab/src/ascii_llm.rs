@@ -29,7 +29,9 @@ Rules:
 - Preserve the sequential order of notes as they appear left-to-right.
 - Assign each note a sequential `position` integer (0-indexed) representing its left-to-right order. Notes at the same horizontal position share the same `position` value.
 - If the tab contains section labels (Intro, Verse, Chorus, etc.), include them as `section` on the first note of that section.
+- IMPORTANT: If a section says "play 3x", "play 4 times", "x7", or similar repeat markers, you MUST output the notes for that section that many times (with incrementing position values). Expand ALL repeats fully.
 - If you encounter notation you cannot parse, skip it and continue.
+- The input may contain markdown formatting (##, ```, **bold**) — ignore the formatting and parse the tab content inside.
 
 Output ONLY a JSON array with no markdown fencing, no explanation:
 [
@@ -65,38 +67,77 @@ fn get_api_key() -> Option<String> {
 /// - API key is not set
 /// - API call fails
 /// - Response cannot be parsed
-pub fn parse_ascii_tab_llm(text: &str) -> Vec<TabNote> {
+/// Parse ASCII tab using LLM (blocking, for use on background thread).
+/// Sends progress messages via `log_tx` if provided.
+pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<String>>) -> Vec<TabNote> {
+    let send = |msg: String| {
+        if let Some(tx) = log_tx { let _ = tx.send(msg); }
+    };
+
     let api_key = match get_api_key() {
         Some(k) if !k.is_empty() => k,
         _ => {
-            log::info!("No Anthropic API key found, using rule-based parser");
+            send("No API key (ANTH_API_KEY), using rule-based parser".into());
             return ascii::parse_ascii_tab(text);
         }
     };
 
+    // Strip markdown formatting for cleaner parsing
+    let cleaned = strip_markdown(text);
+    send("Sending tab to Claude for parsing...".into());
+
     // Truncate input to 50KB
-    let input = if text.len() > 51200 { &text[..51200] } else { text };
+    let input = if cleaned.len() > 51200 { &cleaned[..51200] } else { &cleaned };
 
-    let result = call_claude(&api_key, input).ok();
-
-    match result {
-        Some(notes) if !notes.is_empty() => {
-            log::info!("LLM parsed {} notes from tab", notes.len());
+    match call_claude(&api_key, input) {
+        Ok(notes) if !notes.is_empty() => {
+            send(format!("LLM parsed {} notes", notes.len()));
             notes
         }
-        _ => {
-            log::warn!("LLM parsing failed, falling back to rule-based parser");
+        Ok(_) => {
+            send("LLM returned no notes, falling back to rule-based parser".into());
+            ascii::parse_ascii_tab(text)
+        }
+        Err(e) => {
+            send(format!("LLM error: {}, falling back to rule-based parser", e));
             ascii::parse_ascii_tab(text)
         }
     }
 }
 
+/// Strip markdown formatting to produce clean tab text.
+fn strip_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue; // skip the fence line itself
+        }
+        // Strip markdown headers (## → plain text)
+        let line = if trimmed.starts_with('#') {
+            trimmed.trim_start_matches('#').trim()
+        } else {
+            trimmed
+        };
+        // Strip bold/italic markers
+        let line = line.replace("**", "").replace("__", "");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, String> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": 8192,
+        "max_tokens": 16384,
         "system": SYSTEM_PROMPT,
         "messages": [
             { "role": "user", "content": tab_text }
@@ -199,7 +240,7 @@ mod tests {
     fn test_fallback_on_missing_api_key() {
         // With no API key set, should fall back to rule-based parser
         let tab = "G|--5--|\nD|--0--|\nA|-----|\nE|-----|";
-        let notes = parse_ascii_tab_llm(tab);
+        let notes = parse_ascii_tab_llm(tab, None);
         assert!(!notes.is_empty(), "Should fall back to rule-based parser");
     }
 

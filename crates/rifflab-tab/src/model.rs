@@ -123,6 +123,19 @@ impl TabDocument {
             .fold(0.0, f64::max)
     }
 
+    /// Assign synthetic timing to notes that have no timing (from ASCII import).
+    /// Distributes notes evenly at the given tempo, one note per eighth note.
+    pub fn assign_timing(&mut self) {
+        let beat_duration = 60.0 / self.tempo.initial_bpm;
+        let note_spacing = beat_duration / 2.0; // eighth notes
+        for (i, note) in self.notes.iter_mut().enumerate() {
+            if note.time_secs <= 0.0 || note.duration_secs <= 0.0 {
+                note.time_secs = i as f64 * note_spacing;
+                note.duration_secs = note_spacing * 0.9;
+            }
+        }
+    }
+
     /// Generate measure markers from tempo map and time signature.
     pub fn generate_measures(&mut self) {
         self.measures.clear();
