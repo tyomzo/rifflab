@@ -2,56 +2,15 @@ mod config;
 mod decode;
 mod import;
 mod library;
+mod midi_controller;
 mod midi_input;
 mod node_editor;
 mod preset_bank;
 mod preset_graph;
 mod session;
+mod session_manager;
+mod tab_manager;
 mod tab_view;
-
-/// Arturia MiniLab 3 default knob CC numbers (Arturia preset).
-const MINILAB3_KNOB_CCS: [u8; 8] = [74, 71, 76, 77, 93, 18, 19, 16];
-/// Arturia MiniLab 3 default fader CC numbers.
-const MINILAB3_FADER_CCS: [u8; 4] = [82, 83, 85, 17];
-
-/// Saved MIDI controller mapping (knob + fader CCs).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MidiMapping {
-    knob_ccs: Vec<u8>,
-    fader_ccs: Vec<u8>,
-}
-
-impl MidiMapping {
-    /// Directory for MIDI mapping files.
-    fn mappings_dir() -> Option<std::path::PathBuf> {
-        directories::ProjectDirs::from("", "", "rifflab")
-            .map(|dirs| dirs.config_dir().join("midi_mappings"))
-    }
-
-    /// Sanitize device name for use as filename.
-    fn device_filename(port_name: &str) -> String {
-        // Use the part before the port number (e.g., "Minilab3:Minilab3 MIDI 20:0" → "Minilab3")
-        let name = port_name.split(':').next().unwrap_or(port_name);
-        name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
-    }
-
-    fn save(port_name: &str, knobs: &[u8], faders: &[u8]) -> Result<(), String> {
-        let dir = Self::mappings_dir().ok_or("No config dir")?;
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{e}"))?;
-        let path = dir.join(format!("{}.json", Self::device_filename(port_name)));
-        let mapping = MidiMapping { knob_ccs: knobs.to_vec(), fader_ccs: faders.to_vec() };
-        let json = serde_json::to_string_pretty(&mapping).map_err(|e| format!("{e}"))?;
-        std::fs::write(&path, json).map_err(|e| format!("{e}"))?;
-        Ok(())
-    }
-
-    fn load(port_name: &str) -> Option<MidiMapping> {
-        let dir = Self::mappings_dir()?;
-        let path = dir.join(format!("{}.json", Self::device_filename(port_name)));
-        let json = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&json).ok()
-    }
-}
 
 use anyhow::Result;
 use clap::Parser;
@@ -612,6 +571,84 @@ impl AudioSettings {
 
 }
 
+// ─── Grouped State ──────────────────────────────────────────────────────────
+
+/// Metering state: smoothed peak and RMS levels.
+struct MeteringState {
+    peak_l: f32,
+    peak_r: f32,
+    rms_l: f32,
+    rms_r: f32,
+}
+
+impl Default for MeteringState {
+    fn default() -> Self {
+        Self { peak_l: 0.0, peak_r: 0.0, rms_l: 0.0, rms_r: 0.0 }
+    }
+}
+
+/// Tuner display state: smoothed pitch detection with configurable parameters.
+struct TunerState {
+    /// Current raw pitch frame from the analysis thread.
+    current_pitch: PitchFrame,
+    /// Smoothed note display.
+    note: u8,
+    cents: f32,
+    confidence: f32,
+    /// Consecutive frames the current note has been held.
+    hold_count: u32,
+    /// Timestamp of last confident detection (for display timeout).
+    last_active: std::time::Instant,
+    /// Settings popup open.
+    settings_open: bool,
+    /// Minimum confidence to display (0.0–1.0).
+    min_confidence: f32,
+    /// Noise floor RMS threshold (0.0–0.2).
+    noise_floor: f32,
+    /// How many consistent frames before switching note.
+    hold_frames: u32,
+    /// Display timeout in ms after last detection.
+    timeout_ms: u32,
+}
+
+impl Default for TunerState {
+    fn default() -> Self {
+        Self {
+            current_pitch: PitchFrame::default(),
+            note: 0,
+            cents: 0.0,
+            confidence: 0.0,
+            hold_count: 0,
+            last_active: std::time::Instant::now(),
+            settings_open: false,
+            min_confidence: 0.4,
+            noise_floor: 0.02,
+            hold_frames: 2,
+            timeout_ms: 800,
+        }
+    }
+}
+
+/// Arrangement view state: zoom and scroll.
+struct ViewState {
+    /// Frames per pixel (zoom level).
+    frames_per_pixel: f64,
+    /// Horizontal scroll offset in frames.
+    scroll_offset_frames: f64,
+    /// Whether the view auto-follows the playhead.
+    auto_follow: bool,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            frames_per_pixel: DEFAULT_FRAMES_PER_PIXEL,
+            scroll_offset_frames: 0.0,
+            auto_follow: true,
+        }
+    }
+}
+
 // ─── App ─────────────────────────────────────────────────────────────────────
 
 struct RiffLabApp {
@@ -620,32 +657,13 @@ struct RiffLabApp {
     pitch_rx: rifflab_core::rtrb::Consumer<PitchFrame>,
     file_name: String,
 
-    /// Latest meter readings.
-    peak_l: f32,
-    peak_r: f32,
-    rms_l: f32,
-    rms_r: f32,
-
-    /// Latest detected pitch frame.
-    current_pitch: PitchFrame,
-    /// Smoothed tuner display state: holds the last confident note.
-    tuner_note: u8,
-    tuner_cents: f32,
-    tuner_confidence: f32,
-    /// How many consecutive frames the current tuner note has been held.
-    tuner_hold_count: u32,
-    /// Timestamp of last confident detection (for display timeout).
-    tuner_last_active: std::time::Instant,
-    /// Tuner settings popup.
-    tuner_settings_open: bool,
-    /// Tuner: minimum confidence to display (0.0–1.0).
-    tuner_min_confidence: f32,
-    /// Tuner: noise floor RMS threshold (0.0–0.2).
-    tuner_noise_floor: f32,
-    /// Tuner: how many consistent frames before switching note.
-    tuner_hold_frames: u32,
-    /// Tuner: display timeout in ms after last detection.
-    tuner_timeout_ms: u32,
+    // ── Grouped subsystems ──
+    metering: MeteringState,
+    tuner: TunerState,
+    view: ViewState,
+    midi: midi_controller::MidiController,
+    tabs: tab_manager::TabManager,
+    session: session_manager::SessionManager,
 
     /// Real-time comparator (active when reference notes are loaded).
     comparator: Option<Comparator>,
@@ -655,13 +673,6 @@ struct RiffLabApp {
     /// Pre-computed waveform overviews (one per stem).
     waveform_overviews: Vec<WaveformOverview>,
 
-    /// Arrangement view zoom: frames per pixel.
-    frames_per_pixel: f64,
-    /// Arrangement view horizontal scroll offset in frames.
-    scroll_offset_frames: f64,
-    /// Whether the view should auto-follow the playhead.
-    auto_follow: bool,
-
     /// Audio config info for status bar.
     sample_rate: u32,
     buffer_size: usize,
@@ -670,36 +681,21 @@ struct RiffLabApp {
     loop_drag: LoopDragState,
 
     // ── Piano roll / bottom drawer state ──
-    /// Whether the bottom drawer is open.
     drawer_open: bool,
-    /// Bottom drawer height in logical pixels.
     drawer_height: f32,
-    /// Active tab in the bottom drawer.
     active_tab: BottomTab,
-    /// Reference notes for piano roll display.
     reference_notes: Vec<NoteEvent>,
-    /// Recorded played notes during practice (for piano roll display).
     played_notes: Vec<PlayedNote>,
-    /// Piano roll vertical scroll offset (in MIDI note units from bottom).
     piano_roll_scroll_note: f32,
-    /// Tracks the MIDI note currently being played (for note onset/offset detection).
     tracking_midi_note: u8,
-    /// Whether the tracker was silent on the previous frame.
     tracking_was_silent: bool,
     /// File to load on first frame (from CLI arg).
     pending_file: Option<std::path::PathBuf>,
-    /// Audio settings panel state.
     audio_settings: AudioSettings,
-    /// Persisted app config (for saving).
     app_config: AppConfig,
-    /// Background file loading state.
     file_load_state: FileLoadState,
-    /// Scrollable message log for status/errors.
     message_log: MessageLog,
-    /// Cached sidebar state to avoid locking every frame.
-    /// (num_stems, solos, mutes, volumes, master_vol, input_vol, has_fx)
     sidebar_snapshot: Option<(usize, Vec<bool>, Vec<bool>, Vec<f32>, f32, f32, Vec<bool>)>,
-    /// Effect registry for creating new effects.
     fx_registry: EffectRegistry,
     #[allow(dead_code)]
     fx_add_open: bool,
@@ -709,87 +705,30 @@ struct RiffLabApp {
     fx_mb_snapshot: Option<MultibandSnapshot>,
     #[allow(dead_code)]
     fx_multiband_mode: bool,
-    /// When the effects snapshot was last refreshed.
     fx_snapshot_time: std::time::Instant,
-    /// Force refresh on next frame (after add/remove/reorder).
     fx_snapshot_dirty: bool,
     #[allow(dead_code)]
     fx_preset_path: Option<std::path::PathBuf>,
-    /// Current preset name (shown in UI).
     fx_preset_name: String,
-    /// Current session directory (None = never saved).
-    session_path: Option<std::path::PathBuf>,
-    /// Original file path for session saving.
-    original_file_path: Option<std::path::PathBuf>,
-    /// Background save receiver.
-    save_receiver: Option<std::sync::mpsc::Receiver<(bool, String)>>,
-    /// Pending folder dialog result (for non-blocking Save As).
-    save_dialog_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
-    /// Pre-computed spectrograms (one per stem).
     spectrograms: Vec<SpectrogramDisplay>,
-    /// Cached spectrogram texture.
     spectrogram_texture: Option<egui::TextureHandle>,
-    /// Cache key for the currently displayed texture.
     spectrogram_cache_key: (u64, u64, u32, u32, u64),
-    /// Pending spectrogram render from background thread.
     spectrogram_pending: Option<std::sync::mpsc::Receiver<(egui::ColorImage, (u64, u64, u32, u32, u64))>>,
-    /// Key of the render currently in flight (to avoid duplicate dispatches).
     spectrogram_pending_key: (u64, u64, u32, u32, u64),
-    /// Which view mode is active in the arrangement area.
     arrangement_view: ArrangementView,
-    /// Cue engine for timeline automation.
     cue_engine: CueEngine,
-    /// Node graph for effects routing.
     fx_graph: node_editor::FxGraph,
-    /// Node editor interaction state (not serialized).
     node_editor_state: node_editor::NodeEditorState,
-    /// Hash of last compiled graph (to detect changes).
     fx_graph_compiled_hash: u64,
-    /// MIDI input connection.
-    midi_connection: Option<midi_input::MidiConnection>,
-    midi_rx: Option<std::sync::mpsc::Receiver<midi_input::MidiEvent>>,
-    midi_port_names: Vec<String>,
-    midi_selected_port: usize,
-    /// Preset bank (multiple presets loaded, one active).
     preset_bank: preset_bank::PresetBank,
-    /// MIDI/Preset panel open.
     midi_panel_open: bool,
-    /// Preset navigation graph.
     preset_nav: preset_graph::PresetGraph,
-    /// MIDI learn target.
-    midi_learn: preset_graph::MidiLearnTarget,
-    /// Which preset is being edited (its pipeline shown in the effect editor).
     editing_preset_id: Option<u64>,
-    /// Whether we are currently recording input.
     is_recording: bool,
-    /// Counter for naming recorded takes.
     recording_take: u32,
-    /// Per-track FxGraph (for editing in the node editor). Index = track index.
     stem_graphs: Vec<Option<node_editor::FxGraph>>,
-    /// Which track's FX is being edited (None = live input, Some(idx) = track).
     editing_track_fx: Option<usize>,
-    /// Throttle: when track FX params changed, defer recompile to avoid locking graph every frame.
     track_fx_dirty_since: Option<std::time::Instant>,
-    /// Effect node MIDI learn: waiting for a MIDI event to bind to this node.
-    midi_learn_node: Option<u64>,
-    /// Tab document (loaded tab notation).
-    tab_document: Option<rifflab_tab::model::TabDocument>,
-    /// Tab view state (scroll, zoom, selection).
-    tab_view_state: tab_view::TabViewState,
-    /// Pending tab parse result from background thread.
-    tab_parse_rx: Option<std::sync::mpsc::Receiver<rifflab_tab::model::TabDocument>>,
-    /// Log messages from background tab parsing.
-    tab_parse_log_rx: Option<std::sync::mpsc::Receiver<String>>,
-    /// MIDI CC numbers for physical knobs. Starts with MiniLab 3 defaults, can be re-learned.
-    midi_knob_ccs: Vec<u8>,
-    /// When true, next incoming CCs teach knob slots sequentially.
-    midi_knob_learning: bool,
-    /// Last raw CC value per knob CC (for endless encoder delta computation).
-    midi_knob_last: std::collections::HashMap<u8, u8>,
-    /// MIDI CC numbers for physical faders. Maps to track volumes + master.
-    midi_fader_ccs: Vec<u8>,
-    /// When true, next incoming CCs teach fader slots sequentially.
-    midi_fader_learning: bool,
 }
 
 impl RiffLabApp {
@@ -827,27 +766,15 @@ impl RiffLabApp {
             meter_rx,
             pitch_rx,
             file_name,
-            peak_l: 0.0,
-            peak_r: 0.0,
-            rms_l: 0.0,
-            rms_r: 0.0,
-            current_pitch: PitchFrame::default(),
-            tuner_note: 0,
-            tuner_cents: 0.0,
-            tuner_confidence: 0.0,
-            tuner_hold_count: 0,
-            tuner_last_active: std::time::Instant::now(),
-            tuner_settings_open: false,
-            tuner_min_confidence: 0.4,
-            tuner_noise_floor: 0.02,
-            tuner_hold_frames: 2,
-            tuner_timeout_ms: 800,
+            metering: MeteringState::default(),
+            tuner: TunerState::default(),
+            view: ViewState::default(),
+            midi: midi_controller::MidiController::new(),
+            tabs: tab_manager::TabManager::new(),
+            session: session_manager::SessionManager::new(),
             comparator,
             scorer: SessionScorer::new(),
             waveform_overviews,
-            frames_per_pixel: DEFAULT_FRAMES_PER_PIXEL,
-            scroll_offset_frames: 0.0,
-            auto_follow: true,
             sample_rate,
             buffer_size,
             loop_drag: LoopDragState::default(),
@@ -856,7 +783,7 @@ impl RiffLabApp {
             active_tab: BottomTab::Presets,
             reference_notes,
             played_notes: Vec::new(),
-            piano_roll_scroll_note: 48.0, // C3 at bottom
+            piano_roll_scroll_note: 48.0,
             tracking_midi_note: 0,
             tracking_was_silent: true,
             pending_file: file_path.map(std::path::PathBuf::from),
@@ -874,10 +801,6 @@ impl RiffLabApp {
             fx_snapshot_dirty: true,
             fx_preset_path: None,
             fx_preset_name: "Untitled".to_string(),
-            session_path: None,
-            original_file_path: None,
-            save_receiver: None,
-            save_dialog_rx: None,
             spectrograms: Vec::new(),
             spectrogram_texture: None,
             spectrogram_cache_key: (0, 0, 0, 0, 0),
@@ -888,34 +811,15 @@ impl RiffLabApp {
             fx_graph: node_editor::FxGraph::new_default(),
             node_editor_state: node_editor::NodeEditorState::default(),
             fx_graph_compiled_hash: 0,
-            midi_connection: None,
-            midi_rx: None,
-            midi_port_names: {
-                let ports = midi_input::list_midi_ports();
-                log::info!("MIDI ports found: {:?}", ports);
-                ports
-            },
-            midi_selected_port: 0,
             preset_bank: preset_bank::PresetBank::new(),
             midi_panel_open: false,
             preset_nav: preset_graph::PresetGraph::default(),
-            midi_learn: preset_graph::MidiLearnTarget::None,
             editing_preset_id: None,
             is_recording: false,
             recording_take: 0,
             stem_graphs: Vec::new(),
             editing_track_fx: None,
             track_fx_dirty_since: None,
-            midi_learn_node: None,
-            tab_document: None,
-            tab_view_state: tab_view::TabViewState::default(),
-            tab_parse_rx: None,
-            tab_parse_log_rx: None,
-            midi_knob_ccs: MINILAB3_KNOB_CCS.to_vec(),
-            midi_knob_learning: false,
-            midi_knob_last: std::collections::HashMap::new(),
-            midi_fader_ccs: MINILAB3_FADER_CCS.to_vec(),
-            midi_fader_learning: false,
         }
     }
 
@@ -930,12 +834,12 @@ impl RiffLabApp {
 
     /// Convert a frame position to an x coordinate relative to the arrangement rect.
     fn frame_to_x(&self, frame: u64) -> f64 {
-        (frame as f64 - self.scroll_offset_frames) / self.frames_per_pixel
+        (frame as f64 - self.view.scroll_offset_frames) / self.view.frames_per_pixel
     }
 
     /// Convert an x coordinate (relative to arrangement rect) to a frame position.
     fn x_to_frame(&self, x: f64) -> u64 {
-        let frame = x * self.frames_per_pixel + self.scroll_offset_frames;
+        let frame = x * self.view.frames_per_pixel + self.view.scroll_offset_frames;
         frame.max(0.0) as u64
     }
 
@@ -1166,8 +1070,8 @@ impl RiffLabApp {
         self.file_name = format!("Loading {}...", file_name);
         self.message_log.clear();
         self.message_log.push(format!("Opening {}...", file_name), false);
-        self.original_file_path = Some(path.to_path_buf());
-        self.session_path = None; // new file = no saved session yet
+        self.session.original_file_path = Some(path.to_path_buf());
+        self.session.session_path = None; // new file = no saved session yet
         self.file_load_state = FileLoadState::Loading {
             file_name,
             receiver: rx,
@@ -1239,7 +1143,7 @@ impl RiffLabApp {
                             self.reference_notes.clear();
                             self.scorer = SessionScorer::new();
                             self.played_notes.clear();
-                            self.scroll_offset_frames = 0.0;
+                            self.view.scroll_offset_frames = 0.0;
 
                             log::info!("{load_msg}");
                             self.message_log.push(load_msg, false);
@@ -1285,43 +1189,24 @@ impl eframe::App for RiffLabApp {
         self.poll_file_load();
 
         // ─── Poll background save ────────────────────────────────
-        if let Some(ref rx) = self.save_receiver {
-            match rx.try_recv() {
-                Ok((is_error, msg)) => {
-                    self.message_log.push(msg, is_error);
-                    self.save_receiver = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.save_receiver = None;
-                }
-                _ => {} // still saving
-            }
+        if let Some((is_error, msg)) = self.session.poll_save() {
+            self.message_log.push(msg, is_error);
         }
 
         // ─── Poll async Save As dialog ───────────────────────────
-        if let Some(ref rx) = self.save_dialog_rx {
-            match rx.try_recv() {
-                Ok(Some(dir)) => {
-                    self.save_dialog_rx = None;
-                    self.do_save_to_dir(dir);
-                }
-                Ok(None) => {
-                    self.save_dialog_rx = None; // user cancelled
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.save_dialog_rx = None;
-                }
-                _ => {} // dialog still open
+        if let Some(result) = self.session.poll_dialog() {
+            if let Some(dir) = result {
+                self.do_save_to_dir(dir);
             }
         }
 
         // ─── Drain channels ──────────────────────────────────────
         while let Ok(meter) = self.meter_rx.pop() {
             // Smooth with exponential moving average
-            self.peak_l = self.peak_l * 0.85 + meter.peak_l * 0.15;
-            self.peak_r = self.peak_r * 0.85 + meter.peak_r * 0.15;
-            self.rms_l = self.rms_l * 0.85 + meter.rms_l * 0.15;
-            self.rms_r = self.rms_r * 0.85 + meter.rms_r * 0.15;
+            self.metering.peak_l = self.metering.peak_l * 0.85 + meter.peak_l * 0.15;
+            self.metering.peak_r = self.metering.peak_r * 0.85 + meter.peak_r * 0.15;
+            self.metering.rms_l = self.metering.rms_l * 0.85 + meter.rms_l * 0.15;
+            self.metering.rms_r = self.metering.rms_r * 0.85 + meter.rms_r * 0.15;
         }
 
         // Read transport state
@@ -1368,10 +1253,10 @@ impl eframe::App for RiffLabApp {
             let mut nav_activate: Option<u64> = None;
             let mut bank_activate: Option<usize> = None;
             let mut knob_changes: Vec<node_editor::NodeParamChange> = Vec::new();
-            if let Some(ref rx) = self.midi_rx {
+            if let Some(ref rx) = self.midi.rx {
                 while let Ok(event) = rx.try_recv() {
                     // MIDI Learn mode: capture binding
-                    if self.midi_learn != preset_graph::MidiLearnTarget::None {
+                    if self.midi.learn != preset_graph::MidiLearnTarget::None {
                         let binding = match &event {
                             midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 => {
                                 Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
@@ -1385,7 +1270,7 @@ impl eframe::App for RiffLabApp {
                             _ => None,
                         };
                         if let Some(b) = binding {
-                            match &self.midi_learn {
+                            match &self.midi.learn {
                                 preset_graph::MidiLearnTarget::PresetNode(id) => {
                                     let id = *id;
                                     if let Some(node) = self.preset_nav.find_node_mut(id) {
@@ -1403,20 +1288,20 @@ impl eframe::App for RiffLabApp {
                                 }
                                 _ => {}
                             }
-                            self.midi_learn = preset_graph::MidiLearnTarget::None;
+                            self.midi.learn = preset_graph::MidiLearnTarget::None;
                         }
                         continue;
                     }
 
                     // Knob learning: capture CC numbers sequentially
-                    if self.midi_knob_learning {
+                    if self.midi.knob_learning {
                         if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
-                            if !self.midi_knob_ccs.contains(cc) {
+                            if !self.midi.knob_ccs.contains(cc) {
                                 // Remove from fader list if it was there
-                                self.midi_fader_ccs.retain(|&c| c != *cc);
-                                self.midi_knob_ccs.push(*cc);
+                                self.midi.fader_ccs.retain(|&c| c != *cc);
+                                self.midi.knob_ccs.push(*cc);
                                 self.message_log.push(
-                                    format!("Knob {} → CC#{} (turn next or click Done)", self.midi_knob_ccs.len(), cc),
+                                    format!("Knob {} → CC#{} (turn next or click Done)", self.midi.knob_ccs.len(), cc),
                                     false,
                                 );
                             }
@@ -1425,14 +1310,14 @@ impl eframe::App for RiffLabApp {
                     }
 
                     // Fader learning: capture fader CC numbers sequentially
-                    if self.midi_fader_learning {
+                    if self.midi.fader_learning {
                         if let midi_input::MidiEvent::ControlChange { cc, .. } = &event {
-                            if !self.midi_fader_ccs.contains(cc) {
+                            if !self.midi.fader_ccs.contains(cc) {
                                 // Remove from knob list if it was there
-                                self.midi_knob_ccs.retain(|&c| c != *cc);
-                                self.midi_fader_ccs.push(*cc);
+                                self.midi.knob_ccs.retain(|&c| c != *cc);
+                                self.midi.fader_ccs.push(*cc);
                                 self.message_log.push(
-                                    format!("Fader {} → CC#{} (move next or click Done)", self.midi_fader_ccs.len(), cc),
+                                    format!("Fader {} → CC#{} (move next or click Done)", self.midi.fader_ccs.len(), cc),
                                     false,
                                 );
                             }
@@ -1443,10 +1328,10 @@ impl eframe::App for RiffLabApp {
                     // Faders → track volumes + input + master (absolute, 0-127)
                     // Layout: [track1, track2, ..., input, master]
                     if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
-                        if let Some(fader_idx) = self.midi_fader_ccs.iter().position(|&c| c == *cc) {
+                        if let Some(fader_idx) = self.midi.fader_ccs.iter().position(|&c| c == *cc) {
                             let graph_arc = self.engine.lock().unwrap().graph().clone();
                             if let Ok(mut g) = graph_arc.try_lock() {
-                                let n = self.midi_fader_ccs.len();
+                                let n = self.midi.fader_ccs.len();
                                 if n >= 1 && fader_idx == n - 1 {
                                     // Last fader → master volume (0.0–1.0)
                                     g.master_volume = *value as f32 / 127.0;
@@ -1465,9 +1350,9 @@ impl eframe::App for RiffLabApp {
                     }
 
                     // Effect node MIDI learn: bind a MIDI key/CC to select a node
-                    if let Some(learn_id) = self.midi_learn_node {
+                    if let Some(learn_id) = self.midi.learn_node {
                         let binding = match &event {
-                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi_knob_ccs.contains(cc) && !self.midi_fader_ccs.contains(cc) => {
+                            midi_input::MidiEvent::ControlChange { channel, cc, value } if *value > 0 && !self.midi.knob_ccs.contains(cc) && !self.midi.fader_ccs.contains(cc) => {
                                 Some(preset_graph::MidiBinding::ControlChange { channel: *channel, cc: *cc })
                             }
                             midi_input::MidiEvent::NoteOn { channel, note, .. } => {
@@ -1483,17 +1368,17 @@ impl eframe::App for RiffLabApp {
                                 self.message_log.push(format!("{} → {}", node.label, b.label()), false);
                                 node.midi_binding = Some(b);
                             }
-                            self.midi_learn_node = None;
+                            self.midi.learn_node = None;
                         }
                         continue;
                     }
 
                     // MIDI knobs → selected effect node params (endless encoder delta mode)
                     if let midi_input::MidiEvent::ControlChange { cc, value, .. } = &event {
-                        if let Some(knob_idx) = self.midi_knob_ccs.iter().position(|&c| c == *cc) {
+                        if let Some(knob_idx) = self.midi.knob_ccs.iter().position(|&c| c == *cc) {
                             // Compute delta from last raw CC value (endless encoder)
-                            let last = self.midi_knob_last.get(cc).copied();
-                            self.midi_knob_last.insert(*cc, *value);
+                            let last = self.midi.knob_last.get(cc).copied();
+                            self.midi.knob_last.insert(*cc, *value);
                             let delta = if let Some(prev) = last {
                                 let d = *value as i16 - prev as i16;
                                 // Handle wrap-around: if |delta| > 64, encoder wrapped
@@ -1600,48 +1485,41 @@ impl eframe::App for RiffLabApp {
         }
 
         // Poll background tab parsing
-        if let Some(ref rx) = self.tab_parse_log_rx {
-            while let Ok(msg) = rx.try_recv() {
+        {
+            let (logs, _got_doc) = self.tabs.poll();
+            for msg in logs {
                 self.message_log.push(msg, false);
-            }
-        }
-        if let Some(ref rx) = self.tab_parse_rx {
-            if let Ok(tab) = rx.try_recv() {
-                self.message_log.push(format!("Tab ready: {} ({} notes)", tab.title, tab.notes.len()), false);
-                self.tab_document = Some(tab);
-                self.tab_parse_rx = None;
-                self.tab_parse_log_rx = None;
             }
         }
 
         // Drain pitch frames, run comparison, update score, track played notes
         while let Ok(pitch) = self.pitch_rx.pop() {
-            self.current_pitch = pitch.clone();
+            self.tuner.current_pitch = pitch.clone();
 
             // Tuner smoothing with configurable parameters
-            if pitch.frequency_hz > 0.0 && pitch.confidence > self.tuner_min_confidence {
+            if pitch.frequency_hz > 0.0 && pitch.confidence > self.tuner.min_confidence {
                 let new_note = pitch.midi_note;
-                if new_note == self.tuner_note {
-                    self.tuner_cents = self.tuner_cents * 0.5 + pitch.cents_deviation * 0.5;
-                    self.tuner_confidence = self.tuner_confidence * 0.5 + pitch.confidence * 0.5;
-                    self.tuner_hold_count = 0;
+                if new_note == self.tuner.note {
+                    self.tuner.cents = self.tuner.cents * 0.5 + pitch.cents_deviation * 0.5;
+                    self.tuner.confidence = self.tuner.confidence * 0.5 + pitch.confidence * 0.5;
+                    self.tuner.hold_count = 0;
                 } else {
-                    self.tuner_hold_count += 1;
-                    if self.tuner_hold_count >= self.tuner_hold_frames || self.tuner_note == 0 {
-                        self.tuner_note = new_note;
-                        self.tuner_cents = pitch.cents_deviation;
-                        self.tuner_confidence = pitch.confidence;
-                        self.tuner_hold_count = 0;
+                    self.tuner.hold_count += 1;
+                    if self.tuner.hold_count >= self.tuner.hold_frames || self.tuner.note == 0 {
+                        self.tuner.note = new_note;
+                        self.tuner.cents = pitch.cents_deviation;
+                        self.tuner.confidence = pitch.confidence;
+                        self.tuner.hold_count = 0;
                     }
                 }
-                self.tuner_last_active = std::time::Instant::now();
+                self.tuner.last_active = std::time::Instant::now();
             } else {
-                if self.tuner_last_active.elapsed()
-                    > std::time::Duration::from_millis(self.tuner_timeout_ms as u64)
+                if self.tuner.last_active.elapsed()
+                    > std::time::Duration::from_millis(self.tuner.timeout_ms as u64)
                 {
-                    self.tuner_note = 0;
-                    self.tuner_cents = 0.0;
-                    self.tuner_confidence = 0.0;
+                    self.tuner.note = 0;
+                    self.tuner.cents = 0.0;
+                    self.tuner.confidence = 0.0;
                 }
             }
 
@@ -1723,17 +1601,17 @@ impl eframe::App for RiffLabApp {
 
                     // Save session
                     let has_stems = !self.waveform_overviews.is_empty();
-                    let is_busy = self.save_receiver.is_some() || self.save_dialog_rx.is_some();
+                    let is_busy = self.session.save_receiver.is_some() || self.session.save_dialog_rx.is_some();
                     if has_stems {
-                        if self.session_path.is_some() {
+                        if self.session.session_path.is_some() {
                             if ui.add_enabled(!is_busy, egui::Button::new("Save"))
                                 .on_hover_text("Save session (overwrite)").clicked() {
                                 self.save_current_session(false);
                             }
                         }
-                        let save_as_label = if self.save_receiver.is_some() {
+                        let save_as_label = if self.session.save_receiver.is_some() {
                             "Saving..."
-                        } else if self.save_dialog_rx.is_some() {
+                        } else if self.session.save_dialog_rx.is_some() {
                             "Picking folder..."
                         } else {
                             "Save As"
@@ -1830,16 +1708,16 @@ impl eframe::App for RiffLabApp {
 
                     // Visual tuner indicator (uses smoothed values)
                     {
-                        let has_pitch = self.tuner_note > 0;
+                        let has_pitch = self.tuner.note > 0;
                         let note = if has_pitch {
                             let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-                            let octave = (self.tuner_note as i32 / 12) - 1;
-                            let idx = (self.tuner_note % 12) as usize;
+                            let octave = (self.tuner.note as i32 / 12) - 1;
+                            let idx = (self.tuner.note % 12) as usize;
                             format!("{}{}", names[idx], octave)
                         } else {
                             "--".to_string()
                         };
-                        let cents = self.tuner_cents;
+                        let cents = self.tuner.cents;
                         let tuner_color = if has_pitch {
                             if cents.abs() <= 5.0 {
                                 egui::Color32::from_rgb(80, 220, 80)
@@ -1866,7 +1744,7 @@ impl eframe::App for RiffLabApp {
                             .sense(egui::Sense::click()),
                         );
                         if note_resp.clicked() {
-                            self.tuner_settings_open = !self.tuner_settings_open;
+                            self.tuner.settings_open = !self.tuner.settings_open;
                         }
                         note_resp.on_hover_text("Click to open tuner settings");
 
@@ -1949,7 +1827,7 @@ impl eframe::App for RiffLabApp {
                             self.audio_settings.open = true;
                         }
                         ui.separator();
-                        ui.checkbox(&mut self.auto_follow, "Follow");
+                        ui.checkbox(&mut self.view.auto_follow, "Follow");
                         ui.separator();
                         let drawer_label = if self.drawer_open { "Hide Panel" } else { "Show Panel" };
                         if ui.small_button(drawer_label).clicked() {
@@ -1991,7 +1869,7 @@ impl eframe::App for RiffLabApp {
 
                     if is_running {
                         // Peak dB (stereo max)
-                        let peak_db = to_db(self.peak_l.max(self.peak_r));
+                        let peak_db = to_db(self.metering.peak_l.max(self.metering.peak_r));
                         let peak_color = if peak_db > -3.0 {
                             egui::Color32::from_rgb(255, 80, 80)
                         } else if peak_db > -12.0 {
@@ -2006,7 +1884,7 @@ impl eframe::App for RiffLabApp {
                         );
 
                         // RMS dB
-                        let rms_db = to_db(self.rms_l.max(self.rms_r));
+                        let rms_db = to_db(self.metering.rms_l.max(self.metering.rms_r));
                         ui.label(
                             egui::RichText::new(format!("RMS: {:.1} dB", rms_db))
                                 .small()
@@ -2059,7 +1937,7 @@ impl eframe::App for RiffLabApp {
                         ui.label(
                             egui::RichText::new(format!(
                                 "Zoom: {:.0} fr/px",
-                                self.frames_per_pixel
+                                self.view.frames_per_pixel
                             ))
                             .small()
                             .color(status_color),
@@ -2167,7 +2045,7 @@ impl eframe::App for RiffLabApp {
                     match self.active_tab {
                         BottomTab::Presets => {
                             let action = preset_graph::draw_preset_graph(
-                                ui, &mut self.preset_nav, &mut self.midi_learn,
+                                ui, &mut self.preset_nav, &mut self.midi.learn,
                             );
                             match action {
                                 preset_graph::PresetGraphAction::ActivatePreset(id) => {
@@ -2222,18 +2100,18 @@ impl eframe::App for RiffLabApp {
                             }
                         }
                         BottomTab::Tab => {
-                            if let Some(ref mut tab) = self.tab_document {
+                            if let Some(ref mut tab) = self.tabs.document {
                                 let tab_is_playing = state == TransportState::Playing;
                                 let playback_secs = position_frame as f64 / self.sample_rate.max(1) as f64;
                                 let tab_action = tab_view::draw_tab_view(
-                                    ui, tab, playback_secs, tab_is_playing, &mut self.tab_view_state,
-                                    self.sample_rate, &mut self.scroll_offset_frames, &mut self.frames_per_pixel,
+                                    ui, tab, playback_secs, tab_is_playing, &mut self.tabs.view_state,
+                                    self.sample_rate, &mut self.view.scroll_offset_frames, &mut self.view.frames_per_pixel,
                                 );
                                 if let tab_view::TabViewAction::Seek(t) = tab_action {
                                     let frame = (t * self.sample_rate as f64) as u64;
                                     self.engine.lock().unwrap().transport_mut().seek(frame);
                                 }
-                            } else if self.tab_parse_rx.is_some() {
+                            } else if self.tabs.is_parsing() {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(20.0);
                                     ui.spinner();
@@ -2253,7 +2131,7 @@ impl eframe::App for RiffLabApp {
                                             match rifflab_tab::io::load_tab(&path) {
                                                 Ok(tab) => {
                                                     self.message_log.push(format!("Tab loaded: {}", tab.title), false);
-                                                    self.tab_document = Some(tab);
+                                                    self.tabs.document = Some(tab);
                                                 }
                                                 Err(_) => {
                                                     // Parse as ASCII tab on background thread (LLM call may be slow)
@@ -2263,31 +2141,7 @@ impl eframe::App for RiffLabApp {
                                                                 .map(|s| s.to_string_lossy().to_string())
                                                                 .unwrap_or_else(|| "Imported Tab".into());
                                                             self.message_log.push(format!("Parsing tab: {}...", title), false);
-
-                                                            let (tab_tx, tab_rx) = std::sync::mpsc::channel();
-                                                            let (log_tx, log_rx) = std::sync::mpsc::channel();
-                                                            self.tab_parse_rx = Some(tab_rx);
-                                                            self.tab_parse_log_rx = Some(log_rx);
-
-                                                            std::thread::spawn(move || {
-                                                                let notes = rifflab_tab::ascii_llm::parse_ascii_tab_llm(&text, Some(&log_tx));
-                                                                if notes.is_empty() {
-                                                                    let _ = log_tx.send("No notes found in file".into());
-                                                                    return;
-                                                                }
-                                                                let mut tab = rifflab_tab::model::TabDocument::new(title);
-                                                                tab.tuning = rifflab_tab::ascii::detect_tuning(&text);
-                                                                if let Some(bpm) = rifflab_tab::ascii::detect_tempo(&text) {
-                                                                    tab.tempo = rifflab_tab::model::TempoMap::constant(bpm);
-                                                                }
-                                                                tab.notes = notes;
-                                                                tab.assign_timing();
-                                                                tab.generate_measures();
-                                                                let tuning_name = if tab.tuning == rifflab_tab::model::DROP_D_TUNING { "Drop D" } else { "Standard" };
-                                                                let _ = log_tx.send(format!("Parsed {} notes, {} tuning, {:.0} BPM",
-                                                                    tab.notes.len(), tuning_name, tab.tempo.initial_bpm));
-                                                                let _ = tab_tx.send(tab);
-                                                            });
+                                                            self.tabs.start_parse(text, title);
                                                         }
                                                         Err(e) => self.message_log.push(format!("Read failed: {e}"), true),
                                                     }
@@ -2303,8 +2157,8 @@ impl eframe::App for RiffLabApp {
                                 ui,
                                 &self.reference_notes,
                                 &self.played_notes,
-                                self.scroll_offset_frames,
-                                self.frames_per_pixel,
+                                self.view.scroll_offset_frames,
+                                self.view.frames_per_pixel,
                                 self.sample_rate,
                                 position_frame,
                                 self.piano_roll_scroll_note,
@@ -2357,14 +2211,14 @@ impl eframe::App for RiffLabApp {
                                             format!("[{}]", binding_label)
                                         ).size(10.0).color(egui::Color32::from_rgb(180, 180, 180)));
                                     }
-                                    if self.midi_learn_node.is_some() {
+                                    if self.midi.learn_node.is_some() {
                                         ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
                                             egui::RichText::new("Press a key...").size(10.0));
                                         if ui.small_button("Cancel").clicked() {
-                                            self.midi_learn_node = None;
+                                            self.midi.learn_node = None;
                                         }
                                     } else if ui.small_button("Learn Select").on_hover_text("Bind a MIDI key to select this node").clicked() {
-                                        self.midi_learn_node = Some(sel_id);
+                                        self.midi.learn_node = Some(sel_id);
                                     }
                                 } else {
                                     ui.label(egui::RichText::new("Click a node for knob control").size(10.0)
@@ -2742,7 +2596,7 @@ impl eframe::App for RiffLabApp {
                     });
 
                     ui.add_space(8.0);
-                    draw_stereo_meter(ui, self.peak_l, self.peak_r, self.rms_l, self.rms_r);
+                    draw_stereo_meter(ui, self.metering.peak_l, self.metering.peak_r, self.metering.rms_l, self.metering.rms_r);
                 });
             });
 
@@ -2778,31 +2632,31 @@ impl eframe::App for RiffLabApp {
                         let mouse_x = (mouse_pos.x - arrangement_left) as f64;
                         let frame_at_mouse = self.x_to_frame(mouse_x);
 
-                        self.frames_per_pixel =
-                            (self.frames_per_pixel * zoom_factor).clamp(MIN_FRAMES_PER_PIXEL, MAX_FRAMES_PER_PIXEL);
+                        self.view.frames_per_pixel =
+                            (self.view.frames_per_pixel * zoom_factor).clamp(MIN_FRAMES_PER_PIXEL, MAX_FRAMES_PER_PIXEL);
 
                         // Adjust scroll so the frame under the mouse stays in place
-                        self.scroll_offset_frames =
-                            frame_at_mouse as f64 - mouse_x * self.frames_per_pixel;
-                        self.scroll_offset_frames = self.scroll_offset_frames.max(0.0);
+                        self.view.scroll_offset_frames =
+                            frame_at_mouse as f64 - mouse_x * self.view.frames_per_pixel;
+                        self.view.scroll_offset_frames = self.view.scroll_offset_frames.max(0.0);
                     }
                 } else if !modifiers.ctrl && scroll_delta.x.abs() > 0.0 {
                     // Horizontal scroll
-                    self.scroll_offset_frames -= scroll_delta.x as f64 * self.frames_per_pixel;
-                    self.scroll_offset_frames = self.scroll_offset_frames.max(0.0);
-                    self.auto_follow = false;
+                    self.view.scroll_offset_frames -= scroll_delta.x as f64 * self.view.frames_per_pixel;
+                    self.view.scroll_offset_frames = self.view.scroll_offset_frames.max(0.0);
+                    self.view.auto_follow = false;
                 }
             }
 
             // Auto-follow playhead during playback
-            if self.auto_follow && state == TransportState::Playing {
+            if self.view.auto_follow && state == TransportState::Playing {
                 let playhead_x = self.frame_to_x(position_frame);
                 let view_width = available.x as f64;
                 // Keep playhead in the middle third of the view
                 if playhead_x > view_width * 0.75 || playhead_x < view_width * 0.1 {
-                    self.scroll_offset_frames =
-                        position_frame as f64 - view_width * 0.25 * self.frames_per_pixel;
-                    self.scroll_offset_frames = self.scroll_offset_frames.max(0.0);
+                    self.view.scroll_offset_frames =
+                        position_frame as f64 - view_width * 0.25 * self.view.frames_per_pixel;
+                    self.view.scroll_offset_frames = self.view.scroll_offset_frames.max(0.0);
                 }
             }
 
@@ -2821,8 +2675,8 @@ impl eframe::App for RiffLabApp {
                 draw_time_ruler(
                     &painter,
                     rect,
-                    self.scroll_offset_frames,
-                    self.frames_per_pixel,
+                    self.view.scroll_offset_frames,
+                    self.view.frames_per_pixel,
                     self.sample_rate,
                 );
 
@@ -3129,8 +2983,8 @@ impl eframe::App for RiffLabApp {
 
                     for px in 0..width {
                         let frame_start =
-                            self.scroll_offset_frames + px as f64 * self.frames_per_pixel;
-                        let frame_end = frame_start + self.frames_per_pixel;
+                            self.view.scroll_offset_frames + px as f64 * self.view.frames_per_pixel;
+                        let frame_end = frame_start + self.view.frames_per_pixel;
 
                         if frame_start < 0.0 || frame_start >= overview.total_frames as f64 {
                             top_points.push(egui::pos2(rect.left() + px as f32, center_y));
@@ -3256,9 +3110,9 @@ impl eframe::App for RiffLabApp {
                 .unwrap_or(0) as f64;
 
             if max_total_frames > 0.0 {
-                let view_frames = available.x as f64 * self.frames_per_pixel;
+                let view_frames = available.x as f64 * self.view.frames_per_pixel;
                 let total_scrollable = max_total_frames + view_frames * 0.1;
-                let frac_start = (self.scroll_offset_frames / total_scrollable) as f32;
+                let frac_start = (self.view.scroll_offset_frames / total_scrollable) as f32;
                 let frac_width = (view_frames / total_scrollable) as f32;
 
                 let scrollbar_height = 10.0;
@@ -3289,11 +3143,11 @@ impl eframe::App for RiffLabApp {
                 if sb_response.dragged() {
                     let delta_x = sb_response.drag_delta().x;
                     let delta_frac = delta_x / sb_rect.width();
-                    self.scroll_offset_frames += delta_frac as f64 * total_scrollable;
-                    self.scroll_offset_frames = self.scroll_offset_frames
+                    self.view.scroll_offset_frames += delta_frac as f64 * total_scrollable;
+                    self.view.scroll_offset_frames = self.view.scroll_offset_frames
                         .max(0.0)
                         .min(max_total_frames);
-                    self.auto_follow = false;
+                    self.view.auto_follow = false;
                 }
 
                 // Click on scrollbar to jump
@@ -3301,12 +3155,12 @@ impl eframe::App for RiffLabApp {
                     if let Some(pos) = sb_response.interact_pointer_pos() {
                         let frac = ((pos.x - sb_rect.left()) / sb_rect.width())
                             .clamp(0.0, 1.0) as f64;
-                        self.scroll_offset_frames =
+                        self.view.scroll_offset_frames =
                             frac * total_scrollable - view_frames * 0.5;
-                        self.scroll_offset_frames = self.scroll_offset_frames
+                        self.view.scroll_offset_frames = self.view.scroll_offset_frames
                             .max(0.0)
                             .min(max_total_frames);
-                        self.auto_follow = false;
+                        self.view.auto_follow = false;
                     }
                 }
             }
@@ -3746,8 +3600,8 @@ impl RiffLabApp {
             .fold(0u64, |h: u64, (i, v): (usize, &f32)| h.wrapping_add((v.to_bits() as u64).wrapping_mul(i as u64 + 1)));
 
         let cache_key = (
-            self.scroll_offset_frames.to_bits(),
-            self.frames_per_pixel.to_bits(),
+            self.view.scroll_offset_frames.to_bits(),
+            self.view.frames_per_pixel.to_bits(),
             width as u32,
             height as u32,
             vol_hash,
@@ -3781,8 +3635,8 @@ impl RiffLabApp {
                 }
             }).collect();
 
-            let scroll = self.scroll_offset_frames;
-            let fpp = self.frames_per_pixel;
+            let scroll = self.view.scroll_offset_frames;
+            let fpp = self.view.frames_per_pixel;
             let sr = self.sample_rate;
             let key = cache_key;
 
@@ -4698,28 +4552,10 @@ impl RiffLabApp {
     }
 
     fn save_current_session(&mut self, save_as: bool) {
-        if save_as || self.session_path.is_none() {
-            // Spawn folder picker as a subprocess (zenity) on a background thread.
-            // rfd's synchronous dialog blocks the Wayland event loop, preventing
-            // xdg-desktop-portal from showing the dialog.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let result = std::process::Command::new("zenity")
-                    .args(["--file-selection", "--directory", "--title=Save Session — choose folder"])
-                    .output();
-                let path = match result {
-                    Ok(out) if out.status.success() => {
-                        let s = String::from_utf8_lossy(&out.stdout);
-                        let s = s.trim();
-                        if s.is_empty() { None } else { Some(std::path::PathBuf::from(s)) }
-                    }
-                    _ => None,
-                };
-                let _ = tx.send(path);
-            });
-            self.save_dialog_rx = Some(rx);
+        if save_as || self.session.session_path.is_none() {
+            self.session.start_save_as_dialog();
         } else {
-            let dir = self.session_path.clone().unwrap();
+            let dir = self.session.session_path.clone().unwrap();
             self.do_save_to_dir(dir);
         }
     }
@@ -4754,7 +4590,7 @@ impl RiffLabApp {
             None
         };
 
-        let original = self.original_file_path
+        let original = self.session.original_file_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -4763,7 +4599,7 @@ impl RiffLabApp {
         let sample_rate = self.sample_rate;
         self.fx_graph.save_params_from_cache(&self.node_editor_state.param_cache);
         let fx_graph = self.fx_graph.clone();
-        self.session_path = Some(dir.clone());
+        self.session.session_path = Some(dir.clone());
         self.message_log.push("Saving session...".into(), false);
 
         // Spawn background thread for I/O
@@ -4781,7 +4617,7 @@ impl RiffLabApp {
                 Err(e) => { let _ = tx.send((true, format!("Save failed: {e}"))); }
             }
         });
-        self.save_receiver = Some(rx);
+        self.session.save_receiver = Some(rx);
     }
 
     fn open_session(&mut self, dir: &std::path::Path) {
@@ -4851,15 +4687,15 @@ impl RiffLabApp {
                 }
 
                 self.file_name = loaded.manifest.name;
-                self.session_path = Some(dir.to_path_buf());
-                self.original_file_path = Some(std::path::PathBuf::from(&loaded.manifest.original_file));
+                self.session.session_path = Some(dir.to_path_buf());
+                self.session.original_file_path = Some(std::path::PathBuf::from(&loaded.manifest.original_file));
 
                 // Reset practice state
                 self.comparator = None;
                 self.reference_notes.clear();
                 self.scorer = SessionScorer::new();
                 self.played_notes.clear();
-                self.scroll_offset_frames = 0.0;
+                self.view.scroll_offset_frames = 0.0;
 
                 self.message_log.push(format!(
                     "Session opened: {} ({} stems)",
@@ -5162,11 +4998,11 @@ impl RiffLabApp {
                 // MIDI port selection
                 ui.label(egui::RichText::new("MIDI Input").strong().color(label_color));
                 ui.horizontal(|ui| {
-                    let connected = self.midi_connection.is_some();
-                    let port_label = if self.midi_port_names.is_empty() {
+                    let connected = self.midi.connection.is_some();
+                    let port_label = if self.midi.port_names.is_empty() {
                         "No MIDI ports found".to_string()
                     } else {
-                        self.midi_port_names.get(self.midi_selected_port)
+                        self.midi.port_names.get(self.midi.selected_port)
                             .cloned()
                             .unwrap_or_else(|| "Select...".to_string())
                     };
@@ -5175,40 +5011,31 @@ impl RiffLabApp {
                         .selected_text(&port_label)
                         .width(220.0)
                         .show_ui(ui, |ui| {
-                            for (i, name) in self.midi_port_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.midi_selected_port, i, name);
+                            for (i, name) in self.midi.port_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.midi.selected_port, i, name);
                             }
                         });
 
                     if ui.small_button("Refresh").clicked() {
-                        self.midi_port_names = midi_input::list_midi_ports();
+                        self.midi.port_names = midi_input::list_midi_ports();
                     }
 
                     if connected {
-                        let name = self.midi_connection.as_ref().map(|c| c.port_name.as_str()).unwrap_or("?");
+                        let name = self.midi.connection.as_ref().map(|c| c.port_name.as_str()).unwrap_or("?");
                         ui.colored_label(egui::Color32::from_rgb(80, 200, 120),
                             format!("Connected: {}", name));
                         if ui.small_button("Disconnect").clicked() {
-                            self.midi_connection = None;
-                            self.midi_rx = None;
+                            self.midi.connection = None;
+                            self.midi.rx = None;
                         }
                     } else {
-                        if ui.add_enabled(!self.midi_port_names.is_empty(),
+                        if ui.add_enabled(!self.midi.port_names.is_empty(),
                             egui::Button::new("Connect")).clicked()
                         {
-                            match midi_input::connect(self.midi_selected_port) {
-                                Ok((conn, rx)) => {
-                                    // Auto-load saved mapping for this device
-                                    if let Some(mapping) = MidiMapping::load(&conn.port_name) {
-                                        self.midi_knob_ccs = mapping.knob_ccs;
-                                        self.midi_fader_ccs = mapping.fader_ccs;
-                                        self.message_log.push(format!("MIDI connected: {} (mapping loaded)", conn.port_name), false);
-                                    } else {
-                                        self.message_log.push(format!("MIDI connected: {}", conn.port_name), false);
-                                    }
-                                    self.midi_knob_last.clear();
-                                    self.midi_connection = Some(conn);
-                                    self.midi_rx = Some(rx);
+                            match self.midi.connect() {
+                                Ok(()) => {
+                                    let port_name = self.midi.connection.as_ref().map(|c| c.port_name.clone()).unwrap_or_default();
+                                    self.message_log.push(format!("MIDI connected: {}", port_name), false);
                                 }
                                 Err(e) => {
                                     self.message_log.push(format!("MIDI error: {e}"), true);
@@ -5226,47 +5053,47 @@ impl RiffLabApp {
                 ui.add_space(4.0);
 
                 ui.horizontal(|ui| {
-                    if self.midi_knob_learning {
+                    if self.midi.knob_learning {
                         ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
-                            format!("Turn knobs in order... ({} learned)", self.midi_knob_ccs.len()));
+                            format!("Turn knobs in order... ({} learned)", self.midi.knob_ccs.len()));
                         if ui.small_button("Done").clicked() {
-                            self.midi_knob_learning = false;
-                            self.message_log.push(format!("Learned {} knobs", self.midi_knob_ccs.len()), false);
+                            self.midi.knob_learning = false;
+                            self.message_log.push(format!("Learned {} knobs", self.midi.knob_ccs.len()), false);
                         }
-                    } else if self.midi_fader_learning {
+                    } else if self.midi.fader_learning {
                         ui.colored_label(egui::Color32::from_rgb(255, 200, 80),
-                            format!("Move faders in order... ({} learned, last=master)", self.midi_fader_ccs.len()));
+                            format!("Move faders in order... ({} learned, last=master)", self.midi.fader_ccs.len()));
                         if ui.small_button("Done").clicked() {
-                            self.midi_fader_learning = false;
-                            self.message_log.push(format!("Learned {} faders", self.midi_fader_ccs.len()), false);
+                            self.midi.fader_learning = false;
+                            self.message_log.push(format!("Learned {} faders", self.midi.fader_ccs.len()), false);
                         }
                     } else {
                         if ui.button("Learn Knobs").on_hover_text("Turn MIDI knobs 1-8 in order → controls effect params").clicked() {
-                            self.midi_knob_ccs.clear();
-                            self.midi_knob_learning = true;
+                            self.midi.knob_ccs.clear();
+                            self.midi.knob_learning = true;
                             self.message_log.push("Turn MIDI knobs in order...".into(), false);
                         }
                         if ui.button("Learn Faders").on_hover_text("Move faders in order → tracks + input + master volume").clicked() {
-                            self.midi_fader_ccs.clear();
-                            self.midi_fader_learning = true;
+                            self.midi.fader_ccs.clear();
+                            self.midi.fader_learning = true;
                             self.message_log.push("Move faders in order (last=master, 2nd last=input)...".into(), false);
                         }
                     }
                 });
 
                 // Show current mappings
-                if !self.midi_knob_ccs.is_empty() || !self.midi_fader_ccs.is_empty() {
+                if !self.midi.knob_ccs.is_empty() || !self.midi.fader_ccs.is_empty() {
                     ui.horizontal(|ui| {
-                        if !self.midi_knob_ccs.is_empty() {
-                            let ccs: Vec<String> = self.midi_knob_ccs.iter().map(|c| format!("{}", c)).collect();
+                        if !self.midi.knob_ccs.is_empty() {
+                            let ccs: Vec<String> = self.midi.knob_ccs.iter().map(|c| format!("{}", c)).collect();
                             ui.label(egui::RichText::new(format!("Knobs: CC {}", ccs.join(", ")))
                                 .size(10.0).color(egui::Color32::from_rgb(140, 160, 140)));
                         }
                     });
-                    if !self.midi_fader_ccs.is_empty() {
+                    if !self.midi.fader_ccs.is_empty() {
                         ui.horizontal(|ui| {
-                            let n = self.midi_fader_ccs.len();
-                            for (i, &cc) in self.midi_fader_ccs.iter().enumerate() {
+                            let n = self.midi.fader_ccs.len();
+                            for (i, &cc) in self.midi.fader_ccs.iter().enumerate() {
                                 let role = if n >= 2 && i == n - 1 {
                                     "Master".to_string()
                                 } else if n >= 3 && i == n - 2 {
@@ -5280,20 +5107,20 @@ impl RiffLabApp {
                         });
                     }
                     // Save mapping button
-                    if self.midi_connection.is_some() {
+                    if self.midi.connection.is_some() {
                         ui.horizontal(|ui| {
                             if ui.small_button("Save Mapping").clicked() {
-                                if let Some(ref conn) = self.midi_connection {
-                                    match MidiMapping::save(&conn.port_name, &self.midi_knob_ccs, &self.midi_fader_ccs) {
-                                        Ok(()) => self.message_log.push(
-                                            format!("Mapping saved for {}", MidiMapping::device_filename(&conn.port_name)), false),
-                                        Err(e) => self.message_log.push(format!("Save failed: {e}"), true),
+                                match self.midi.save_mapping() {
+                                    Ok(()) => {
+                                        let dev = self.midi.device_filename().unwrap_or_default();
+                                        self.message_log.push(format!("Mapping saved for {}", dev), false);
                                     }
+                                    Err(e) => self.message_log.push(format!("Save failed: {e}"), true),
                                 }
                             }
-                            if let Some(ref conn) = self.midi_connection {
+                            if let Some(dev) = self.midi.device_filename() {
                                 ui.label(egui::RichText::new(
-                                    format!("({})", MidiMapping::device_filename(&conn.port_name))
+                                    format!("({})", dev)
                                 ).size(9.0).color(egui::Color32::from_rgb(120, 120, 120)));
                             }
                         });
@@ -5423,7 +5250,7 @@ impl RiffLabApp {
     }
 
     fn draw_tuner_settings(&mut self, ctx: &egui::Context) {
-        let mut open = self.tuner_settings_open;
+        let mut open = self.tuner.settings_open;
         egui::Window::new("Tuner Settings")
             .open(&mut open)
             .resizable(false)
@@ -5433,7 +5260,7 @@ impl RiffLabApp {
                 let label_color = egui::Color32::from_rgb(180, 200, 220);
 
                 ui.label(egui::RichText::new("Confidence Threshold").color(label_color));
-                ui.add(egui::Slider::new(&mut self.tuner_min_confidence, 0.1..=0.9)
+                ui.add(egui::Slider::new(&mut self.tuner.min_confidence, 0.1..=0.9)
                     .step_by(0.05)
                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                 ui.label(egui::RichText::new(
@@ -5443,7 +5270,7 @@ impl RiffLabApp {
                 ui.add_space(4.0);
 
                 ui.label(egui::RichText::new("Noise Floor (RMS)").color(label_color));
-                if ui.add(egui::Slider::new(&mut self.tuner_noise_floor, 0.001..=0.1)
+                if ui.add(egui::Slider::new(&mut self.tuner.noise_floor, 0.001..=0.1)
                     .logarithmic(true)
                     .custom_formatter(|v, _| {
                         let db = if v > 0.0 { 20.0 * (v as f64).log10() } else { -100.0 };
@@ -5451,7 +5278,7 @@ impl RiffLabApp {
                     })).changed()
                 {
                     let eng = self.engine.lock().unwrap();
-                    eng.set_analysis_noise_floor(self.tuner_noise_floor);
+                    eng.set_analysis_noise_floor(self.tuner.noise_floor);
                 }
                 ui.label(egui::RichText::new(
                     "Signal below this level is ignored. Raise if picking up noise."
@@ -5460,7 +5287,7 @@ impl RiffLabApp {
                 ui.add_space(4.0);
 
                 ui.label(egui::RichText::new("Note Hold (frames)").color(label_color));
-                ui.add(egui::Slider::new(&mut self.tuner_hold_frames, 1..=10));
+                ui.add(egui::Slider::new(&mut self.tuner.hold_frames, 1..=10));
                 ui.label(egui::RichText::new(
                     "How many consistent detections before switching note. Higher = less jumpy."
                 ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
@@ -5468,7 +5295,7 @@ impl RiffLabApp {
                 ui.add_space(4.0);
 
                 ui.label(egui::RichText::new("Display Timeout (ms)").color(label_color));
-                ui.add(egui::Slider::new(&mut self.tuner_timeout_ms, 200..=3000).step_by(100.0));
+                ui.add(egui::Slider::new(&mut self.tuner.timeout_ms, 200..=3000).step_by(100.0));
                 ui.label(egui::RichText::new(
                     "How long the note stays visible after the signal fades."
                 ).size(10.0).color(egui::Color32::from_rgb(120, 125, 130)));
@@ -5477,13 +5304,13 @@ impl RiffLabApp {
 
                 // Live debug info
                 ui.separator();
-                let raw = &self.current_pitch;
+                let raw = &self.tuner.current_pitch;
                 ui.label(egui::RichText::new(format!(
                     "Raw: {:.1}Hz  conf={:.2}  midi={}  cents={:.1}",
                     raw.frequency_hz, raw.confidence, raw.midi_note, raw.cents_deviation,
                 )).size(10.0).color(egui::Color32::from_rgb(100, 110, 120)));
             });
-        self.tuner_settings_open = open;
+        self.tuner.settings_open = open;
     }
 }
 
