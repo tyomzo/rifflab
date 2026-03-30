@@ -1,7 +1,13 @@
-use rifflab_analysis::pitch::yin::YinDetector;
-use rifflab_core::analysis::PitchFrame;
+use rifflab_core::analysis::{PitchDetector, PitchFrame};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+
+/// Factory function that creates a PitchDetector for a given sample rate.
+/// Provided by the application layer to break the compile-time dependency
+/// between the audio engine and the analysis crate.
+///
+/// Uses `Arc` so it can be stored in the engine and passed to new threads on restart.
+pub type PitchDetectorFactory = std::sync::Arc<dyn Fn(u32) -> Box<dyn PitchDetector> + Send + Sync>;
 
 /// Analysis thread that runs pitch detection off the real-time audio path.
 pub struct AnalysisThread {
@@ -17,6 +23,7 @@ impl AnalysisThread {
     pub fn new(
         sample_rate: u32,
         pitch_tx: rifflab_core::rtrb::Producer<PitchFrame>,
+        detector_factory: PitchDetectorFactory,
     ) -> (Self, rifflab_core::rtrb::Producer<f32>) {
         let (audio_tx, audio_rx) = rifflab_core::rtrb::RingBuffer::<f32>::new(8192);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -29,7 +36,7 @@ impl AnalysisThread {
         let handle = std::thread::Builder::new()
             .name("rifflab-analysis".into())
             .spawn(move || {
-                analysis_loop(audio_rx, pitch_tx, sr, stop, nf);
+                analysis_loop(audio_rx, pitch_tx, sr, stop, nf, detector_factory);
             })
             .expect("Failed to spawn analysis thread");
 
@@ -75,9 +82,10 @@ fn analysis_loop(
     sample_rate: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     noise_floor: Arc<AtomicU32>,
+    detector_factory: PitchDetectorFactory,
 ) {
     let mut current_rate = sample_rate.load(Ordering::Relaxed);
-    let mut detector = YinDetector::new(current_rate);
+    let mut detector = detector_factory(current_rate);
     // Larger hop = more stable pitch detection (more periods in the window).
     // 4096 at 44100Hz = 93ms = ~11 updates/sec. Very stable for tuning,
     // slight lag acceptable since tuner doesn't need real-time response.
@@ -88,9 +96,9 @@ fn analysis_loop(
         // Check if sample rate changed — recreate detector if so
         let new_rate = sample_rate.load(Ordering::Relaxed);
         if new_rate != current_rate {
-            log::info!("Analysis: recreating YIN detector for {}Hz (was {}Hz)", new_rate, current_rate);
+            log::info!("Analysis: recreating pitch detector for {}Hz (was {}Hz)", new_rate, current_rate);
             current_rate = new_rate;
-            detector = YinDetector::new(current_rate);
+            detector = detector_factory(current_rate);
         }
 
         if audio_rx.slots() >= hop_size {

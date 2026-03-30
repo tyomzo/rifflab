@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rifflab_core::audio::EffectDescriptor;
 
 use crate::effects::cabinet::Cabinet;
@@ -16,7 +18,6 @@ use crate::effects::tuner::Tuner;
 
 /// Factory for a single registered effect type.
 struct EffectFactory {
-    type_id: String,
     name: String,
     category: String,
     create: Box<dyn Fn() -> Box<dyn EffectDescriptor> + Send + Sync>,
@@ -26,15 +27,19 @@ struct EffectFactory {
 ///
 /// Built-in effects are registered automatically on construction.
 /// Additional factories (e.g. user scripts) can be added later.
+/// Uses HashMap for O(1) lookup by type_id and duplicate prevention.
 pub struct EffectRegistry {
-    factories: Vec<EffectFactory>,
+    factories: HashMap<String, EffectFactory>,
+    /// Insertion order preserved for UI listing.
+    order: Vec<String>,
 }
 
 impl EffectRegistry {
     /// Create a new registry pre-populated with all built-in effects.
     pub fn new() -> Self {
         let mut reg = Self {
-            factories: Vec::new(),
+            factories: HashMap::new(),
+            order: Vec::new(),
         };
 
         reg.register(
@@ -131,7 +136,7 @@ impl EffectRegistry {
         reg
     }
 
-    /// Register a new effect factory.
+    /// Register a new effect factory. Duplicates are silently ignored.
     pub fn register<F>(
         &mut self,
         type_id: &str,
@@ -141,29 +146,35 @@ impl EffectRegistry {
     ) where
         F: Fn() -> Box<dyn EffectDescriptor> + Send + Sync + 'static,
     {
-        self.factories.push(EffectFactory {
-            type_id: type_id.to_string(),
-            name: name.to_string(),
-            category: category.to_string(),
-            create: Box::new(create),
-        });
+        use std::collections::hash_map::Entry;
+        let key = type_id.to_string();
+        if let Entry::Vacant(e) = self.factories.entry(key.clone()) {
+            e.insert(EffectFactory {
+                name: name.to_string(),
+                category: category.to_string(),
+                create: Box::new(create),
+            });
+            self.order.push(key);
+        }
     }
 
-    /// List all registered effects as `(type_id, name, category)` tuples.
+    /// List all registered effects as `(type_id, name, category)` tuples,
+    /// in registration order.
     pub fn list_effects(&self) -> Vec<(String, String, String)> {
-        self.factories
+        self.order
             .iter()
-            .map(|f| (f.type_id.clone(), f.name.clone(), f.category.clone()))
+            .filter_map(|id| {
+                self.factories
+                    .get(id)
+                    .map(|f| (id.clone(), f.name.clone(), f.category.clone()))
+            })
             .collect()
     }
 
     /// Create a new instance of an effect by its type id.
     /// Returns `None` if the type id is not registered.
     pub fn create_effect(&self, type_id: &str) -> Option<Box<dyn EffectDescriptor>> {
-        self.factories
-            .iter()
-            .find(|f| f.type_id == type_id)
-            .map(|f| (f.create)())
+        self.factories.get(type_id).map(|f| (f.create)())
     }
 }
 

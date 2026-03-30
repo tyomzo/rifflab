@@ -8,6 +8,50 @@ use rifflab_core::metering::MeterData;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+// ─── Denormal Guard ─────────────────────────────────────────────────────────
+
+/// RAII guard that sets FTZ+DAZ (Flush-To-Zero + Denormals-Are-Zero) on x86_64
+/// and restores the original MXCSR flags on drop.
+///
+/// Prevents denormal floats from causing 100x CPU slowdowns in IIR filters
+/// and feedback loops. Standard practice in professional audio software.
+#[cfg(target_arch = "x86_64")]
+struct DenormalGuard {
+    saved: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DenormalGuard {
+    fn new() -> Self {
+        let mut saved: u32 = 0;
+        unsafe {
+            std::arch::asm!("stmxcsr [{}]", in(reg) &mut saved, options(nostack, preserves_flags));
+            let mut modified = saved;
+            modified |= 0x8040; // FTZ (bit 15) + DAZ (bit 6)
+            std::arch::asm!("ldmxcsr [{}]", in(reg) &modified, options(nostack, preserves_flags));
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for DenormalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::arch::asm!("ldmxcsr [{}]", in(reg) &self.saved, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// No-op on non-x86_64 architectures.
+#[cfg(not(target_arch = "x86_64"))]
+struct DenormalGuard;
+
+#[cfg(not(target_arch = "x86_64"))]
+impl DenormalGuard {
+    fn new() -> Self { Self }
+}
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("Backend error: {0}")]
@@ -33,11 +77,14 @@ pub struct AudioEngine {
     input_device_name: String,
     /// Analysis thread for pitch detection (off the audio thread).
     analysis_thread: Option<AnalysisThread>,
+    /// Factory for creating pitch detectors (injected by app layer).
+    detector_factory: crate::analysis_thread::PitchDetectorFactory,
 }
 
 impl AudioEngine {
     pub fn new(
         config: AudioConfig,
+        detector_factory: crate::analysis_thread::PitchDetectorFactory,
     ) -> (
         Self,
         rifflab_core::rtrb::Consumer<MeterData>,
@@ -58,6 +105,7 @@ impl AudioEngine {
             output_device_name: String::new(),
             input_device_name: String::new(),
             analysis_thread: None,
+            detector_factory,
         };
         (engine, meter_rx, pitch_rx)
     }
@@ -101,7 +149,8 @@ impl AudioEngine {
             let (new_tx, _) = rifflab_core::rtrb::RingBuffer::new(1);
             std::mem::replace(&mut self.pitch_tx, new_tx)
         };
-        let (analysis, mut audio_tx) = AnalysisThread::new(sample_rate, pitch_tx);
+        let factory = self.detector_factory.clone();
+        let (analysis, mut audio_tx) = AnalysisThread::new(sample_rate, pitch_tx, factory);
         self.analysis_thread = Some(analysis);
 
         // Set up the audio callback
@@ -123,15 +172,7 @@ impl AudioEngine {
         let mut last_output = vec![0.0f32; max_buf * 2];
 
         let callback: backend::AudioCallback = Box::new(move |input, output, frames| {
-            // Flush denormals to zero — prevents CPU stalls in IIR filters and feedback loops.
-            // Standard practice in all professional audio software.
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let mut mxcsr: u32 = 0;
-                std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack, preserves_flags));
-                mxcsr |= 0x8040; // FTZ (bit 15) + DAZ (bit 6)
-                std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack, preserves_flags));
-            }
+            let _denormal_guard = DenormalGuard::new();
 
             // 1. Process commands (play/pause/seek) BEFORE reading position
             let is_playing = rt_handle.process_commands(&mut command_rx);

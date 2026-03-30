@@ -149,6 +149,12 @@ impl YinDetector {
     }
 }
 
+impl rifflab_core::analysis::PitchDetector for YinDetector {
+    fn detect(&mut self, samples: &[f32]) -> PitchFrame {
+        self.detect(samples)
+    }
+}
+
 impl YinDetector {
     /// Process a full audio buffer offline and return pitch data for each frame.
     ///

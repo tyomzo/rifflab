@@ -3727,7 +3727,6 @@ dependencies = [
  "cpal",
  "jack 0.13.5",
  "log",
- "rifflab-analysis",
  "rifflab-core",
  "rifflab-fx",
  "thiserror 2.0.18",

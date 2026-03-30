@@ -125,7 +125,12 @@ fn main() -> Result<()> {
     let audio_config = app_config.to_audio_config();
     let mut target_rate = audio_config.sample_rate.as_u32();
     let buffer_size = audio_config.buffer_size.as_usize();
-    let (mut engine, meter_rx, pitch_rx) = AudioEngine::new(audio_config);
+    // Create pitch detector factory (wires YinDetector from rifflab-analysis)
+    let detector_factory: rifflab_audio::analysis_thread::PitchDetectorFactory =
+        std::sync::Arc::new(|sample_rate| {
+            Box::new(rifflab_analysis::pitch::yin::YinDetector::new(sample_rate))
+        });
+    let (mut engine, meter_rx, pitch_rx) = AudioEngine::new(audio_config, detector_factory);
     engine.set_backend_prefs(
         &app_config.audio.backend,
         &app_config.audio.output_device,

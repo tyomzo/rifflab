@@ -52,3 +52,10 @@ impl NoteEvent {
         440.0 * 2.0f32.powf((self.midi_note as f32 - 69.0) / 12.0)
     }
 }
+
+/// Trait for pitch detection algorithms, allowing the audio engine to be
+/// independent of any specific detector implementation.
+pub trait PitchDetector: Send {
+    /// Detect pitch from a buffer of mono audio samples.
+    fn detect(&mut self, samples: &[f32]) -> PitchFrame;
+}
