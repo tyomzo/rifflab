@@ -8,6 +8,83 @@ pub struct AppConfig {
     pub audio: AudioSection,
     pub library: LibrarySection,
     pub ui: UiSection,
+    #[serde(default)]
+    pub paths: PathsSection,
+    #[serde(default)]
+    pub chat: ChatSection,
+}
+
+/// AI chat panel preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSection {
+    /// Width of the right side panel in pixels.
+    pub width: f32,
+    /// Whether the panel is visible on launch.
+    pub visible: bool,
+}
+
+impl Default for ChatSection {
+    fn default() -> Self {
+        Self { width: 340.0, visible: false }
+    }
+}
+
+/// Per-resource last-used directories, so file dialogs reopen where the user left off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PathsSection {
+    #[serde(default)]
+    pub audio: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub preset_graph: String,
+    #[serde(default)]
+    pub tab: String,
+    #[serde(default)]
+    pub fx_graph: String,
+    #[serde(default)]
+    pub fx_preset: String,
+}
+
+impl PathsSection {
+    fn field(&self, kind: PathKind) -> &str {
+        match kind {
+            PathKind::Audio => &self.audio,
+            PathKind::Session => &self.session,
+            PathKind::PresetGraph => &self.preset_graph,
+            PathKind::Tab => &self.tab,
+            PathKind::FxGraph => &self.fx_graph,
+            PathKind::FxPreset => &self.fx_preset,
+        }
+    }
+
+    fn field_mut(&mut self, kind: PathKind) -> &mut String {
+        match kind {
+            PathKind::Audio => &mut self.audio,
+            PathKind::Session => &mut self.session,
+            PathKind::PresetGraph => &mut self.preset_graph,
+            PathKind::Tab => &mut self.tab,
+            PathKind::FxGraph => &mut self.fx_graph,
+            PathKind::FxPreset => &mut self.fx_preset,
+        }
+    }
+}
+
+/// Categories of resources whose load/save directories are remembered separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Source audio files (songs/tracks for stem separation or raw playback).
+    Audio,
+    /// Saved session folders.
+    Session,
+    /// Preset graph JSON files (collection of preset nodes).
+    PresetGraph,
+    /// Tab files (.rltab, ASCII tabs).
+    Tab,
+    /// FX graph JSON files (track FX, preset bank entries, pipelines).
+    FxGraph,
+    /// FX preset TOML files (effect chain snapshots).
+    FxPreset,
 }
 
 /// Audio engine configuration section.
@@ -69,6 +146,8 @@ impl Default for AppConfig {
                 auto_follow: true,
                 drawer_open: true,
             },
+            paths: PathsSection::default(),
+            chat: ChatSection::default(),
         }
     }
 }
@@ -118,6 +197,43 @@ impl AppConfig {
         std::fs::write(path, &contents)
             .with_context(|| format!("Failed to write config {}", path.display()))?;
         Ok(())
+    }
+
+    /// Last-used directory for a resource kind, if it still exists on disk.
+    pub fn last_dir(&self, kind: PathKind) -> Option<PathBuf> {
+        let s = self.paths.field(kind);
+        if s.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(s);
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Remember the parent directory of `path` for this resource kind. No-op if path has no parent.
+    pub fn remember_from_file(&mut self, kind: PathKind, path: &Path) {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.remember_dir(kind, parent);
+            }
+        }
+    }
+
+    /// Remember `dir` itself as the last-used directory for this resource kind.
+    pub fn remember_dir(&mut self, kind: PathKind, dir: &Path) {
+        *self.paths.field_mut(kind) = dir.to_string_lossy().into_owned();
+    }
+
+    /// Persist to the default config path, logging on error. Cheap; called after a successful pick.
+    pub fn save_to_default(&self) {
+        if let Some(path) = default_config_path() {
+            if let Err(e) = self.save(&path) {
+                log::warn!("Failed to persist config to {}: {e}", path.display());
+            }
+        }
     }
 
     /// Apply CLI argument overrides to this config.
@@ -219,6 +335,63 @@ mod tests {
         let ac = config.to_audio_config();
         assert_eq!(ac.sample_rate.as_u32(), 48000);
         assert_eq!(ac.buffer_size.as_usize(), 128);
+    }
+
+    #[test]
+    fn test_chat_section_roundtrip_and_defaults() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rifflab_config_chat_{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Default values present after construction.
+        let mut config = AppConfig::default();
+        assert_eq!(config.chat.width, 340.0);
+        assert!(!config.chat.visible);
+
+        // Mutate, save, reload, compare.
+        config.chat.width = 412.5;
+        config.chat.visible = true;
+        config.save(&tmp).unwrap();
+        let loaded = AppConfig::load(&tmp).unwrap();
+        assert_eq!(loaded.chat.width, 412.5);
+        assert!(loaded.chat.visible);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_old_config_without_chat_section_still_loads() {
+        // Simulate a config saved before the chat section existed.
+        let tmp = std::env::temp_dir().join(format!(
+            "rifflab_config_no_chat_{}.toml",
+            std::process::id()
+        ));
+        let toml = r#"
+[audio]
+backend = "auto"
+buffer_size = 128
+sample_rate = 48000
+input_gain = 1.0
+master_volume = 1.0
+
+[library]
+root_override = ""
+
+[ui]
+default_zoom = 512.0
+auto_follow = true
+drawer_open = true
+
+[paths]
+"#;
+        std::fs::write(&tmp, toml).unwrap();
+        let loaded = AppConfig::load(&tmp).expect("should accept missing chat section");
+        // Falls back to defaults.
+        assert_eq!(loaded.chat.width, 340.0);
+        assert!(!loaded.chat.visible);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

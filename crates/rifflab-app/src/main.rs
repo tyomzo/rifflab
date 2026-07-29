@@ -1,3 +1,4 @@
+mod chat;
 mod config;
 mod decode;
 mod import;
@@ -31,7 +32,7 @@ use rifflab_practice::compare::Comparator;
 use rifflab_practice::scoring::SessionScorer;
 use std::sync::{Arc, Mutex};
 
-use config::AppConfig;
+use config::{AppConfig, PathKind};
 use library::Library;
 
 // ─── CLI Arguments ──────────────────────────────────────────────────────────
@@ -165,7 +166,10 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 700.0])
-            .with_title("RiffLab"),
+            .with_title("RiffLab")
+            // Match StartupWMClass in packaging/linux/rifflab.desktop so GNOME/Wayland
+            // associates the window with the launcher entry (taskbar icon, Alt-Tab).
+            .with_app_id("rifflab"),
         ..Default::default()
     };
 
@@ -712,6 +716,7 @@ struct RiffLabApp {
     stem_graphs: Vec<Option<node_editor::FxGraph>>,
     editing_track_fx: Option<usize>,
     track_fx_dirty_since: Option<std::time::Instant>,
+    chat: chat::ChatPanel,
 }
 
 impl RiffLabApp {
@@ -732,6 +737,10 @@ impl RiffLabApp {
             .and_then(|n| n.to_str())
             .unwrap_or("No file loaded")
             .to_string();
+
+        // Snapshot chat-panel prefs before moving app_config into the struct.
+        let app_config_chat_visible = app_config.chat.visible;
+        let app_config_chat_width = app_config.chat.width;
 
         // If reference notes were transcribed, set up the comparator
         let comparator = if !reference_notes.is_empty() {
@@ -803,6 +812,16 @@ impl RiffLabApp {
             stem_graphs: Vec::new(),
             editing_track_fx: None,
             track_fx_dirty_since: None,
+            chat: {
+                let history = chat::persistence::default_history_path()
+                    .map(|p| chat::persistence::load_history(&p))
+                    .unwrap_or_default();
+                chat::ChatPanel::new(
+                    app_config_chat_visible,
+                    app_config_chat_width,
+                    history.messages,
+                )
+            },
         }
     }
 
@@ -1004,6 +1023,7 @@ impl RiffLabApp {
         }
         if let Some(result) = self.session.poll_dialog() {
             if let Some(dir) = result {
+                self.remember_dir(PathKind::Session, &dir);
                 self.do_save_to_dir(dir);
             }
         }
@@ -1011,6 +1031,32 @@ impl RiffLabApp {
         for msg in logs {
             self.message_log.push(msg, false);
         }
+        // Chat: drain worker events.
+        let chat_actions = self.chat.poll(&self.preset_nav);
+        if !chat_actions.is_empty() {
+            self.apply_chat_actions(chat_actions);
+        }
+    }
+
+    /// Save chat history to disk. Best-effort: failures are logged, not surfaced.
+    fn persist_chat_history(&self) {
+        if let Some(path) = chat::persistence::default_history_path() {
+            if let Err(e) = chat::persistence::save_history(&path, &self.chat.messages) {
+                log::warn!("Failed to save chat history: {e}");
+            }
+        }
+    }
+
+    /// Remember the parent directory of `path` for `kind` and persist the config.
+    fn remember_path(&mut self, kind: PathKind, path: &std::path::Path) {
+        self.app_config.remember_from_file(kind, path);
+        self.app_config.save_to_default();
+    }
+
+    /// Remember `dir` itself as the last-used directory for `kind` and persist.
+    fn remember_dir(&mut self, kind: PathKind, dir: &std::path::Path) {
+        self.app_config.remember_dir(kind, dir);
+        self.app_config.save_to_default();
     }
 
     /// Drain meter data and read transport state. Returns per-frame state used by UI.
@@ -1395,6 +1441,7 @@ impl eframe::App for RiffLabApp {
         }
 
         self.draw_sidebar(ctx, &fs);
+        self.draw_chat(ctx);
         self.draw_arrangement(ctx, &fs);
 
         self.draw_audio_settings(ctx);
@@ -1426,13 +1473,24 @@ impl RiffLabApp {
                     let is_loading = matches!(self.file_load_state, FileLoadState::Loading { .. });
                     let open_label = if is_loading { "\u{231B} Loading..." } else { "\u{1F4C2} Open" };
                     if ui.add_enabled(!is_loading, egui::Button::new(open_label)).clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                        let mut dlg = rfd::FileDialog::new()
                             .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aac", "m4a"])
-                            .add_filter("All files", &["*"])
-                            .pick_file()
-                        {
+                            .add_filter("All files", &["*"]);
+                        if let Some(d) = self.app_config.last_dir(PathKind::Audio) {
+                            dlg = dlg.set_directory(d);
+                        }
+                        if let Some(path) = dlg.pick_file() {
+                            self.remember_path(PathKind::Audio, &path);
                             self.load_file(&path);
                         }
+                    }
+
+                    // Chat panel toggle
+                    let chat_label = if self.chat.visible { "🤖 Hide Chat" } else { "🤖 Chat" };
+                    if ui.small_button(chat_label).on_hover_text("Toggle AI preset assistant").clicked() {
+                        self.chat.visible = !self.chat.visible;
+                        self.app_config.chat.visible = self.chat.visible;
+                        self.app_config.save_to_default();
                     }
 
                     // Save session
@@ -1460,17 +1518,25 @@ impl RiffLabApp {
 
                     // Load raw audio (no stem separation)
                     if ui.small_button("Load Raw").on_hover_text("Load audio without stem separation").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aac", "m4a"])
-                            .pick_file()
-                        {
+                        let mut dlg = rfd::FileDialog::new()
+                            .add_filter("Audio", &["wav", "flac", "mp3", "ogg", "aac", "m4a"]);
+                        if let Some(d) = self.app_config.last_dir(PathKind::Audio) {
+                            dlg = dlg.set_directory(d);
+                        }
+                        if let Some(path) = dlg.pick_file() {
+                            self.remember_path(PathKind::Audio, &path);
                             self.load_raw_audio(&path);
                         }
                     }
 
                     // Open session
                     if ui.small_button("Open Session").on_hover_text("Open a saved session").clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        let mut dlg = rfd::FileDialog::new();
+                        if let Some(d) = self.app_config.last_dir(PathKind::Session) {
+                            dlg = dlg.set_directory(d);
+                        }
+                        if let Some(dir) = dlg.pick_folder() {
+                            self.remember_dir(PathKind::Session, &dir);
                             self.open_session(&dir);
                         }
                     }
@@ -1908,11 +1974,14 @@ impl RiffLabApp {
                                     self.active_tab = BottomTab::Effects;
                                 }
                                 preset_graph::PresetGraphAction::Save => {
-                                    if let Some(path) = rfd::FileDialog::new()
+                                    let mut dlg = rfd::FileDialog::new()
                                         .add_filter("RiffLab Preset Graph", &["json"])
-                                        .set_file_name("presets.json")
-                                        .save_file()
-                                    {
+                                        .set_file_name("presets.json");
+                                    if let Some(d) = self.app_config.last_dir(PathKind::PresetGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(path) = dlg.save_file() {
+                                        self.remember_path(PathKind::PresetGraph, &path);
                                         if let Err(e) = preset_graph::save_preset_graph(&path, &self.preset_nav) {
                                             self.message_log.push(format!("Save failed: {e}"), true);
                                         } else {
@@ -1920,30 +1989,73 @@ impl RiffLabApp {
                                         }
                                     }
                                 }
-                                preset_graph::PresetGraphAction::Load => {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("RiffLab Preset/Graph", &["json"])
-                                        .pick_file()
-                                    {
-                                        // Try as PresetGraph first, then as single FxGraph (create a preset node)
-                                        match preset_graph::load_preset_graph(&path) {
+                                preset_graph::PresetGraphAction::LoadPipelineFor(id) => {
+                                    let mut dlg = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"]);
+                                    if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(path) = dlg.pick_file() {
+                                        self.remember_path(PathKind::FxGraph, &path);
+                                        match node_editor::load_graph(&path) {
                                             Ok(g) => {
-                                                self.preset_nav = g;
-                                                self.message_log.push(format!("Presets loaded from {}", path.display()), false);
-                                            }
-                                            Err(_) => {
-                                                // Try as FxGraph — wrap in a new preset node
-                                                match node_editor::load_graph(&path) {
-                                                    Ok(graph) => {
-                                                        let name = path.file_stem()
-                                                            .map(|s| s.to_string_lossy().to_string())
-                                                            .unwrap_or_else(|| "Loaded".into());
-                                                        self.preset_nav.add_node_with_pipeline(name, graph);
-                                                        self.message_log.push(format!("Pipeline loaded as preset from {}", path.display()), false);
-                                                    }
-                                                    Err(e) => self.message_log.push(format!("Load failed: {e}"), true),
+                                                if let Some(node) = self.preset_nav.find_node_mut(id) {
+                                                    node.pipeline = g;
+                                                    node.name = path.file_stem()
+                                                        .and_then(|s| s.to_str())
+                                                        .unwrap_or("Loaded")
+                                                        .to_string();
                                                 }
+                                                self.activate_nav_preset(id);
                                             }
+                                            Err(e) => self.message_log.push(format!("Load pipeline failed: {e}"), true),
+                                        }
+                                    }
+                                }
+                                preset_graph::PresetGraphAction::AddNodes => {
+                                    let mut dlg = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Preset/Graph", &["json"]);
+                                    if let Some(d) = self.app_config.last_dir(PathKind::PresetGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    } else if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(paths) = dlg.pick_files() {
+                                        if let Some(first) = paths.first() {
+                                            self.remember_path(PathKind::PresetGraph, first);
+                                        }
+                                        let mut added = 0usize;
+                                        let mut failed: Vec<String> = Vec::new();
+                                        for path in &paths {
+                                            // Try as a single FxGraph first (one file = one node);
+                                            // fall back to PresetGraph (merge all its nodes).
+                                            match node_editor::load_graph(path) {
+                                                Ok(graph) => {
+                                                    let name = path.file_stem()
+                                                        .map(|s| s.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| "Loaded".into());
+                                                    self.preset_nav.add_node_with_pipeline(name, graph);
+                                                    added += 1;
+                                                }
+                                                Err(_) => match preset_graph::load_preset_graph(path) {
+                                                    Ok(sub) => {
+                                                        for node in sub.nodes {
+                                                            self.preset_nav.add_node_with_pipeline(
+                                                                node.name, node.pipeline);
+                                                            added += 1;
+                                                        }
+                                                    }
+                                                    Err(e) => failed.push(
+                                                        format!("{}: {e}", path.display())),
+                                                },
+                                            }
+                                        }
+                                        if added > 0 {
+                                            self.message_log.push(
+                                                format!("Added {added} preset node(s)"), false);
+                                        }
+                                        for msg in failed {
+                                            self.message_log.push(format!("Add failed — {msg}"), true);
                                         }
                                     }
                                 }
@@ -1974,10 +2086,13 @@ impl RiffLabApp {
                                     ui.label("No tab loaded");
                                     ui.add_space(10.0);
                                     if ui.button("Open Tab File").clicked() {
-                                        if let Some(path) = rfd::FileDialog::new()
-                                            .add_filter("Tab files", &["rltab", "json", "txt", "md", "tab"])
-                                            .pick_file()
-                                        {
+                                        let mut dlg = rfd::FileDialog::new()
+                                            .add_filter("Tab files", &["rltab", "json", "txt", "md", "tab"]);
+                                        if let Some(d) = self.app_config.last_dir(PathKind::Tab) {
+                                            dlg = dlg.set_directory(d);
+                                        }
+                                        if let Some(path) = dlg.pick_file() {
+                                            self.remember_path(PathKind::Tab, &path);
                                             // Try as .rltab JSON first, then as ASCII tab text
                                             match rifflab_tab::io::load_tab(&path) {
                                                 Ok(tab) => {
@@ -2107,11 +2222,14 @@ impl RiffLabApp {
                                 node_editor::GraphAction::Save => {
                                     // Save param cache into graph nodes before serializing
                                     self.fx_graph.save_params_from_cache(&self.node_editor_state.param_cache);
-                                    if let Some(path) = rfd::FileDialog::new()
+                                    let mut dlg = rfd::FileDialog::new()
                                         .add_filter("RiffLab Graph", &["json"])
-                                        .set_file_name("graph.json")
-                                        .save_file()
-                                    {
+                                        .set_file_name("graph.json");
+                                    if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(path) = dlg.save_file() {
+                                        self.remember_path(PathKind::FxGraph, &path);
                                         if let Err(e) = node_editor::save_graph(&path, &self.fx_graph) {
                                             self.message_log.push(format!("Save graph failed: {e}"), true);
                                         } else {
@@ -2120,10 +2238,13 @@ impl RiffLabApp {
                                     }
                                 }
                                 node_editor::GraphAction::Load => {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("RiffLab Graph", &["json"])
-                                        .pick_file()
-                                    {
+                                    let mut dlg = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"]);
+                                    if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(path) = dlg.pick_file() {
+                                        self.remember_path(PathKind::FxGraph, &path);
                                         match node_editor::load_graph(&path) {
                                             Ok(g) => {
                                                 self.fx_graph = g;
@@ -2331,10 +2452,13 @@ impl RiffLabApp {
                                 }
                             } else {
                                 if ui.small_button("Load FX").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("RiffLab Graph", &["json"])
-                                        .pick_file()
-                                    {
+                                    let mut dlg = rfd::FileDialog::new()
+                                        .add_filter("RiffLab Graph", &["json"]);
+                                    if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(path) = dlg.pick_file() {
+                                        self.remember_path(PathKind::FxGraph, &path);
                                         self.load_track_fx(i, &path);
                                     }
                                 }
@@ -4343,11 +4467,14 @@ impl RiffLabApp {
             }
         }
         if do_save_as {
-            if let Some(path) = rfd::FileDialog::new()
+            let mut dlg = rfd::FileDialog::new()
                 .add_filter("RiffLab Preset", &["toml"])
-                .set_file_name(&format!("{}.toml", self.fx_preset_name))
-                .save_file()
-            {
+                .set_file_name(&format!("{}.toml", self.fx_preset_name));
+            if let Some(d) = self.app_config.last_dir(PathKind::FxPreset) {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(path) = dlg.save_file() {
+                self.remember_path(PathKind::FxPreset, &path);
                 self.fx_preset_path = Some(path.clone());
                 self.fx_preset_name = path.file_stem()
                     .and_then(|s| s.to_str())
@@ -4357,10 +4484,13 @@ impl RiffLabApp {
             }
         }
         if do_open {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("RiffLab Preset", &["toml"])
-                .pick_file()
-            {
+            let mut dlg = rfd::FileDialog::new()
+                .add_filter("RiffLab Preset", &["toml"]);
+            if let Some(d) = self.app_config.last_dir(PathKind::FxPreset) {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(path) = dlg.pick_file() {
+                self.remember_path(PathKind::FxPreset, &path);
                 self.load_fx_preset(&path, &graph_arc);
             }
         }
@@ -4395,7 +4525,8 @@ impl RiffLabApp {
 
     fn save_current_session(&mut self, save_as: bool) {
         if save_as || self.session.session_path.is_none() {
-            self.session.start_save_as_dialog();
+            let start_dir = self.app_config.last_dir(PathKind::Session);
+            self.session.start_save_as_dialog(start_dir);
         } else {
             let dir = self.session.session_path.clone().unwrap();
             self.do_save_to_dir(dir);
@@ -5027,19 +5158,39 @@ impl RiffLabApp {
                 }
 
                 ui.add_space(4.0);
-                if ui.button("+ Add Preset").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("RiffLab Graph", &["json"])
-                        .pick_file()
-                    {
-                        match self.preset_bank.add_from_file(&path) {
-                            Ok(idx) => {
-                                self.message_log.push(
-                                    format!("Added preset: {}", self.preset_bank.presets[idx].name), false);
+                if ui.button("+ Add Preset(s)").on_hover_text("Hold Ctrl/Shift to select multiple files").clicked() {
+                    let mut dlg = rfd::FileDialog::new()
+                        .add_filter("RiffLab Graph", &["json"]);
+                    if let Some(d) = self.app_config.last_dir(PathKind::FxGraph) {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(paths) = dlg.pick_files() {
+                        if let Some(first) = paths.first() {
+                            self.remember_path(PathKind::FxGraph, first);
+                        }
+                        let mut added: Vec<String> = Vec::new();
+                        let mut failed = 0usize;
+                        for path in &paths {
+                            match self.preset_bank.add_from_file(path) {
+                                Ok(idx) => added.push(self.preset_bank.presets[idx].name.clone()),
+                                Err(e) => {
+                                    failed += 1;
+                                    self.message_log.push(
+                                        format!("Failed to add {}: {e}", path.display()), true);
+                                }
                             }
-                            Err(e) => {
-                                self.message_log.push(format!("Failed to add preset: {e}"), true);
-                            }
+                        }
+                        if !added.is_empty() {
+                            let summary = if added.len() == 1 {
+                                format!("Added preset: {}", added[0])
+                            } else {
+                                format!("Added {} presets: {}", added.len(), added.join(", "))
+                            };
+                            self.message_log.push(summary, false);
+                        }
+                        if failed > 0 && added.is_empty() {
+                            self.message_log.push(
+                                format!("All {failed} preset(s) failed to load"), true);
                         }
                     }
                 }
@@ -5053,6 +5204,59 @@ impl RiffLabApp {
                 }
             });
         self.midi_panel_open = open;
+    }
+
+    fn draw_chat(&mut self, ctx: &egui::Context) {
+        let current_song: Option<String> = if self.file_name == "No file loaded" {
+            None
+        } else {
+            Some(self.file_name.clone())
+        };
+        let actions = self.chat.draw(
+            ctx,
+            &self.preset_nav,
+            &self.fx_registry,
+            current_song.as_deref(),
+        );
+        if !actions.is_empty() {
+            self.apply_chat_actions(actions);
+        }
+    }
+
+    fn apply_chat_actions(&mut self, actions: Vec<chat::ChatAction>) {
+        let mut history_dirty = false;
+        let mut config_dirty = false;
+        for action in actions {
+            match action {
+                chat::ChatAction::WidthChanged(w) => {
+                    self.app_config.chat.width = w;
+                    config_dirty = true;
+                }
+                chat::ChatAction::VisibilityChanged(v) => {
+                    self.app_config.chat.visible = v;
+                    config_dirty = true;
+                }
+                chat::ChatAction::HistoryDirty => {
+                    history_dirty = true;
+                }
+                chat::ChatAction::PresetGraphReplaced(new_nav) => {
+                    self.preset_nav = *new_nav;
+                    self.message_log.push(
+                        "Preset graph updated by AI assistant.".into(), false);
+                }
+                chat::ChatAction::UndoRequested(snap) => {
+                    self.preset_nav = *snap;
+                    self.message_log.push(
+                        "Preset graph: undo applied.".into(), false);
+                }
+            }
+        }
+        if config_dirty {
+            self.app_config.save_to_default();
+        }
+        if history_dirty {
+            self.persist_chat_history();
+        }
     }
 
     fn draw_message_log(&mut self, ctx: &egui::Context) {

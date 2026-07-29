@@ -1,0 +1,107 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "pos": [30.0, 150.0],
+      "kind": "Input",
+      "label": "Input"
+    },
+    {
+      "id": 2,
+      "pos": [1220.0, 150.0],
+      "kind": "Output",
+      "label": "Output"
+    },
+    {
+      "id": 3,
+      "pos": [200.0, 30.0],
+      "kind": { "Effect": { "type_id": "builtin:noise_gate" } },
+      "label": "Gate",
+      "params": [
+        [0, -40.0],
+        [1, 1.0],
+        [2, 50.0]
+      ]
+    },
+    {
+      "id": 4,
+      "pos": [200.0, 280.0],
+      "kind": { "Effect": { "type_id": "builtin:compressor" } },
+      "label": "Compressor (Fieldy squash)",
+      "params": [
+        [0, -24.0],
+        [1, 6.0],
+        [2, 5.0],
+        [3, 80.0],
+        [4, 4.0]
+      ]
+    },
+    {
+      "id": 5,
+      "pos": [450.0, 30.0],
+      "kind": { "Effect": { "type_id": "builtin:eq" } },
+      "label": "EQ (Scooped Click)",
+      "params": [
+        [0, 80.0],
+        [1, 6.0],
+        [2, 1.0],
+        [3, 500.0],
+        [4, -6.0],
+        [5, 1.5],
+        [6, 3500.0],
+        [7, 5.0],
+        [8, 2.0],
+        [9, 8000.0],
+        [10, 2.0],
+        [11, 1.0]
+      ]
+    },
+    {
+      "id": 6,
+      "pos": [450.0, 320.0],
+      "kind": { "Effect": { "type_id": "builtin:overdrive" } },
+      "label": "Light Grit",
+      "params": [
+        [0, 0.18],
+        [1, 0.6],
+        [2, 0.25],
+        [3, 0.0]
+      ]
+    },
+    {
+      "id": 7,
+      "pos": [720.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:cabinet" } },
+      "label": "Cabinet 8x10 (SVT)",
+      "params": [
+        [0, 1.0],
+        [1, 0.55],
+        [2, 0.5],
+        [3, 0.0]
+      ]
+    },
+    {
+      "id": 8,
+      "pos": [970.0, 150.0],
+      "kind": { "Effect": { "type_id": "builtin:reverb" } },
+      "label": "Tight Room",
+      "params": [
+        [0, 0.12],
+        [1, 0.4],
+        [2, 0.18],
+        [3, 0.85]
+      ]
+    }
+  ],
+  "cables": [
+    { "from": { "node_id": 1, "index": 0, "is_output": true }, "to": { "node_id": 3, "index": 0, "is_output": false } },
+    { "from": { "node_id": 3, "index": 0, "is_output": true }, "to": { "node_id": 4, "index": 0, "is_output": false } },
+    { "from": { "node_id": 4, "index": 0, "is_output": true }, "to": { "node_id": 5, "index": 0, "is_output": false } },
+    { "from": { "node_id": 5, "index": 0, "is_output": true }, "to": { "node_id": 6, "index": 0, "is_output": false } },
+    { "from": { "node_id": 6, "index": 0, "is_output": true }, "to": { "node_id": 7, "index": 0, "is_output": false } },
+    { "from": { "node_id": 7, "index": 0, "is_output": true }, "to": { "node_id": 8, "index": 0, "is_output": false } },
+    { "from": { "node_id": 8, "index": 0, "is_output": true }, "to": { "node_id": 2, "index": 0, "is_output": false } }
+  ],
+  "next_id": 9,
+  "pan": [0.0, 0.0]
+}

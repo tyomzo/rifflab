@@ -10,6 +10,7 @@ members = [
     "crates/rifflab-ui",
     "crates/rifflab-cue",
     "crates/rifflab-tab",
+    "crates/rifflab-llm",
     "crates/rifflab-app",
 ]
 resolver = "2"
@@ -38,3 +39,4 @@ rifflab-analysis = { path = "crates/rifflab-analysis" }
 rifflab-practice = { path = "crates/rifflab-practice" }
 rifflab-ui = { path = "crates/rifflab-ui" }
 rifflab-cue = { path = "crates/rifflab-cue" }
+rifflab-llm = { path = "crates/rifflab-llm" }

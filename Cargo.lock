@@ -3703,6 +3703,7 @@ dependencies = [
  "rifflab-cue",
  "rifflab-fx",
  "rifflab-ipc",
+ "rifflab-llm",
  "rifflab-practice",
  "rifflab-stems",
  "rifflab-tab",
@@ -3778,6 +3779,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rifflab-llm"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rifflab-practice"
 version = "0.1.0"
 dependencies = [
@@ -3805,9 +3817,9 @@ name = "rifflab-tab"
 version = "0.1.0"
 dependencies = [
  "log",
- "reqwest",
  "rifflab-analysis",
  "rifflab-core",
+ "rifflab-llm",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -42,7 +42,7 @@ impl MidiBinding {
 }
 
 /// A preset node in the navigation graph.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetNode {
     pub id: u64,
     pub pos: [f32; 2],
@@ -53,7 +53,7 @@ pub struct PresetNode {
 }
 
 /// A wire connecting two preset nodes (defines navigation order).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetWire {
     pub from_id: u64,
     pub to_id: u64,
@@ -69,7 +69,7 @@ pub enum MidiLearnTarget {
 }
 
 /// The full preset navigation graph.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetGraph {
     pub nodes: Vec<PresetNode>,
     pub wires: Vec<PresetWire>,
@@ -161,7 +161,9 @@ pub enum PresetGraphAction {
     ActivatePreset(u64),
     EditPreset(u64),
     Save,
-    Load,
+    LoadPipelineFor(u64),
+    /// Add one or more preset files as new nodes in the current graph (multi-select).
+    AddNodes,
 }
 
 // ─── Drawing ────────────────────────────────────────────────────────────────
@@ -176,7 +178,10 @@ pub fn draw_preset_graph(
     // Toolbar
     ui.horizontal(|ui| {
         if ui.small_button("Save Presets").clicked() { action = PresetGraphAction::Save; }
-        if ui.small_button("Load Presets").clicked() { action = PresetGraphAction::Load; }
+        if ui.small_button("Add Presets")
+            .on_hover_text("Add one or more preset files as nodes (hold Ctrl/Shift to multi-select)")
+            .clicked()
+        { action = PresetGraphAction::AddNodes; }
         ui.separator();
 
         // Next/Prev MIDI learn buttons
@@ -413,24 +418,9 @@ pub fn draw_preset_graph(
         graph.remove_node(id);
     }
     if let Some(id) = load_pipeline_for {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("RiffLab Graph", &["json"])
-            .pick_file()
-        {
-            match crate::node_editor::load_graph(&path) {
-                Ok(g) => {
-                    if let Some(node) = graph.find_node_mut(id) {
-                        node.pipeline = g;
-                        node.name = path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("Loaded")
-                            .to_string();
-                    }
-                    action = PresetGraphAction::ActivatePreset(id);
-                }
-                Err(e) => log::error!("Load pipeline failed: {e}"),
-            }
-        }
+        // Defer to the caller so it can seed the dialog with the last-used directory
+        // and remember the chosen path on success.
+        action = PresetGraphAction::LoadPipelineFor(id);
     }
 
     // Right-click context menu (simplified — delete and edit moved to node buttons)

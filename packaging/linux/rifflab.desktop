@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=RiffLab
+GenericName=Music Practice Workstation
+Comment=Stem separation, effects, and pitch/timing feedback for instrument practice
+Exec=env LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack rifflab %F
+Icon=rifflab
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+MimeType=audio/wav;audio/flac;audio/mpeg;audio/ogg;audio/aac;audio/mp4;
+StartupNotify=true
+StartupWMClass=rifflab
+Keywords=audio;music;stems;practice;guitar;

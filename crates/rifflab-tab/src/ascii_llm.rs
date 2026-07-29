@@ -5,6 +5,8 @@
 
 use crate::ascii;
 use crate::model::{NoteSource, TabNote, Technique};
+use crate::util::strip_markdown;
+use rifflab_llm::{AnthropicClient, LlmError, Message};
 use uuid::Uuid;
 
 const SYSTEM_PROMPT: &str = r#"You are a bass guitar tablature parser. You receive ASCII bass tab and output a JSON array of note events.
@@ -44,6 +46,12 @@ Output ONLY a JSON array with no markdown fencing, no explanation:
   }
 ]"#;
 
+/// Model used for tab parsing — kept on the well-tested Sonnet 4 release that
+/// the prompt was tuned against. Chat code defaults to a newer model.
+const TAB_MODEL: &str = "claude-sonnet-4-20250514";
+/// Tab payloads can be large; keep the historical output budget.
+const TAB_MAX_TOKENS: u32 = 16_384;
+
 /// Intermediate struct for JSON deserialization from the LLM response.
 #[derive(serde::Deserialize)]
 struct AsciiNote {
@@ -55,29 +63,28 @@ struct AsciiNote {
     section: Option<String>,
 }
 
-/// Get the Anthropic API key from environment.
-fn get_api_key() -> Option<String> {
-    std::env::var("ANTH_API_KEY").ok()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-}
-
 /// Parse ASCII tab text using the Anthropic Claude API.
 ///
 /// Falls back to the rule-based parser if:
 /// - API key is not set
 /// - API call fails
 /// - Response cannot be parsed
-/// Parse ASCII tab using LLM (blocking, for use on background thread).
-/// Sends progress messages via `log_tx` if provided.
+///
+/// Sends progress messages via `log_tx` if provided. Blocking — call from a
+/// background thread.
 pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<String>>) -> Vec<TabNote> {
     let send = |msg: String| {
         if let Some(tx) = log_tx { let _ = tx.send(msg); }
     };
 
-    let api_key = match get_api_key() {
-        Some(k) if !k.is_empty() => k,
-        _ => {
+    let client = match AnthropicClient::from_env() {
+        Ok(c) => c.with_model(TAB_MODEL).with_max_tokens(TAB_MAX_TOKENS),
+        Err(LlmError::MissingKey) => {
             send("No API key (ANTH_API_KEY), using rule-based parser".into());
+            return ascii::parse_ascii_tab(text);
+        }
+        Err(e) => {
+            send(format!("LLM setup error: {e}, falling back to rule-based parser"));
             return ascii::parse_ascii_tab(text);
         }
     };
@@ -86,14 +93,14 @@ pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<S
     let cleaned = strip_markdown(text);
     send("Sending tab to Claude for parsing...".into());
 
-    // Truncate input to 50KB
+    // Truncate input to keep request size bounded.
     let input = if cleaned.len() > crate::constants::LLM_INPUT_TRUNCATE {
         &cleaned[..crate::constants::LLM_INPUT_TRUNCATE]
     } else {
         &cleaned
     };
 
-    match call_claude(&api_key, input) {
+    match call_claude(&client, input) {
         Ok(notes) if !notes.is_empty() => {
             send(format!("LLM parsed {} notes", notes.len()));
             notes
@@ -103,69 +110,34 @@ pub fn parse_ascii_tab_llm(text: &str, log_tx: Option<&std::sync::mpsc::Sender<S
             ascii::parse_ascii_tab(text)
         }
         Err(e) => {
-            send(format!("LLM error: {}, falling back to rule-based parser", e));
+            send(format!("LLM error: {e}, falling back to rule-based parser"));
             ascii::parse_ascii_tab(text)
         }
     }
 }
 
-use crate::util::strip_markdown;
-
-fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, crate::error::TabError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
-
-    let body = serde_json::json!({
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 16384,
-        "system": SYSTEM_PROMPT,
-        "messages": [
-            { "role": "user", "content": tab_text }
-        ]
-    });
-
+fn call_claude(client: &AnthropicClient, tab_text: &str) -> Result<Vec<TabNote>, crate::error::TabError> {
     let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
+        .post_messages(SYSTEM_PROMPT, &[Message::user_text(tab_text.to_string())], &[])
+        .map_err(map_llm_error)?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().unwrap_or_default();
-        return Err(crate::error::TabError::LlmApi(format!("API error {}: {}", status, text)));
+    let text_content = response.text();
+    if text_content.is_empty() {
+        return Err(crate::error::TabError::LlmApi("No text content in response".into()));
     }
 
-    let resp: serde_json::Value = response
-        .json()
-        .map_err(|e| crate::error::TabError::Http(format!("{e}")))?;
-
-    // Extract text content from Claude's response
-    let text_content = resp["content"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|block| block["text"].as_str())
-        .ok_or_else(|| crate::error::TabError::LlmApi("No text content in response".into()))?;
-
-    // Strip markdown code fences if present
+    // Strip markdown code fences if present.
     let json_str = text_content
         .trim()
         .strip_prefix("```json")
         .or_else(|| text_content.trim().strip_prefix("```"))
-        .unwrap_or(text_content)
+        .unwrap_or(&text_content)
         .strip_suffix("```")
-        .unwrap_or(text_content)
+        .unwrap_or(&text_content)
         .trim();
 
-    // Parse as array of AsciiNote
     let ascii_notes: Vec<AsciiNote> = serde_json::from_str(json_str)?;
 
-    // Convert to TabNote
     let tab_notes = ascii_notes.into_iter().map(|an| {
         let technique = an.technique.as_deref().and_then(parse_technique);
         TabNote {
@@ -184,6 +156,17 @@ fn call_claude(api_key: &str, tab_text: &str) -> Result<Vec<TabNote>, crate::err
     }).collect();
 
     Ok(tab_notes)
+}
+
+fn map_llm_error(e: LlmError) -> crate::error::TabError {
+    match e {
+        LlmError::Http(msg) => crate::error::TabError::Http(msg),
+        LlmError::Api { status, body } => {
+            crate::error::TabError::LlmApi(format!("API error {status}: {body}"))
+        }
+        LlmError::Malformed(msg) => crate::error::TabError::LlmApi(msg),
+        LlmError::MissingKey => crate::error::TabError::LlmApi("missing API key".into()),
+    }
 }
 
 fn parse_technique(s: &str) -> Option<Technique> {
@@ -221,8 +204,17 @@ mod tests {
     fn test_fallback_on_missing_api_key() {
         // With no API key set, should fall back to rule-based parser
         let tab = "G|--5--|\nD|--0--|\nA|-----|\nE|-----|";
+        // Temporarily clear env vars for this test only.
+        let prev_anth = std::env::var("ANTH_API_KEY").ok();
+        let prev_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTH_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
         let notes = parse_ascii_tab_llm(tab, None);
         assert!(!notes.is_empty(), "Should fall back to rule-based parser");
+
+        if let Some(v) = prev_anth { std::env::set_var("ANTH_API_KEY", v); }
+        if let Some(v) = prev_anthropic { std::env::set_var("ANTHROPIC_API_KEY", v); }
     }
 
     #[test]

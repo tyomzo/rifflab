@@ -60,16 +60,25 @@ impl SessionManager {
     }
 
     /// Launch a non-blocking folder picker dialog (uses zenity on Wayland).
-    pub fn start_save_as_dialog(&mut self) {
+    /// `start_dir`, if set, seeds zenity's initial directory.
+    pub fn start_save_as_dialog(&mut self, start_dir: Option<PathBuf>) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = std::process::Command::new("zenity")
-                .args([
-                    "--file-selection",
-                    "--directory",
-                    "--title=Save Session — choose folder",
-                ])
-                .output();
+            let mut cmd = std::process::Command::new("zenity");
+            cmd.args([
+                "--file-selection",
+                "--directory",
+                "--title=Save Session — choose folder",
+            ]);
+            if let Some(dir) = start_dir {
+                // zenity uses --filename to seed the dialog; append a trailing slash so it treats it as a folder.
+                let mut s = dir.to_string_lossy().into_owned();
+                if !s.ends_with('/') {
+                    s.push('/');
+                }
+                cmd.arg(format!("--filename={}", s));
+            }
+            let result = cmd.output();
             let path = match result {
                 Ok(out) if out.status.success() => {
                     let s = String::from_utf8_lossy(&out.stdout);
